@@ -1,0 +1,67 @@
+{
+  "protocol": "codex-app-server",
+  "codexVersion": "codex-cli 0.143.0",
+  "capturedAt": "2026-07-10T19:58:12.853Z",
+  "schemas": {
+    "initialize": {
+      "path": "v1/InitializeParams.json",
+      "sha256": "4f576f99e285beb28f71f48a72b887c1f517dada86fee348fe2af0a35511de23"
+    },
+    "thread/start": {
+      "path": "v2/ThreadStartParams.json",
+      "sha256": "4f30cb90cae47ff01adba8d863228b2aa198232df895dbfc996d594270326744"
+    },
+    "thread/resume": {
+      "path": "v2/ThreadResumeParams.json",
+      "sha256": "f828ee9846f11a68a1d259429ae147ddd49fcbd1cfb860b1a83f41604a5e97b9"
+    },
+    "turn/start": {
+      "path": "v2/TurnStartParams.json",
+      "sha256": "a28f74287e18b8a18c7aa6966ee7552a8ed2ae13c03f4ba12e9af48f7370f19d"
+    },
+    "turn/interrupt": {
+      "path": "v2/TurnInterruptParams.json",
+      "sha256": "49132b57b09f09dc545ed1cd373c12eede6e880e9afb54ae50add78bb42490cd"
+    },
+    "model/list": {
+      "path": "v2/ModelListParams.json",
+      "sha256": "10ac5c0cb8ddbe840527c8eb8053dc4ced32ea3efdfb200283cadc43447f9073"
+    },
+    "thread/started": {
+      "path": "v2/ThreadStartedNotification.json",
+      "sha256": "49ecfc7478d824b9b31a38e89099c44bc1f5e5a9d9a6dda3221184a11d158e7c"
+    },
+    "turn/started": {
+      "path": "v2/TurnStartedNotification.json",
+      "sha256": "8fa9297e89172a4430b8a023dc6fe6f4b5764578fb64df0d41886be25e64e669"
+    },
+    "turn/completed": {
+      "path": "v2/TurnCompletedNotification.json",
+      "sha256": "900bc6e40f0aeb5aa498ec874f026a2a077356ac1dc740c1928cfdca29630345"
+    },
+    "item/started": {
+      "path": "v2/ItemStartedNotification.json",
+      "sha256": "0d842417a83335153e12e8f511a401b467fbc4308035f94b503bb0b5647079e2"
+    },
+    "item/completed": {
+      "path": "v2/ItemCompletedNotification.json",
+      "sha256": "2905f1169b0990af2b114358b0b14ddb071fdd2643ac7e43a62c8db40643abcf"
+    },
+    "error": {
+      "path": "v2/ErrorNotification.json",
+      "sha256": "1ec871b02771300a26a34e41a7cfaf7484330a8c37c197d1ac133e753b083a09"
+    },
+    "item/commandExecution/requestApproval": {
+      "path": "CommandExecutionRequestApprovalParams.json",
+      "sha256": "252b95dd7223b86d3bb7e786eb819a40d66dc36514e77c4221ea72c7cd5cad7c"
+    },
+    "item/fileChange/requestApproval": {
+      "path": "FileChangeRequestApprovalParams.json",
+      "sha256": "7b465f7c5671adffdc5c339f50799860950307456e2a2b52c5ce1d3018f4babd"
+    },
+    "item/permissions/requestApproval": {
+      "path": "PermissionsRequestApprovalParams.json",
+      "sha256": "1d3d82089f06c19f1ab7c5a8790aad7c8ae8cafb3ebcf48458947cedcc201254"
+    }
+  }
+}
