@@ -209,6 +209,8 @@ export class StateStore {
       );
       CREATE INDEX IF NOT EXISTS conversations_active_turn
         ON conversations(active_turn_id) WHERE active_turn_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS conversations_thread
+        ON conversations(thread_id) WHERE thread_id IS NOT NULL;
 
       CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -439,6 +441,10 @@ export class StateStore {
 
   getConversation(conversationKey) {
     return mapConversation(this.#db.prepare('SELECT * FROM conversations WHERE conversation_key = ?').get(conversationKey))
+  }
+
+  getConversationByThreadId(threadId) {
+    return mapConversation(this.#db.prepare('SELECT * FROM conversations WHERE thread_id = ?').get(threadId))
   }
 
   setActiveTurn({ conversationKey, turnId, nowMs = Date.now() }) {
