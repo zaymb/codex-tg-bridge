@@ -328,3 +328,64 @@ test('serializes one topic while allowing different topics up to the global limi
   assert.equal(maxGlobal, 2)
   assert.ok(['11', '12', '13'].every(id => state.getUpdate(id).status === 'completed'))
 })
+
+test('turns a due wake into a normal Codex turn and durable Telegram action', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  setup.state.upsertApprovedChat({
+    conversationKey: '-100123:7',
+    telegramChatId: '-100123',
+    alias: 'sandbox-topic',
+    title: 'Sandbox Topic',
+    kind: 'forum_topic',
+    nowMs: 1,
+  })
+  setup.state.enqueueWake({
+    conversationKey: '-100123:7',
+    source: 'cron',
+    reason: 'morning check',
+    context: { schedule: 'daily' },
+    dedupeKey: 'daily:1',
+    earliestAtMs: 1_000,
+    expiresAtMs: 10_000,
+    nowMs: 100,
+  })
+
+  const result = await setup.dispatcher.drainWakesOnce()
+
+  assert.equal(result.processed, 1)
+  assert.equal(setup.runner.jobs[0].conversationKey, '-100123:7')
+  assert.match(setup.runner.jobs[0].text, /morning check/)
+  assert.match(setup.runner.jobs[0].text, /daily/)
+  assert.equal(setup.telegram.calls.filter(call => call.method === 'sendText').length, 1)
+  assert.equal(setup.telegram.calls.find(call => call.method === 'sendText').payload.threadId, '7')
+  assert.equal(setup.state.getWakeByDedupe('cron', 'daily:1').status, 'completed')
+})
+
+test('completes a wake without sending when Codex returns SKIP', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  setup.runner.result = { ...setup.runner.result, skipped: true, finalText: null }
+  setup.state.upsertApprovedChat({
+    conversationKey: '42',
+    telegramChatId: '42',
+    alias: 'owner',
+    title: 'Owner DM',
+    kind: 'private',
+    nowMs: 1,
+  })
+  setup.state.enqueueWake({
+    conversationKey: '42',
+    source: 'manual',
+    reason: 'check silently',
+    dedupeKey: 'manual:skip',
+    earliestAtMs: 1_000,
+    expiresAtMs: 10_000,
+    nowMs: 100,
+  })
+
+  await setup.dispatcher.drainWakesOnce()
+
+  assert.equal(setup.telegram.calls.some(call => ['reply', 'sendText'].includes(call.method)), false)
+  assert.equal(setup.state.getWakeByDedupe('manual', 'manual:skip').status, 'completed')
+})

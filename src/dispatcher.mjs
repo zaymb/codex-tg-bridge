@@ -1,5 +1,6 @@
 import { splitTelegramText } from './message-format.mjs'
 import { normalizeUpdate } from './update-normalizer.mjs'
+import { readFile } from 'node:fs/promises'
 import {
   RateLimitError,
   TelegramApiError,
@@ -349,7 +350,30 @@ export class Dispatcher {
   async #executeOutbound(action) {
     if (action.actionType === 'reply') return this.#telegram.reply(action.payload)
     if (action.actionType === 'send_text') return this.#telegram.sendText(action.payload)
+    if (action.actionType === 'edit_own_message') return this.#telegram.editOwnMessage(action.payload)
+    if (action.actionType === 'delete_own_message') return this.#telegram.deleteOwnMessage(action.payload)
+    if (action.actionType === 'react') return this.#telegram.react(action.payload)
+    if (action.actionType === 'send_file') {
+      return this.#telegram.sendFile({
+        ...action.payload,
+        bytes: await readFile(action.payload.path),
+      })
+    }
     throw new Error(`unsupported outbound action type: ${action.actionType}`)
+  }
+
+  async enqueueExternalAction({ actionId, conversationKey, actionType, payload }) {
+    this.#state.createOutboundAction({
+      actionId,
+      conversationKey,
+      actionType,
+      payload,
+      sequenceGroup: actionId,
+      sequenceIndex: 0,
+      nowMs: this.#clock(),
+    })
+    await this.#sendOutboundAction(actionId)
+    return this.#state.getOutboundAction(actionId)
   }
 
   async #sendOutboundAction(actionId, alreadyClaimed = false) {
@@ -396,5 +420,83 @@ export class Dispatcher {
     })
     for (const action of actions) await this.#sendOutboundAction(action.actionId, true)
     return actions.length
+  }
+
+  async drainWakesOnce({ limit = 8 } = {}) {
+    const wakes = this.#state.claimWakes({
+      workerId: this.#workerId,
+      limit,
+      leaseMs: this.#updateLeaseMs,
+      nowMs: this.#clock(),
+    })
+    const results = await Promise.all(wakes.map(wake => this.#schedule(
+      wake.conversationKey,
+      () => this.#processWake(wake),
+    )))
+    return {
+      claimed: wakes.length,
+      processed: results.filter(result => result.status === 'completed').length,
+      failed: results.filter(result => result.status === 'failed').length,
+    }
+  }
+
+  async #processWake(wake) {
+    try {
+      const chat = this.#state.getApprovedChat(wake.conversationKey)
+      if (!chat) throw new Error(`wake target is no longer approved: ${wake.conversationKey}`)
+      const syntheticUpdate = {
+        conversationKey: wake.conversationKey,
+        chat: { id: chat.telegramChatId, type: chat.kind, title: chat.title },
+        actor: null,
+        message: null,
+        reaction: null,
+      }
+      const typing = this.#startTyping(syntheticUpdate)
+      let turn
+      try {
+        turn = await this.#runner.runTurn({
+          conversationKey: wake.conversationKey,
+          ownerDm: chat.kind === 'private' && chat.telegramChatId === this.#ownerUserId,
+          text: [
+            '[Proactive wake request]',
+            `Source: ${wake.source}`,
+            `Reason: ${wake.reason}`,
+            wake.context === null ? null : `Context: ${JSON.stringify(wake.context)}`,
+          ].filter(Boolean).join('\n'),
+          attachments: [],
+          telegramContext: {
+            eventType: 'wake',
+            wakeId: wake.id,
+            source: wake.source,
+            conversationKey: wake.conversationKey,
+          },
+          clientUserMessageId: `wake:${wake.id}`,
+        })
+      } finally {
+        clearInterval(typing)
+      }
+      if (turn.contextBreak) {
+        await this.#sendContextBreakNotice(syntheticUpdate, `wake-${wake.id}`, turn.replacedThreadId)
+      }
+      const equivalentSent = (turn.sentActionIds ?? []).some(actionId => {
+        const action = this.#state.getOutboundAction(actionId)
+        return action?.status === 'sent' && action.conversationKey === wake.conversationKey
+      })
+      if (!turn.skipped && turn.finalText && !equivalentSent) {
+        await this.#queueFinalAnswer(syntheticUpdate, `wake-${wake.id}`, turn.finalText)
+      }
+      this.#state.completeWake({ id: wake.id, workerId: this.#workerId, nowMs: this.#clock() })
+      return { status: 'completed' }
+    } catch (error) {
+      this.#state.failWake({
+        id: wake.id,
+        workerId: this.#workerId,
+        error: error.message,
+        retryAtMs: this.#clock() + Math.min(60_000, 1_000 * (2 ** Math.max(0, wake.attempts - 1))),
+        permanent: wake.attempts >= 5,
+        nowMs: this.#clock(),
+      })
+      return { status: 'failed', error }
+    }
   }
 }

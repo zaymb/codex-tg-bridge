@@ -9,11 +9,13 @@
   "scripts": {
     "test": "node --test --test-reporter=spec",
     "start": "node src/index.mjs",
-    "mcp": "node src/mcp-server.mjs"
+    "mcp": "node src/mcp-server.mjs",
+    "wake": "node src/wake-cli.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
     "better-sqlite3": "12.11.1",
-    "ws": "8.21.0"
+    "ws": "8.21.0",
+    "zod": "4.4.3"
   }
 }
