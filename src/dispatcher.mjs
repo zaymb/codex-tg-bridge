@@ -1,0 +1,400 @@
+import { splitTelegramText } from './message-format.mjs'
+import { normalizeUpdate } from './update-normalizer.mjs'
+import {
+  RateLimitError,
+  TelegramApiError,
+  TelegramTransportError,
+} from './telegram-client.mjs'
+
+class Semaphore {
+  #limit
+  #active = 0
+  #queue = []
+
+  constructor(limit) {
+    this.#limit = limit
+  }
+
+  async run(task) {
+    if (this.#active >= this.#limit) {
+      await new Promise(resolve => this.#queue.push(resolve))
+    }
+    this.#active += 1
+    try {
+      return await task()
+    } finally {
+      this.#active -= 1
+      this.#queue.shift()?.()
+    }
+  }
+}
+
+function commandName(update) {
+  const text = update.message?.text ?? update.message?.caption ?? ''
+  return text.match(/^\/(new|stop)(?:@[A-Za-z0-9_]+)?(?:\s|$)/iu)?.[1]?.toLowerCase() ?? null
+}
+
+function topicId(update) {
+  if (update.message?.threadId) return update.message.threadId
+  const key = update.conversationKey ?? ''
+  const index = key.lastIndexOf(':')
+  return index === -1 ? null : key.slice(index + 1)
+}
+
+function eventText(update) {
+  if (update.message) {
+    const text = update.message.text ?? update.message.caption ?? ''
+    const prefix = update.type.startsWith('edited_') ? '[Telegram edited message]\n' : ''
+    return `${prefix}${text}`.trim()
+  }
+  if (update.reaction) {
+    const added = update.reaction.added?.map(item => item.emoji ?? item.customEmojiId ?? item.type).join(', ') || 'none'
+    const removed = update.reaction.removed?.map(item => item.emoji ?? item.customEmojiId ?? item.type).join(', ') || 'none'
+    return `Telegram reaction event on bot message ${update.reaction.messageId}. Added: ${added}. Removed: ${removed}.`
+  }
+  return `Telegram ${update.type} event.`
+}
+
+function messageIdForReply(update) {
+  return update.message?.id ?? update.reaction?.messageId ?? null
+}
+
+export class Dispatcher {
+  #state
+  #telegram
+  #runner
+  #approvalRouter
+  #policy
+  #attachmentStore
+  #ownerUserId
+  #workerId
+  #updateLeaseMs
+  #typingIntervalMs
+  #clock
+  #semaphore
+  #chains = new Map()
+
+  constructor({
+    stateStore,
+    telegramClient,
+    codexRunner,
+    approvalRouter,
+    engagementPolicy,
+    attachmentStore,
+    ownerUserId,
+    maxConcurrentTurns = 2,
+    workerId = `dispatcher-${process.pid}`,
+    updateLeaseMs = 120_000,
+    typingIntervalMs = 4_000,
+    clock = Date.now,
+  }) {
+    this.#state = stateStore
+    this.#telegram = telegramClient
+    this.#runner = codexRunner
+    this.#approvalRouter = approvalRouter
+    this.#policy = engagementPolicy
+    this.#attachmentStore = attachmentStore
+    this.#ownerUserId = String(ownerUserId)
+    this.#workerId = workerId
+    this.#updateLeaseMs = updateLeaseMs
+    this.#typingIntervalMs = typingIntervalMs
+    this.#clock = clock
+    this.#semaphore = new Semaphore(maxConcurrentTurns)
+  }
+
+  #schedule(key, task) {
+    const previous = this.#chains.get(key) ?? Promise.resolve()
+    const current = previous.catch(() => {}).then(() => this.#semaphore.run(task))
+    this.#chains.set(key, current)
+    current.finally(() => {
+      if (this.#chains.get(key) === current) this.#chains.delete(key)
+    }).catch(() => {})
+    return current
+  }
+
+  async drainOnce({ limit = 16 } = {}) {
+    this.#state.recoverExpiredLeases(this.#clock())
+    await this.#approvalRouter.expirePending()
+    const rows = this.#state.claimUpdates({
+      workerId: this.#workerId,
+      limit,
+      leaseMs: this.#updateLeaseMs,
+      nowMs: this.#clock(),
+    })
+    const scheduled = rows.map(row => {
+      let key = row.conversationKey
+      if (!key) {
+        try { key = normalizeUpdate(row.raw).conversationKey } catch {}
+      }
+      return this.#schedule(key ?? `update:${row.updateId}`, () => this.processClaimedUpdate(row))
+    })
+    const results = await Promise.all(scheduled)
+    return {
+      claimed: rows.length,
+      processed: results.filter(result => result.status === 'completed').length,
+      failed: results.filter(result => result.status === 'failed').length,
+    }
+  }
+
+  async #recordApprovedUpdate(update, row) {
+    if (!this.#state.getApprovedChat(update.conversationKey)) {
+      this.#state.upsertApprovedChat({
+        conversationKey: update.conversationKey,
+        telegramChatId: update.chat.id,
+        title: update.chat.title,
+        kind: update.message?.threadId ? 'forum_topic' : update.chat.type,
+        nowMs: this.#clock(),
+      })
+    }
+
+    if (update.message) {
+      this.#state.recordMessage({
+        updateId: row.updateId,
+        conversationKey: update.conversationKey,
+        telegramChatId: update.chat.id,
+        telegramMessageId: update.message.id,
+        senderId: update.actor?.id ?? null,
+        messageType: update.type,
+        metadata: update,
+        nowMs: this.#clock(),
+      })
+    }
+
+    const attachments = []
+    for (const attachment of update.message?.attachments ?? []) {
+      const downloaded = await this.#telegram.downloadFile(attachment.fileId)
+      const saved = await this.#attachmentStore.save({
+        updateId: row.updateId,
+        attachment,
+        bytes: downloaded.bytes,
+      })
+      this.#state.recordAttachment({
+        updateId: row.updateId,
+        telegramFileId: attachment.fileId,
+        telegramUniqueId: attachment.uniqueId,
+        localPath: saved.localPath,
+        mediaType: attachment.kind,
+        byteSize: saved.byteSize,
+        sha256: saved.sha256,
+        nowMs: this.#clock(),
+      })
+      attachments.push({ ...attachment, localPath: saved.localPath })
+    }
+    return attachments
+  }
+
+  async processClaimedUpdate(row) {
+    try {
+      const update = normalizeUpdate(row.raw)
+      let knownBotMessage = null
+      if (update.reaction) {
+        knownBotMessage = this.#state.findSentOutboundMessage(update.chat.id, update.reaction.messageId)
+        if (knownBotMessage) update.conversationKey = knownBotMessage.conversationKey
+      }
+      const decision = this.#policy.evaluate(update, { isKnownBotMessage: Boolean(knownBotMessage) })
+
+      if (decision.action === 'reject') {
+        this.#state.completeUpdate({ updateId: row.updateId, workerId: this.#workerId, nowMs: this.#clock() })
+        return { status: 'completed', action: 'rejected', reason: decision.reason }
+      }
+      if (decision.action === 'callback') {
+        await this.#approvalRouter.handleCallback(update)
+        this.#state.completeUpdate({ updateId: row.updateId, workerId: this.#workerId, nowMs: this.#clock() })
+        return { status: 'completed', action: 'callback' }
+      }
+
+      const attachments = await this.#recordApprovedUpdate(update, row)
+      if (decision.action === 'store') {
+        this.#state.completeUpdate({ updateId: row.updateId, workerId: this.#workerId, nowMs: this.#clock() })
+        return { status: 'completed', action: 'stored', reason: decision.reason }
+      }
+
+      const command = commandName(update)
+      if (command === 'new') {
+        this.#state.detachThread(update.conversationKey, 'owner requested /new', this.#clock())
+        await this.#sendSystemReply(update, row.updateId, 'A new Codex conversation will start with your next message.')
+        this.#state.completeUpdate({ updateId: row.updateId, workerId: this.#workerId, nowMs: this.#clock() })
+        return { status: 'completed', action: 'new' }
+      }
+      if (command === 'stop') {
+        const interrupted = await this.#runner.interrupt(update.conversationKey)
+        await this.#sendSystemReply(update, row.updateId, interrupted ? 'Stopped the active turn.' : 'No active turn.')
+        this.#state.completeUpdate({ updateId: row.updateId, workerId: this.#workerId, nowMs: this.#clock() })
+        return { status: 'completed', action: 'stop' }
+      }
+
+      const typing = this.#startTyping(update)
+      let turn
+      try {
+        turn = await this.#runner.runTurn({
+          conversationKey: update.conversationKey,
+          ownerDm: update.chat.type === 'private' && update.actor?.id === this.#ownerUserId,
+          text: eventText(update),
+          attachments,
+          telegramContext: {
+            updateId: update.updateId,
+            updateType: update.type,
+            chatId: update.chat.id,
+            conversationKey: update.conversationKey,
+            messageId: messageIdForReply(update),
+            senderId: update.actor?.id ?? null,
+            senderIsBot: update.actor?.isBot ?? false,
+          },
+          clientUserMessageId: `telegram:${update.updateId}`,
+        })
+      } finally {
+        clearInterval(typing)
+      }
+
+      if (turn.contextBreak) {
+        await this.#sendContextBreakNotice(update, row.updateId, turn.replacedThreadId)
+      }
+      const equivalentSent = (turn.sentActionIds ?? []).some(actionId => {
+        const action = this.#state.getOutboundAction(actionId)
+        return action?.status === 'sent' && action.conversationKey === update.conversationKey
+      })
+      if (!turn.skipped && turn.finalText && !equivalentSent) {
+        await this.#queueFinalAnswer(update, row.updateId, turn.finalText)
+      }
+
+      this.#state.completeUpdate({ updateId: row.updateId, workerId: this.#workerId, nowMs: this.#clock() })
+      return { status: 'completed', action: turn.skipped ? 'skipped' : equivalentSent ? 'tool_sent' : 'answered' }
+    } catch (error) {
+      const permanent = row.attempts >= 5 || (error instanceof TelegramApiError && !(error instanceof RateLimitError))
+      this.#state.failUpdate({
+        updateId: row.updateId,
+        workerId: this.#workerId,
+        error: error.message,
+        retryAtMs: this.#clock() + Math.min(60_000, 1_000 * (2 ** Math.max(0, row.attempts - 1))),
+        permanent,
+        nowMs: this.#clock(),
+      })
+      return { status: 'failed', error }
+    }
+  }
+
+  #startTyping(update) {
+    const payload = { chatId: update.chat.id, action: 'typing', threadId: topicId(update) }
+    this.#telegram.sendChatAction(payload).catch(() => {})
+    const timer = setInterval(() => this.#telegram.sendChatAction(payload).catch(() => {}), this.#typingIntervalMs)
+    timer.unref?.()
+    return timer
+  }
+
+  async #sendSystemReply(update, updateId, text) {
+    const group = `system:update:${updateId}`
+    this.#state.createOutboundAction({
+      actionId: `${group}:0000`,
+      conversationKey: update.conversationKey,
+      actionType: 'reply',
+      payload: {
+        chatId: update.chat.id,
+        messageId: messageIdForReply(update),
+        threadId: topicId(update),
+        text,
+      },
+      sequenceGroup: group,
+      sequenceIndex: 0,
+      nowMs: this.#clock(),
+    })
+    await this.#sendOutboundAction(`${group}:0000`)
+  }
+
+  async #sendContextBreakNotice(update, updateId, replacedThreadId) {
+    const group = `context-break:update:${updateId}`
+    this.#state.createOutboundAction({
+      actionId: `${group}:0000`,
+      conversationKey: this.#ownerUserId,
+      actionType: 'send_text',
+      payload: {
+        chatId: this.#ownerUserId,
+        text: `Codex thread ${replacedThreadId ?? '(unknown)'} could not be resumed for ${update.conversationKey}. A new thread was started; prior context was not migrated.`,
+      },
+      sequenceGroup: group,
+      sequenceIndex: 0,
+      nowMs: this.#clock(),
+    })
+    await this.#sendOutboundAction(`${group}:0000`)
+  }
+
+  async #queueFinalAnswer(update, updateId, text) {
+    const chunks = splitTelegramText(text)
+    const group = `answer:update:${updateId}`
+    const ids = []
+    for (let index = 0; index < chunks.length; index += 1) {
+      const actionId = `${group}:${String(index).padStart(4, '0')}`
+      const first = index === 0 && messageIdForReply(update)
+      this.#state.createOutboundAction({
+        actionId,
+        conversationKey: update.conversationKey,
+        actionType: first ? 'reply' : 'send_text',
+        payload: {
+          chatId: update.chat.id,
+          messageId: first ? messageIdForReply(update) : null,
+          threadId: topicId(update),
+          text: chunks[index],
+        },
+        sequenceGroup: group,
+        sequenceIndex: index,
+        nowMs: this.#clock(),
+      })
+      ids.push(actionId)
+    }
+    for (const actionId of ids) {
+      const status = await this.#sendOutboundAction(actionId)
+      if (status !== 'sent') break
+    }
+  }
+
+  async #executeOutbound(action) {
+    if (action.actionType === 'reply') return this.#telegram.reply(action.payload)
+    if (action.actionType === 'send_text') return this.#telegram.sendText(action.payload)
+    throw new Error(`unsupported outbound action type: ${action.actionType}`)
+  }
+
+  async #sendOutboundAction(actionId, alreadyClaimed = false) {
+    let action = this.#state.getOutboundAction(actionId)
+    if (!action) throw new Error(`outbound action not found: ${actionId}`)
+    if (['sent', 'ambiguous'].includes(action.status)) return action.status
+    if (!alreadyClaimed && !this.#state.markOutboundSending(actionId, this.#clock())) {
+      return this.#state.getOutboundAction(actionId).status
+    }
+    action = this.#state.getOutboundAction(actionId)
+    try {
+      const result = await this.#executeOutbound(action)
+      this.#state.markOutboundSent(actionId, {
+        telegramChatId: String(result?.chat?.id ?? action.payload.chatId),
+        telegramMessageId: result?.message_id === undefined ? null : String(result.message_id),
+        result,
+      }, this.#clock())
+      return 'sent'
+    } catch (error) {
+      if (error instanceof RateLimitError) {
+        this.#state.markOutboundFailed(
+          actionId,
+          error.message,
+          this.#clock() + error.retryAfterSec * 1_000,
+          this.#clock(),
+        )
+        return 'failed'
+      }
+      if (error instanceof TelegramTransportError && error.deliveryAmbiguous) {
+        this.#state.markOutboundAmbiguous(actionId, error.message, this.#clock())
+        return 'ambiguous'
+      }
+      const retryAtMs = error instanceof TelegramTransportError ? this.#clock() + 1_000 : null
+      this.#state.markOutboundFailed(actionId, error.message, retryAtMs, this.#clock())
+      return 'failed'
+    }
+  }
+
+  async drainOutboundOnce({ limit = 16 } = {}) {
+    const actions = this.#state.claimDueOutboundActions({
+      workerId: this.#workerId,
+      limit,
+      nowMs: this.#clock(),
+    })
+    for (const action of actions) await this.#sendOutboundAction(action.actionId, true)
+    return actions.length
+  }
+}

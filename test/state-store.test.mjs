@@ -158,6 +158,49 @@ test('deduplicates outbound actions and preserves ambiguous sends', async t => {
   assert.equal(store.markOutboundSending('answer:update:42', 500), false)
 })
 
+test('claims due outbound actions in sequence without rerunning the source update', async t => {
+  const { store } = await openStore()
+  t.after(() => store.close())
+  for (const sequenceIndex of [0, 1]) {
+    store.createOutboundAction({
+      actionId: `answer:42:${sequenceIndex}`,
+      conversationKey: '-100123',
+      actionType: sequenceIndex === 0 ? 'reply' : 'send_text',
+      payload: { text: `chunk-${sequenceIndex}` },
+      sequenceGroup: 'answer:42',
+      sequenceIndex,
+      nowMs: 100,
+    })
+  }
+
+  assert.equal(store.claimDueOutboundActions({ workerId: 'sender', nowMs: 100, limit: 5 }).length, 1)
+  assert.equal(store.markOutboundFailed('answer:42:0', 'rate limited', 500, 110), true)
+  assert.equal(store.claimDueOutboundActions({ workerId: 'sender', nowMs: 499, limit: 5 }).length, 0)
+  const retried = store.claimDueOutboundActions({ workerId: 'sender', nowMs: 500, limit: 5 })
+  assert.equal(retried[0].actionId, 'answer:42:0')
+  assert.equal(store.markOutboundSent('answer:42:0', { telegramChatId: '-100123', telegramMessageId: '55' }, 510), true)
+
+  const second = store.claimDueOutboundActions({ workerId: 'sender', nowMs: 511, limit: 5 })
+  assert.equal(second[0].actionId, 'answer:42:1')
+})
+
+test('finds a sent bot message for reaction-to-topic routing', async t => {
+  const { store } = await openStore()
+  t.after(() => store.close())
+  store.createOutboundAction({
+    actionId: 'answer:42:0',
+    conversationKey: '-100123:7',
+    actionType: 'reply',
+    payload: { text: 'answer' },
+    nowMs: 100,
+  })
+  store.markOutboundSending('answer:42:0', 101)
+  store.markOutboundSent('answer:42:0', { telegramChatId: '-100123', telegramMessageId: '55' }, 102)
+
+  assert.equal(store.findSentOutboundMessage('-100123', '55').conversationKey, '-100123:7')
+  assert.equal(store.findSentOutboundMessage('-100123', 'missing'), null)
+})
+
 test('resolves an approval once, only for the configured owner, before expiry', async t => {
   const { store } = await openStore()
   t.after(() => store.close())

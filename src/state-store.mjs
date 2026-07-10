@@ -57,11 +57,14 @@ function mapOutbound(row) {
     conversationKey: row.conversation_key,
     actionType: row.action_type,
     payload: parse(row.payload_json),
+    sequenceGroup: row.sequence_group,
+    sequenceIndex: row.sequence_index,
     status: row.status,
     telegramChatId: row.telegram_chat_id,
     telegramMessageId: row.telegram_message_id,
     result: parse(row.result_json),
     attempts: row.attempts,
+    nextAttemptAtMs: row.next_attempt_at_ms,
     lastError: row.last_error,
     createdAtMs: row.created_at_ms,
     updatedAtMs: row.updated_at_ms,
@@ -240,18 +243,21 @@ export class StateStore {
         conversation_key TEXT NOT NULL,
         action_type TEXT NOT NULL,
         payload_json TEXT NOT NULL,
+        sequence_group TEXT NOT NULL,
+        sequence_index INTEGER NOT NULL DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'pending',
         telegram_chat_id TEXT,
         telegram_message_id TEXT,
         result_json TEXT,
         attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at_ms INTEGER,
         last_error TEXT,
         created_at_ms INTEGER NOT NULL,
         updated_at_ms INTEGER NOT NULL,
         CHECK (status IN ('pending', 'sending', 'sent', 'ambiguous', 'failed'))
       );
       CREATE INDEX IF NOT EXISTS outbound_actions_status
-        ON outbound_actions(status, updated_at_ms);
+        ON outbound_actions(status, next_attempt_at_ms, sequence_group, sequence_index);
 
       CREATE TABLE IF NOT EXISTS approvals (
         token_hash TEXT PRIMARY KEY,
@@ -585,12 +591,31 @@ export class StateStore {
     `).get(telegramFileId))
   }
 
-  createOutboundAction({ actionId, conversationKey, actionType, payload, nowMs = Date.now() }) {
+  createOutboundAction({
+    actionId,
+    conversationKey,
+    actionType,
+    payload,
+    sequenceGroup = actionId,
+    sequenceIndex = 0,
+    nowMs = Date.now(),
+  }) {
     const created = this.#db.prepare(`
       INSERT OR IGNORE INTO outbound_actions(
-        action_id, conversation_key, action_type, payload_json, status, created_at_ms, updated_at_ms
-      ) VALUES (?, ?, ?, ?, 'pending', ?, ?)
-    `).run(actionId, conversationKey, actionType, stringify(payload), nowMs, nowMs).changes === 1
+        action_id, conversation_key, action_type, payload_json, sequence_group,
+        sequence_index, status, next_attempt_at_ms, created_at_ms, updated_at_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+    `).run(
+      actionId,
+      conversationKey,
+      actionType,
+      stringify(payload),
+      sequenceGroup,
+      sequenceIndex,
+      nowMs,
+      nowMs,
+      nowMs,
+    ).changes === 1
     return { created, action: this.getOutboundAction(actionId) }
   }
 
@@ -603,14 +628,15 @@ export class StateStore {
       UPDATE outbound_actions
       SET status = 'sending', attempts = attempts + 1, updated_at_ms = ?
       WHERE action_id = ? AND status IN ('pending', 'failed')
-    `).run(nowMs, actionId).changes === 1
+        AND next_attempt_at_ms IS NOT NULL AND next_attempt_at_ms <= ?
+    `).run(nowMs, actionId, nowMs).changes === 1
   }
 
   markOutboundSent(actionId, { telegramChatId = null, telegramMessageId = null, result = null } = {}, nowMs = Date.now()) {
     return this.#db.prepare(`
       UPDATE outbound_actions
       SET status = 'sent', telegram_chat_id = ?, telegram_message_id = ?, result_json = ?,
-          last_error = NULL, updated_at_ms = ?
+          next_attempt_at_ms = NULL, last_error = NULL, updated_at_ms = ?
       WHERE action_id = ? AND status = 'sending'
     `).run(telegramChatId, telegramMessageId, stringify(result), nowMs, actionId).changes === 1
   }
@@ -618,9 +644,55 @@ export class StateStore {
   markOutboundAmbiguous(actionId, error, nowMs = Date.now()) {
     return this.#db.prepare(`
       UPDATE outbound_actions
-      SET status = 'ambiguous', last_error = ?, updated_at_ms = ?
+      SET status = 'ambiguous', next_attempt_at_ms = NULL, last_error = ?, updated_at_ms = ?
       WHERE action_id = ? AND status = 'sending'
     `).run(String(error), nowMs, actionId).changes === 1
+  }
+
+  markOutboundFailed(actionId, error, retryAtMs = null, nowMs = Date.now()) {
+    return this.#db.prepare(`
+      UPDATE outbound_actions
+      SET status = 'failed', next_attempt_at_ms = ?, last_error = ?, updated_at_ms = ?
+      WHERE action_id = ? AND status = 'sending'
+    `).run(retryAtMs, String(error), nowMs, actionId).changes === 1
+  }
+
+  claimDueOutboundActions({ workerId, limit = 1, nowMs = Date.now() }) {
+    if (!workerId) throw new Error('workerId is required')
+    const transaction = this.#db.transaction(() => {
+      const rows = this.#db.prepare(`
+        SELECT current.action_id
+        FROM outbound_actions AS current
+        WHERE current.status IN ('pending', 'failed')
+          AND current.next_attempt_at_ms IS NOT NULL
+          AND current.next_attempt_at_ms <= ?
+          AND NOT EXISTS (
+            SELECT 1 FROM outbound_actions AS prior
+            WHERE prior.sequence_group = current.sequence_group
+              AND prior.sequence_index < current.sequence_index
+              AND prior.status != 'sent'
+          )
+        ORDER BY current.created_at_ms, current.sequence_group, current.sequence_index
+        LIMIT ?
+      `).all(nowMs, limit)
+      const claim = this.#db.prepare(`
+        UPDATE outbound_actions
+        SET status = 'sending', attempts = attempts + 1, updated_at_ms = ?
+        WHERE action_id = ? AND status IN ('pending', 'failed')
+          AND next_attempt_at_ms IS NOT NULL AND next_attempt_at_ms <= ?
+      `)
+      for (const row of rows) claim.run(nowMs, row.action_id, nowMs)
+      return rows.map(row => this.getOutboundAction(row.action_id))
+    })
+    return transaction()
+  }
+
+  findSentOutboundMessage(telegramChatId, telegramMessageId) {
+    return mapOutbound(this.#db.prepare(`
+      SELECT * FROM outbound_actions
+      WHERE status = 'sent' AND telegram_chat_id = ? AND telegram_message_id = ?
+      ORDER BY updated_at_ms DESC LIMIT 1
+    `).get(String(telegramChatId), String(telegramMessageId)))
   }
 
   createApproval({
