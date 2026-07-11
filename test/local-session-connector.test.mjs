@@ -210,6 +210,61 @@ test('reports busy state for local TUI turns and becomes available after complet
   assert.equal(setup.relay.frames.at(-1).acceptingJobs, true)
 })
 
+test('never sends a mixed Telegram and terminal turn back to Telegram', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  const collisions = []
+  setup.connector.on('channelCollision', collision => collisions.push(collision))
+  await setup.connector.start()
+
+  setup.relay.emit('frame', batch())
+  await setup.connector.idle()
+
+  setup.app.emit('notification:item/started', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: { id: 'tg-input', type: 'userMessage', clientId: 'batch:telegram:1:telegram:2', content: [] },
+  })
+  setup.app.emit('notification:item/started', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: { id: 'terminal-steer', type: 'userMessage', clientId: 'tui:local-message', content: [] },
+  })
+  setup.app.emit('notification:item/completed', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: { id: 'terminal-steer', type: 'userMessage', clientId: 'tui:local-message', content: [] },
+  })
+  setup.app.emit('notification:item/completed', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: {
+      id: 'mixed-answer',
+      type: 'agentMessage',
+      phase: 'final_answer',
+      text: JSON.stringify({ action: 'send', text: 'terminal-only answer', reason: 'mixed' }),
+    },
+  })
+  setup.app.emit('notification:turn/completed', {
+    threadId: 'thread-a',
+    turn: { id: 'turn-tg', status: 'completed' },
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(collisions, [{
+    turnId: 'turn-tg',
+    expectedClientId: 'batch:telegram:1:telegram:2',
+    receivedClientId: 'tui:local-message',
+  }])
+  assert.deepEqual(setup.relay.frames.at(-1), {
+    version: 1,
+    type: 'job_result',
+    batchId: 'batch:telegram:1:telegram:2',
+    turnId: 'turn-tg',
+    result: { action: 'skip', reason: 'mixed_source_turn' },
+  })
+})
+
 test('reconciles a pre-existing local turn and advertises availability when it ends', async t => {
   const setup = fixture({ heartbeatIntervalMs: 10 })
   t.after(() => setup.connector.close())

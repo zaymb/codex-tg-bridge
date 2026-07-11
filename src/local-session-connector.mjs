@@ -150,10 +150,12 @@ export class LocalSessionConnector extends EventEmitter {
   async start() {
     if (this.#started) return
     const onTurnStarted = params => this.#schedule(() => this.#handleTurnStarted(params))
+    const onItemStarted = params => this.#schedule(() => this.#handleItemStarted(params))
     const onItemCompleted = params => this.#schedule(() => this.#handleItemCompleted(params))
     const onTurnCompleted = params => this.#schedule(() => this.#handleTurnCompleted(params))
     const onRelayFrame = frame => this.#schedule(() => this.#handleRelayFrame(frame))
     this.#listen(this.#app, 'notification:turn/started', onTurnStarted)
+    this.#listen(this.#app, 'notification:item/started', onItemStarted)
     this.#listen(this.#app, 'notification:item/completed', onItemCompleted)
     this.#listen(this.#app, 'notification:turn/completed', onTurnCompleted)
     this.#listen(this.#relay, 'frame', onRelayFrame)
@@ -184,8 +186,30 @@ export class LocalSessionConnector extends EventEmitter {
     this.#send({ type: 'heartbeat', acceptingJobs: false })
   }
 
+  #trackUserInput(params) {
+    if (
+      params.threadId !== this.#threadId
+      || params.turnId !== this.#currentJob?.turnId
+      || params.item?.type !== 'userMessage'
+    ) return
+
+    if (params.item.clientId !== this.#currentJob.clientUserMessageId && !this.#currentJob.mixedSource) {
+      this.emit('channelCollision', {
+        turnId: params.turnId,
+        expectedClientId: this.#currentJob.clientUserMessageId,
+        receivedClientId: params.item.clientId ?? null,
+      })
+      this.#currentJob.mixedSource = true
+    }
+  }
+
+  #handleItemStarted(params) {
+    this.#trackUserInput(params)
+  }
+
   #handleItemCompleted(params) {
     if (params.threadId !== this.#threadId || !params.turnId) return
+    this.#trackUserInput(params)
     const items = this.#items.get(params.turnId) ?? []
     items.push(params.item)
     this.#items.set(params.turnId, items)
@@ -210,6 +234,13 @@ export class LocalSessionConnector extends EventEmitter {
         this.#send(this.#resultFrame('job_failed', {
           turnId: turn.id,
           error: turn.error?.message ?? `Codex turn ended with status ${turn.status}`,
+        }))
+      } else if (this.#currentJob.mixedSource) {
+        // A local steer joined this Telegram-owned turn. The final answer is now
+        // mixed-channel content, so fail closed instead of leaking it to Telegram.
+        this.#send(this.#resultFrame('job_result', {
+          turnId: turn.id,
+          result: { action: 'skip', reason: 'mixed_source_turn' },
         }))
       } else {
         const output = parseTelegramStructuredOutput(finalText(turn, items))
@@ -265,14 +296,21 @@ export class LocalSessionConnector extends EventEmitter {
       return
     }
 
-    this.#currentJob = { ...inbound, turnId: null, awaitingRecord: false }
+    const clientUserMessageId = inbound.mode === 'legacy' ? inbound.jobs[0].jobId : inbound.batchId
+    this.#currentJob = {
+      ...inbound,
+      turnId: null,
+      awaitingRecord: false,
+      clientUserMessageId,
+      mixedSource: false,
+    }
     this.#send({ type: 'heartbeat', acceptingJobs: false })
     try {
       const telegramMessages = inbound.jobs.map(job => job.payload?.telegramContext ?? {})
       const response = await this.#app.request('turn/start', {
         threadId: this.#threadId,
         input: batchInput(inbound.jobs),
-        clientUserMessageId: inbound.mode === 'legacy' ? inbound.jobs[0].jobId : inbound.batchId,
+        clientUserMessageId,
         additionalContext: {
           telegram: {
             kind: 'untrusted',

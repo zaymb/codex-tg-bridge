@@ -21,6 +21,9 @@ VPS does not run Codex.
   replies to selected messages from that batch.
 - Every injected Telegram message is prefixed with `[TG]`; an unmarked user
   turn came from the terminal or another local Codex client.
+- Replies are bound to the channel that started the turn. If a local TUI steer
+  joins a Telegram-owned turn, the connector fails closed and does not send the
+  mixed final answer to Telegram.
 - Jobs older than 24 hours expire silently before acceptance.
 
 When the local connector is absent, each Telegram conversation receives this
