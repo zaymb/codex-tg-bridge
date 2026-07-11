@@ -43,9 +43,13 @@ export async function createTransportRuntime({
       throw new Error('Telegram bot still has a webhook configured; long polling will not start')
     }
 
+    const groupGate = config.deliverAllGroupMessages
+      ? { evaluate: () => ({ deliver: true, reason: 'configured_group_passthrough' }) }
+      : null
     const engagementPolicy = new EngagementPolicy(config, {
       botUserId: String(bot.id),
       botUsername: bot.username,
+      groupGate,
     })
     const dispatcher = new RelayDispatcher({
       stateStore,

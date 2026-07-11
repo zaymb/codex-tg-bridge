@@ -139,6 +139,7 @@ test('loads the transport-only config without Codex app-server settings', async 
   assert.equal(config.dbPath, '/var/lib/codex-tg-bridge/bridge.sqlite3')
   assert.equal(config.pollTimeoutSec, 50)
   assert.equal(config.updateLeaseMs, 120_000)
+  assert.equal(config.deliverAllGroupMessages, false)
   assert.equal(config.readTelegramToken(), '123456:secret-token')
   assert.equal(Object.keys(config).includes('readTelegramToken'), false)
 })
@@ -150,4 +151,13 @@ test('requires a normalized transport session label', async () => {
   assert.throws(() => loadTransportConfig(env), /BRIDGE_SESSION_LABEL/)
   env.BRIDGE_SESSION_LABEL = 'contains spaces'
   assert.throws(() => loadTransportConfig(env), /BRIDGE_SESSION_LABEL/)
+})
+
+test('can explicitly enable approved-group passthrough for transport testing', async () => {
+  const tokenPath = await tokenFixture()
+  const env = validEnv(tokenPath)
+  env.BRIDGE_SESSION_LABEL = 'tg-engage'
+  env.BRIDGE_DELIVER_ALL_GROUP_MESSAGES = 'true'
+
+  assert.equal(loadTransportConfig(env).deliverAllGroupMessages, true)
 })

@@ -198,6 +198,7 @@ export function loadTransportConfig(env = process.env) {
     dbPath: requireAbsolutePath(env.BRIDGE_DB_PATH, 'BRIDGE_DB_PATH'),
     pollTimeoutSec: parseInteger(env, 'BRIDGE_POLL_TIMEOUT_SEC', 50, 1, 50),
     updateLeaseMs: parseInteger(env, 'BRIDGE_UPDATE_LEASE_MS', 120_000, 1_000, 3_600_000),
+    deliverAllGroupMessages: parseBoolean(env.BRIDGE_DELIVER_ALL_GROUP_MESSAGES, false),
     logLevel: env.BRIDGE_LOG_LEVEL?.trim() || 'info',
   }
   return attachTokenReader(config, token.read)
