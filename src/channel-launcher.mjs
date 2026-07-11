@@ -97,6 +97,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       }),
       reconnectInitialMs: local.reconnectInitialMs ?? 1_000,
       reconnectMaxMs: local.reconnectMaxMs ?? 20_000,
+      heartbeatTimeoutMs: local.heartbeatTimeoutMs ?? 20_000,
     })
     connectorRun = supervisor.run({ signal: connectorController.signal })
 

@@ -308,7 +308,9 @@ test('runtime preempts an active batch when owner stop arrives in a later poll',
   const controller = new AbortController()
   const running = runtime.run({ signal: controller.signal })
 
-  await waitFor(() => runtime.stateStore.getUpdate('2')?.status === 'completed' && interrupts.length === 1)
+  await waitFor(() => runtime.stateStore.getUpdate('2')?.status === 'completed'
+    && runtime.stateStore.getUpdate('1')?.status === 'failed'
+    && interrupts.length === 1)
   assert.deepEqual(interrupts, [{ threadId: 'preempt-thread', turnId: 'preempt-turn' }])
   assert.equal(runtime.stateStore.getUpdate('1').status, 'failed')
   controller.abort()

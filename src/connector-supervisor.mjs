@@ -43,6 +43,7 @@ export class ConnectorSupervisor {
   #wait
   #reconnectInitialMs
   #reconnectMaxMs
+  #heartbeatTimeoutMs
   #child = null
   #statusChain = Promise.resolve()
 
@@ -56,6 +57,7 @@ export class ConnectorSupervisor {
     waitImpl = wait,
     reconnectInitialMs = 1_000,
     reconnectMaxMs = 20_000,
+    heartbeatTimeoutMs = 20_000,
   }) {
     this.#command = command
     this.#args = args
@@ -66,6 +68,7 @@ export class ConnectorSupervisor {
     this.#wait = waitImpl
     this.#reconnectInitialMs = reconnectInitialMs
     this.#reconnectMaxMs = reconnectMaxMs
+    this.#heartbeatTimeoutMs = heartbeatTimeoutMs
   }
 
   #writeStatus(status, fields = {}) {
@@ -81,6 +84,8 @@ export class ConnectorSupervisor {
 
   #monitorOutput(child) {
     let connected = false
+    let lastHeartbeatAtMs = null
+    let heartbeatTimer = null
     const errorLines = []
     const stdout = createInterface({ input: child.stdout, crlfDelay: Infinity })
     const stderr = createInterface({ input: child.stderr, crlfDelay: Infinity })
@@ -93,10 +98,22 @@ export class ConnectorSupervisor {
       }
       if (!['local_connector_ready', 'local_connector_heartbeat'].includes(event?.event)) return
       connected = true
+      lastHeartbeatAtMs = this.#clock()
       this.#writeStatus('connected', {
         connectorPid: child.pid ?? null,
-        lastHeartbeatAtMs: this.#clock(),
+        lastHeartbeatAtMs,
+        heartbeatExpiresAtMs: lastHeartbeatAtMs + this.#heartbeatTimeoutMs,
       })
+      clearTimeout(heartbeatTimer)
+      heartbeatTimer = setTimeout(() => {
+        if (child.exitCode !== null || child.signalCode !== null) return
+        this.#writeStatus('disconnected', {
+          connectorPid: child.pid ?? null,
+          lastHeartbeatAtMs,
+          reason: 'heartbeat_timeout',
+        })
+        child.kill('SIGTERM')
+      }, this.#heartbeatTimeoutMs)
     })
     stderr.on('line', line => {
       errorLines.push(line.slice(0, 2_000))
@@ -106,6 +123,7 @@ export class ConnectorSupervisor {
       connected: () => connected,
       lastError: () => errorLines.length > 0 ? errorLines.join('\n') : null,
       close() {
+        clearTimeout(heartbeatTimer)
         stdout.close()
         stderr.close()
       },

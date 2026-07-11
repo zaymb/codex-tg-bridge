@@ -92,3 +92,33 @@ test('writes an owner-only atomic channel status file', async () => {
   })
   assert.equal((await stat(path)).mode & 0o077, 0)
 })
+
+test('marks a stale heartbeat disconnected and restarts the connector', async () => {
+  const children = []
+  const statuses = []
+  const controller = new AbortController()
+  const supervisor = new ConnectorSupervisor({
+    command: '/usr/local/bin/node',
+    spawnImpl() {
+      const child = fakeChild(200 + children.length)
+      children.push(child)
+      return child
+    },
+    statusWriter: status => statuses.push(status),
+    waitImpl: async () => {},
+    reconnectInitialMs: 1,
+    heartbeatTimeoutMs: 20,
+  })
+
+  const running = supervisor.run({ signal: controller.signal })
+  await waitFor(() => children.length === 1)
+  children[0].stdout.write(`${JSON.stringify({ event: 'local_connector_ready' })}\n`)
+  await waitFor(() => statuses.some(status => status.status === 'connected'))
+  await waitFor(() => children.length === 2)
+
+  assert.equal(children[0].signalCode, 'SIGTERM')
+  assert.ok(statuses.some(status => status.status === 'disconnected'
+    && status.reason === 'heartbeat_timeout'))
+  controller.abort()
+  await running
+})

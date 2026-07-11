@@ -11,6 +11,8 @@ both split-host and same-host deployments.
   Telegram connector.
 - The launcher supervises the connector, writes `.state/channel-status.json`,
   and reconnects with bounded exponential backoff while the TUI stays open.
+  Connected status carries a heartbeat expiry; a stale heartbeat is marked
+  disconnected and the connector is restarted automatically.
 - Split-host mode uses outbound-only SSH stdio. Same-host mode starts the relay
   process directly without opening a listener.
 - App-server, connector, and SSH relay processes are detached from the TUI's
