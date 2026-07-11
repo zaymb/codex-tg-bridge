@@ -75,13 +75,17 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
         CODEX_THREAD_ID: sessionId,
         APP_SERVER_SOCKET: socketPath,
         CODEX_CONTRACT_PATH: contractPath,
+        BRIDGE_RELAY_MODE: local.relayMode ?? 'ssh',
         BRIDGE_SSH_PATH: local.sshPath ?? '/usr/bin/ssh',
         BRIDGE_RELAY_HOST: local.relayHost,
         BRIDGE_RELAY_SSH_USER: local.relaySshUser,
         BRIDGE_RELAY_IDENTITY_FILE: local.relayIdentityFile,
         BRIDGE_RELAY_SERVICE_USER: local.relayServiceUser ?? 'tgbridge',
-        BRIDGE_RELAY_NODE_PATH: local.relayNodePath ?? '/usr/local/bin/node',
-        BRIDGE_RELAY_SCRIPT_PATH: local.relayScriptPath ?? '/opt/tg-engage/bridge/src/relay-stdio.mjs',
+        BRIDGE_RELAY_NODE_PATH: local.relayNodePath ?? (local.relayMode === 'local' ? nodePath : '/usr/local/bin/node'),
+        BRIDGE_RELAY_SCRIPT_PATH: local.relayScriptPath
+          ?? (local.relayMode === 'local'
+            ? join(bridgeRoot, 'src', 'relay-stdio.mjs')
+            : '/opt/tg-engage/bridge/src/relay-stdio.mjs'),
         BRIDGE_RELAY_DB_PATH: local.relayDbPath ?? '/var/lib/codex-tg-bridge/bridge.sqlite3',
         CODEX_APPROVAL_POLICY: local.approvalPolicy ?? 'on-request',
         CODEX_SANDBOX_MODE: local.sandboxMode ?? 'workspace-write',

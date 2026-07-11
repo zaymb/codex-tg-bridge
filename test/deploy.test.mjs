@@ -37,3 +37,17 @@ test('installer requires Node only and does not provision a cloud Codex runtime'
   assert.doesNotMatch(install, /codex --version|codexbot|generate-json-schema|codex-tg-app\.service/)
   assert.doesNotMatch(install, /TELEGRAM_BOT_TOKEN=/)
 })
+
+test('user release staging installs an isolated verified Node without touching service state', async () => {
+  const stage = await file('stage-user-release.sh')
+
+  assert.match(stage, /^NODE_VERSION=\$\{NODE_VERSION:-v24\.18\.0\}$/m)
+  assert.match(stage, /https:\/\/nodejs\.org\/dist\/\$\{NODE_VERSION\}/)
+  assert.match(stage, /sha256sum/)
+  assert.match(stage, /\.local\/share\}\/codex-tg-bridge/)
+  assert.match(stage, /"\$\{node_binary\}" --check/)
+  assert.match(stage, /"\$\{npm_cli\}" test/)
+  assert.match(stage, /service_changed=false/)
+  assert.doesNotMatch(stage, /systemctl|sudo|\/usr\/bin\/node|\/usr\/local\/bin\/node/)
+  assert.doesNotMatch(stage, /\.bridge-state|TELEGRAM_TOKEN|credentials/)
+})

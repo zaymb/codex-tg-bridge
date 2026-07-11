@@ -15,7 +15,7 @@ const execFile = promisify(execFileCallback)
 const bridgeRoot = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const contractPath = process.env.CODEX_CONTRACT_PATH
   ?? join(bridgeRoot, 'fixtures/codex-app-server-0.143.0/contract.json')
-const codexBin = process.env.CODEX_BIN ?? '/Users/alta/.local/bin/codex'
+const codexBin = process.env.CODEX_BIN ?? 'codex'
 const workdir = process.env.CODEX_SMOKE_WORKDIR ?? resolve(bridgeRoot, '..')
 
 async function waitForSocket(path, child, logs, timeoutMs = 20_000) {

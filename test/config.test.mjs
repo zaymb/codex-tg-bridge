@@ -184,3 +184,22 @@ test('loads explicit no-prompt permissions for the local Telegram connector', ()
   env.CODEX_SANDBOX_MODE = 'everything'
   assert.throws(() => loadLocalConnectorConfig(env), /CODEX_SANDBOX_MODE/)
 })
+
+test('loads a same-host relay without requiring SSH configuration', () => {
+  const config = loadLocalConnectorConfig({
+    BRIDGE_SESSION_LABEL: 'tg-engage',
+    CODEX_SESSION_ID: 'session-a',
+    APP_SERVER_SOCKET: '/run/user/1000/codex-app.sock',
+    CODEX_CONTRACT_PATH: '/home/user/bridge/contract.json',
+    BRIDGE_RELAY_MODE: 'local',
+    BRIDGE_RELAY_NODE_PATH: '/home/user/runtime/node-v24/bin/node',
+    BRIDGE_RELAY_SCRIPT_PATH: '/home/user/releases/release-a/src/relay-stdio.mjs',
+    BRIDGE_RELAY_DB_PATH: '/home/user/codex-tg-bridge/.bridge-state/bridge.sqlite3',
+  })
+
+  assert.equal(config.relayMode, 'local')
+  assert.equal(config.localNodePath, '/home/user/runtime/node-v24/bin/node')
+  assert.equal(config.localScriptPath, '/home/user/releases/release-a/src/relay-stdio.mjs')
+  assert.equal(config.localDbPath, '/home/user/codex-tg-bridge/.bridge-state/bridge.sqlite3')
+  assert.equal('sshIdentityFile' in config, false)
+})

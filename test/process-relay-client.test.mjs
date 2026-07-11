@@ -22,6 +22,7 @@ test('starts the relay command, completes hello, and parses frames', async t => 
   const client = new ProcessRelayClient({
     command: 'ssh',
     args: ['relay-host', 'relay-command'],
+    env: { BRIDGE_DB_PATH: '/tmp/bridge.sqlite3' },
     spawnImpl(command, args, options) {
       spawned.push({ command, args, options })
       return child
@@ -43,6 +44,7 @@ test('starts the relay command, completes hello, and parses frames', async t => 
   assert.deepEqual(spawned[0].options.stdio, ['pipe', 'pipe', 'pipe'])
   assert.equal(spawned[0].options.detached, true)
   assert.equal(spawned[0].options.env.TERM, 'dumb')
+  assert.equal(spawned[0].options.env.BRIDGE_DB_PATH, '/tmp/bridge.sqlite3')
   assert.deepEqual(JSON.parse(writes.join('').trim()), {
     version: 1,
     type: 'hello',

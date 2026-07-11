@@ -99,6 +99,30 @@ closes the connector and app-server. It installs no launchd service.
 The checked contract fixture targets local `codex-cli 0.144.1`. Regenerate and
 review it whenever Codex CLI changes; startup fails closed on a version mismatch.
 
+### Same-host VPS staging
+
+When Telegram transport and Codex run under the same Unix user, set
+`BRIDGE_RELAY_MODE=local`. The connector then starts `relay-stdio.mjs` directly
+with the configured absolute Node, script, and SQLite paths; it does not invoke
+SSH. The existing `ssh` mode remains the default for split-host deployments.
+
+Before changing an existing user service, stage an isolated Node 24 runtime and
+a separate tested release:
+
+```bash
+git clone https://github.com/zaymb/tg-engage.git
+cd tg-engage
+bash bridge/deploy/stage-user-release.sh
+```
+
+The staging script downloads a pinned archive from `nodejs.org`, verifies it
+against the official `SHASUMS256.txt`, and installs it below
+`${XDG_DATA_HOME:-$HOME/.local/share}/codex-tg-bridge/runtime/`. It copies the
+bridge into a commit-addressed release directory, runs syntax checks and the
+full test suite with the isolated binary, and prints an installation report.
+It never edits PATH, symlinks, `.env`, credentials, durable state, or systemd.
+Service switching is a separate, explicitly approved phase.
+
 ## Telegram setup
 
 For owner DM, no group configuration is needed. Before group acceptance:

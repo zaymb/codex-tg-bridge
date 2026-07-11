@@ -222,26 +222,25 @@ export function loadRelayConfig(env = process.env) {
 }
 
 export function loadLocalConnectorConfig(env = process.env) {
+  const relayMode = parseChoice(
+    env.BRIDGE_RELAY_MODE,
+    'BRIDGE_RELAY_MODE',
+    ['ssh', 'local'],
+    'ssh',
+  )
   const sandboxMode = parseChoice(
     env.CODEX_SANDBOX_MODE,
     'CODEX_SANDBOX_MODE',
     ['read-only', 'workspace-write', 'danger-full-access'],
     'workspace-write',
   )
-  return {
+  const config = {
     sessionLabel: parseSessionLabel(env.BRIDGE_SESSION_LABEL),
     codexSessionId: requireSimpleValue(env.CODEX_SESSION_ID, 'CODEX_SESSION_ID'),
     threadId: requireSimpleValue(env.CODEX_THREAD_ID ?? env.CODEX_SESSION_ID, 'CODEX_THREAD_ID'),
     appServerSocket: requireAbsolutePath(env.APP_SERVER_SOCKET, 'APP_SERVER_SOCKET'),
     contractPath: requireAbsolutePath(env.CODEX_CONTRACT_PATH, 'CODEX_CONTRACT_PATH'),
-    sshPath: requireAbsolutePath(env.BRIDGE_SSH_PATH ?? '/usr/bin/ssh', 'BRIDGE_SSH_PATH'),
-    sshHost: requireSimpleValue(env.BRIDGE_RELAY_HOST, 'BRIDGE_RELAY_HOST'),
-    sshUser: requireSimpleValue(env.BRIDGE_RELAY_SSH_USER, 'BRIDGE_RELAY_SSH_USER'),
-    sshIdentityFile: requireAbsolutePath(env.BRIDGE_RELAY_IDENTITY_FILE, 'BRIDGE_RELAY_IDENTITY_FILE'),
-    remoteServiceUser: requireSimpleValue(env.BRIDGE_RELAY_SERVICE_USER ?? 'tgbridge', 'BRIDGE_RELAY_SERVICE_USER'),
-    remoteNodePath: requireAbsolutePath(env.BRIDGE_RELAY_NODE_PATH ?? '/usr/local/bin/node', 'BRIDGE_RELAY_NODE_PATH'),
-    remoteScriptPath: requireAbsolutePath(env.BRIDGE_RELAY_SCRIPT_PATH ?? '/opt/tg-engage/bridge/src/relay-stdio.mjs', 'BRIDGE_RELAY_SCRIPT_PATH'),
-    remoteDbPath: requireAbsolutePath(env.BRIDGE_RELAY_DB_PATH ?? '/var/lib/codex-tg-bridge/bridge.sqlite3', 'BRIDGE_RELAY_DB_PATH'),
+    relayMode,
     frameMaxBytes: parseInteger(env, 'BRIDGE_RELAY_FRAME_MAX_BYTES', 262_144, 1_024, 1_048_576),
     heartbeatIntervalMs: parseInteger(env, 'BRIDGE_RELAY_HEARTBEAT_INTERVAL_MS', 5_000, 1_000, 30_000),
     approvalPolicy: parseChoice(
@@ -255,5 +254,24 @@ export function loadLocalConnectorConfig(env = process.env) {
       : sandboxMode === 'read-only'
         ? { type: 'readOnly', networkAccess: false }
         : { type: 'workspaceWrite', writableRoots: [], networkAccess: false },
+  }
+  if (relayMode === 'local') {
+    return {
+      ...config,
+      localNodePath: requireAbsolutePath(env.BRIDGE_RELAY_NODE_PATH ?? process.execPath, 'BRIDGE_RELAY_NODE_PATH'),
+      localScriptPath: requireAbsolutePath(env.BRIDGE_RELAY_SCRIPT_PATH, 'BRIDGE_RELAY_SCRIPT_PATH'),
+      localDbPath: requireAbsolutePath(env.BRIDGE_RELAY_DB_PATH, 'BRIDGE_RELAY_DB_PATH'),
+    }
+  }
+  return {
+    ...config,
+    sshPath: requireAbsolutePath(env.BRIDGE_SSH_PATH ?? '/usr/bin/ssh', 'BRIDGE_SSH_PATH'),
+    sshHost: requireSimpleValue(env.BRIDGE_RELAY_HOST, 'BRIDGE_RELAY_HOST'),
+    sshUser: requireSimpleValue(env.BRIDGE_RELAY_SSH_USER, 'BRIDGE_RELAY_SSH_USER'),
+    sshIdentityFile: requireAbsolutePath(env.BRIDGE_RELAY_IDENTITY_FILE, 'BRIDGE_RELAY_IDENTITY_FILE'),
+    remoteServiceUser: requireSimpleValue(env.BRIDGE_RELAY_SERVICE_USER ?? 'tgbridge', 'BRIDGE_RELAY_SERVICE_USER'),
+    remoteNodePath: requireAbsolutePath(env.BRIDGE_RELAY_NODE_PATH ?? '/usr/local/bin/node', 'BRIDGE_RELAY_NODE_PATH'),
+    remoteScriptPath: requireAbsolutePath(env.BRIDGE_RELAY_SCRIPT_PATH ?? '/opt/tg-engage/bridge/src/relay-stdio.mjs', 'BRIDGE_RELAY_SCRIPT_PATH'),
+    remoteDbPath: requireAbsolutePath(env.BRIDGE_RELAY_DB_PATH ?? '/var/lib/codex-tg-bridge/bridge.sqlite3', 'BRIDGE_RELAY_DB_PATH'),
   }
 }

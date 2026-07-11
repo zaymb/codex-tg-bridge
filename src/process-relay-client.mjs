@@ -8,6 +8,7 @@ export class ProcessRelayClient extends EventEmitter {
   #spawn
   #frameMaxBytes
   #connectTimeoutMs
+  #env
   #child = null
   #lines = null
   #closed = false
@@ -18,6 +19,7 @@ export class ProcessRelayClient extends EventEmitter {
     spawnImpl = spawn,
     frameMaxBytes = 262_144,
     connectTimeoutMs = 15_000,
+    env = process.env,
   }) {
     super()
     this.#command = command
@@ -25,6 +27,7 @@ export class ProcessRelayClient extends EventEmitter {
     this.#spawn = spawnImpl
     this.#frameMaxBytes = frameMaxBytes
     this.#connectTimeoutMs = connectTimeoutMs
+    this.#env = env
   }
 
   connect(hello) {
@@ -32,7 +35,7 @@ export class ProcessRelayClient extends EventEmitter {
     this.#child = this.#spawn(this.#command, this.#args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: true,
-      env: { ...process.env, TERM: 'dumb' },
+      env: { ...this.#env, TERM: 'dumb' },
     })
     this.#lines = createInterface({ input: this.#child.stdout, crlfDelay: Infinity })
     return new Promise((resolve, reject) => {

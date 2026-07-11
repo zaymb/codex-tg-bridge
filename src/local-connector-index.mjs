@@ -28,6 +28,25 @@ export function buildRelaySshArgs(config) {
   ]
 }
 
+export function buildRelayProcessSpec(config, env = process.env) {
+  if (config.relayMode === 'local') {
+    return {
+      command: config.localNodePath,
+      args: [config.localScriptPath],
+      env: {
+        ...env,
+        BRIDGE_DB_PATH: config.localDbPath,
+        BRIDGE_SESSION_LABEL: config.sessionLabel,
+      },
+    }
+  }
+  return {
+    command: config.sshPath,
+    args: buildRelaySshArgs(config),
+    env,
+  }
+}
+
 export async function main(env = process.env) {
   const config = loadLocalConnectorConfig(env)
   const contract = JSON.parse(await readFile(config.contractPath, 'utf8'))
@@ -35,9 +54,9 @@ export async function main(env = process.env) {
     socketPath: config.appServerSocket,
     contract,
   })
+  const relayProcess = buildRelayProcessSpec(config, env)
   const relayClient = new ProcessRelayClient({
-    command: config.sshPath,
-    args: buildRelaySshArgs(config),
+    ...relayProcess,
     frameMaxBytes: config.frameMaxBytes,
   })
   const connector = new LocalSessionConnector({
