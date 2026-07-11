@@ -17,7 +17,6 @@ function wait(ms, signal) {
   return new Promise(resolve => {
     if (signal?.aborted) return resolve()
     const timer = setTimeout(resolve, ms)
-    timer.unref?.()
     signal?.addEventListener('abort', () => {
       clearTimeout(timer)
       resolve()
@@ -82,7 +81,7 @@ export class ConnectorSupervisor {
 
   #monitorOutput(child) {
     let connected = false
-    let lastError = null
+    const errorLines = []
     const stdout = createInterface({ input: child.stdout, crlfDelay: Infinity })
     const stderr = createInterface({ input: child.stderr, crlfDelay: Infinity })
     stdout.on('line', line => {
@@ -100,11 +99,12 @@ export class ConnectorSupervisor {
       })
     })
     stderr.on('line', line => {
-      lastError = line.slice(0, 2_000)
+      errorLines.push(line.slice(0, 2_000))
+      if (errorLines.length > 10) errorLines.shift()
     })
     return {
       connected: () => connected,
-      lastError: () => lastError,
+      lastError: () => errorLines.length > 0 ? errorLines.join('\n') : null,
       close() {
         stdout.close()
         stderr.close()
