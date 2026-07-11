@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
+import { ConnectorSupervisor, createChannelStatusWriter } from './connector-supervisor.mjs'
+
 const bridgeRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 function wait(ms) {
@@ -50,15 +52,22 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   const contractPath = resolve(bridgeRoot, local.contractPath ?? 'fixtures/codex-app-server-0.144.1/contract.json')
 
   const appServer = spawn(codexPath, ['app-server', '--listen', `unix://${socketPath}`], {
-    stdio: ['ignore', 'ignore', 'inherit'],
+    stdio: ['ignore', 'ignore', 'ignore'],
     env,
+    detached: true,
   })
-  let connector = null
+  const connectorController = new AbortController()
+  let connectorRun = null
   let tui = null
   try {
     await waitForSocket(socketPath, appServer)
-    connector = spawn(nodePath, [join(bridgeRoot, 'src', 'local-connector-index.mjs')], {
-      stdio: ['ignore', 'inherit', 'inherit'],
+    const writeChannelStatus = createChannelStatusWriter(resolve(
+      bridgeRoot,
+      local.statusPath ?? '.state/channel-status.json',
+    ))
+    const supervisor = new ConnectorSupervisor({
+      command: nodePath,
+      args: [join(bridgeRoot, 'src', 'local-connector-index.mjs')],
       env: {
         ...env,
         BRIDGE_SESSION_LABEL: local.sessionLabel,
@@ -77,12 +86,15 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
         CODEX_APPROVAL_POLICY: local.approvalPolicy ?? 'on-request',
         CODEX_SANDBOX_MODE: local.sandboxMode ?? 'workspace-write',
       },
+      statusWriter: status => writeChannelStatus({
+        ...status,
+        sessionLabel: local.sessionLabel,
+        codexSessionId: sessionId,
+      }),
+      reconnectInitialMs: local.reconnectInitialMs ?? 1_000,
+      reconnectMaxMs: local.reconnectMaxMs ?? 20_000,
     })
-    childExit(connector).then(({ code, signal }) => {
-      if (tui?.exitCode === null) {
-        console.error(`Telegram channel stopped (${code ?? signal}); Codex TUI remains available.`)
-      }
-    }).catch(error => console.error(`Telegram channel failed: ${error.message}`))
+    connectorRun = supervisor.run({ signal: connectorController.signal })
 
     tui = spawn(codexPath, ['resume', '--remote', `unix://${socketPath}`, sessionId], {
       stdio: 'inherit',
@@ -91,9 +103,9 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     const result = await childExit(tui)
     if (result.code !== 0 && result.signal === null) process.exitCode = result.code
   } finally {
-    if (connector?.exitCode === null) connector.kill('SIGTERM')
+    connectorController.abort()
     if (appServer.exitCode === null) appServer.kill('SIGTERM')
-    await Promise.allSettled([connector && childExit(connector), childExit(appServer)].filter(Boolean))
+    await Promise.allSettled([connectorRun, childExit(appServer)].filter(Boolean))
     await rm(runtimeDir, { recursive: true, force: true })
   }
 }

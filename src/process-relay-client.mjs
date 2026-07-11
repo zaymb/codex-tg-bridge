@@ -31,6 +31,8 @@ export class ProcessRelayClient extends EventEmitter {
     if (this.#child) throw new Error('relay process is already started')
     this.#child = this.#spawn(this.#command, this.#args, {
       stdio: ['pipe', 'pipe', 'pipe'],
+      detached: true,
+      env: { ...process.env, TERM: 'dumb' },
     })
     this.#lines = createInterface({ input: this.#child.stdout, crlfDelay: Infinity })
     return new Promise((resolve, reject) => {

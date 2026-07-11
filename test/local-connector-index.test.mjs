@@ -17,6 +17,7 @@ test('builds a non-interactive SSH relay command without Telegram credentials', 
 
   assert.deepEqual(args.slice(0, 2), ['-T', '-i'])
   assert.equal(args.includes('BatchMode=yes'), true)
+  assert.equal(args.includes('RequestTTY=no'), true)
   assert.equal(args.includes('ubuntu@relay.example'), true)
   assert.equal(args.includes('BRIDGE_SESSION_LABEL=tg-engage'), true)
   assert.equal(args.some(value => /token|secret/iu.test(value)), false)

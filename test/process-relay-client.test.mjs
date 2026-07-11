@@ -22,8 +22,8 @@ test('starts the relay command, completes hello, and parses frames', async t => 
   const client = new ProcessRelayClient({
     command: 'ssh',
     args: ['relay-host', 'relay-command'],
-    spawnImpl(command, args) {
-      spawned.push({ command, args })
+    spawnImpl(command, args, options) {
+      spawned.push({ command, args, options })
       return child
     },
     connectTimeoutMs: 1_000,
@@ -38,7 +38,11 @@ test('starts the relay command, completes hello, and parses frames', async t => 
   child.stdout.write(`${JSON.stringify({ version: 1, type: 'job', job: { jobId: 'telegram:1' } })}\n`)
   await new Promise(resolve => setImmediate(resolve))
 
-  assert.deepEqual(spawned, [{ command: 'ssh', args: ['relay-host', 'relay-command'] }])
+  assert.equal(spawned[0].command, 'ssh')
+  assert.deepEqual(spawned[0].args, ['relay-host', 'relay-command'])
+  assert.deepEqual(spawned[0].options.stdio, ['pipe', 'pipe', 'pipe'])
+  assert.equal(spawned[0].options.detached, true)
+  assert.equal(spawned[0].options.env.TERM, 'dumb')
   assert.deepEqual(JSON.parse(writes.join('').trim()), {
     version: 1,
     type: 'hello',

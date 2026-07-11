@@ -36,23 +36,38 @@ function normalizeInbound(frame) {
   return null
 }
 
+function senderLabel(context) {
+  return context.senderDisplayName || context.senderUsername || context.senderId || 'unknown sender'
+}
+
+function messageLine(job) {
+  const context = job.payload?.telegramContext ?? {}
+  const sender = senderLabel(context)
+  const replyTarget = context.replyTo?.senderDisplayName
+    || context.replyTo?.senderUsername
+    || context.replyTo?.senderId
+  const replyNote = replyTarget ? ` (replying to ${replyTarget})` : ''
+  const messageId = context.messageId ?? 'unknown'
+  return `[TG][message_id=${messageId}][sender=${sender}]${replyNote}\n${job.payload?.text || '[no text]'}`
+}
+
 function batchInput(jobs) {
   if (jobs.length === 1) {
-    return [{ type: 'text', text: jobs[0].payload?.text || '[Telegram event with no text content]' }]
+    return [{ type: 'text', text: messageLine(jobs[0]) }]
   }
   const lines = [
-    `[Telegram inbound batch: ${jobs.length} messages received while the previous turn was busy]`,
+    `[TG BATCH: ${jobs.length} messages received while the previous turn was busy]`,
     'Read them in order. You may answer once in text, or use responses to reply selectively to any listed message_id values.',
   ]
   jobs.forEach((job, index) => {
     const context = job.payload?.telegramContext ?? {}
-    const sender = context.senderDisplayName || context.senderUsername || context.senderId || 'unknown sender'
+    const sender = senderLabel(context)
     const replyTarget = context.replyTo?.senderDisplayName
       || context.replyTo?.senderUsername
       || context.replyTo?.senderId
     const replyNote = replyTarget ? ` (replying to ${replyTarget})` : ''
     const messageId = context.messageId ?? 'unknown'
-    lines.push(`${index + 1}. [message_id=${messageId}] ${sender}${replyNote}: ${job.payload?.text || '[no text]'}`)
+    lines.push(`${index + 1}. [TG][message_id=${messageId}] ${sender}${replyNote}: ${job.payload?.text || '[no text]'}`)
   })
   return [{ type: 'text', text: lines.join('\n') }]
 }
@@ -225,7 +240,13 @@ export class LocalSessionConnector extends EventEmitter {
 
   async #handleRelayFrame(frame) {
     if (!frame || frame.version !== RELAY_PROTOCOL_VERSION) throw new Error('unsupported relay protocol version')
-    if (frame.type === 'heartbeat' || frame.type === 'ready') return
+    if (frame.type === 'heartbeat' || frame.type === 'ready') {
+      this.emit('relayStatus', {
+        status: 'connected',
+        remoteNowMs: frame.nowMs ?? null,
+      })
+      return
+    }
     if (frame.type === 'error') throw new Error(`VPS relay error: ${frame.message}`)
     if (frame.type === 'job_recorded') {
       if (!this.#recordedMatches(frame)) return
@@ -256,10 +277,16 @@ export class LocalSessionConnector extends EventEmitter {
           telegram: {
             kind: 'untrusted',
             value: JSON.stringify({
+              source: 'telegram',
+              transportStatus: 'connected',
               batchId: inbound.batchId,
               messageCount: inbound.jobs.length,
               messages: telegramMessages,
             }),
+          },
+          telegram_source: {
+            kind: 'application',
+            value: '[TG] This turn originated from Telegram. Turns without this marker originate from the terminal or another local client.',
           },
           telegram_output_contract: { kind: 'application', value: TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS },
         },

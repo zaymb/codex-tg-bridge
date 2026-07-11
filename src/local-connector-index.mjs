@@ -14,6 +14,7 @@ export function buildRelaySshArgs(config) {
     '-T',
     '-i', config.sshIdentityFile,
     '-o', 'BatchMode=yes',
+    '-o', 'RequestTTY=no',
     '-o', 'ConnectTimeout=10',
     '-o', 'ServerAliveInterval=15',
     '-o', 'ServerAliveCountMax=3',
@@ -62,6 +63,13 @@ export async function main(env = process.env) {
     appServerClient.once('protocolError', fail)
   })
   try {
+    connector.on('relayStatus', status => {
+      console.log(JSON.stringify({
+        level: 'info',
+        event: 'local_connector_heartbeat',
+        remoteNowMs: status.remoteNowMs ?? null,
+      }))
+    })
     await Promise.race([connector.start(), failure])
     console.log(JSON.stringify({
       level: 'info',

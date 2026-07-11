@@ -9,12 +9,18 @@ VPS does not run Codex.
   reliable Telegram sends.
 - Mac launcher: one Codex app-server shared by the interactive TUI and the
   Telegram connector.
+- The launcher supervises the connector, writes `.state/channel-status.json`,
+  and reconnects with bounded exponential backoff while the TUI stays open.
 - SSH stdio: an outbound-only Mac connection. No listener is opened on the Mac
   or exposed publicly on the VPS.
+- App-server, connector, and SSH relay processes are detached from the TUI's
+  controlling terminal. Only the Codex TUI inherits terminal stdio.
 - A Telegram job is claimed only while the target Codex thread is idle. Local
   TUI turns take priority.
 - One queued batch can produce one compatibility reply or multiple targeted
   replies to selected messages from that batch.
+- Every injected Telegram message is prefixed with `[TG]`; an unmarked user
+  turn came from the terminal or another local Codex client.
 - Jobs older than 24 hours expire silently before acceptance.
 
 When the local connector is absent, each Telegram conversation receives this

@@ -127,17 +127,21 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
   assert.equal(started.params.threadId, 'thread-a')
   assert.equal(started.params.clientUserMessageId, 'batch:telegram:1:telegram:2')
   assert.equal(started.params.input.length, 1)
-  assert.match(started.params.input[0].text, /1\. \[message_id=10\] Alta: first message/)
-  assert.match(started.params.input[0].text, /2\. \[message_id=11\] laurie_bot \(replying to Alta\): second message/)
+  assert.match(started.params.input[0].text, /^\[TG BATCH:/)
+  assert.match(started.params.input[0].text, /1\. \[TG\]\[message_id=10\] Alta: first message/)
+  assert.match(started.params.input[0].text, /2\. \[TG\]\[message_id=11\] laurie_bot \(replying to Alta\): second message/)
   assert.ok(started.params.input[0].text.indexOf('first message') < started.params.input[0].text.indexOf('second message'))
   assert.equal('cwd' in started.params, false)
   assert.equal(started.params.approvalPolicy, 'never')
   assert.deepEqual(started.params.sandboxPolicy, { type: 'dangerFullAccess' })
   assert.deepEqual(JSON.parse(started.params.additionalContext.telegram.value), {
+    source: 'telegram',
+    transportStatus: 'connected',
     batchId: 'batch:telegram:1:telegram:2',
     messageCount: 2,
     messages: batch().batch.jobs.map(job => job.payload.telegramContext),
   })
+  assert.match(started.params.additionalContext.telegram_source.value, /originated from Telegram/)
   assert.deepEqual(setup.relay.frames.at(-1), {
     version: 1,
     type: 'job_accepted',
@@ -250,7 +254,10 @@ test('accepts a legacy single-job frame during rolling deployment', async t => {
   await setup.connector.idle()
 
   const started = setup.app.calls.find(call => call.method === 'turn/start')
-  assert.deepEqual(started.params.input, [{ type: 'text', text: 'legacy Telegram message' }])
+  assert.deepEqual(started.params.input, [{
+    type: 'text',
+    text: '[TG][message_id=9][sender=unknown sender]\nlegacy Telegram message',
+  }])
   assert.deepEqual(setup.relay.frames.at(-1), {
     version: 1,
     type: 'job_accepted',
@@ -258,4 +265,17 @@ test('accepts a legacy single-job frame during rolling deployment', async t => {
     threadId: 'thread-a',
     turnId: 'turn-tg',
   })
+})
+
+test('emits relay status heartbeats for an external channel monitor', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  const statuses = []
+  setup.connector.on('relayStatus', status => statuses.push(status))
+  await setup.connector.start()
+
+  setup.relay.emit('frame', { version: 1, type: 'heartbeat', nowMs: 1234 })
+  await setup.connector.idle()
+
+  assert.deepEqual(statuses.at(-1), { status: 'connected', remoteNowMs: 1234 })
 })
