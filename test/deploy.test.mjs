@@ -141,5 +141,9 @@ test('installer verifies Node, Codex, swap, and schema before enabling services'
   assert.match(install, /SwapTotal/)
   assert.match(install, /generate-json-schema/)
   assert.match(install, /capture-codex-contract\.mjs/)
+  assert.match(
+    install,
+    /useradd[^\n]+codexbot[\s\S]+chown codexbot:codexbot "\$SCHEMA_DIR"[\s\S]+runuser -u codexbot/,
+  )
   assert.doesNotMatch(install, /TELEGRAM_BOT_TOKEN=/)
 })

@@ -33,6 +33,7 @@ id codexbot >/dev/null 2>&1 || useradd --system --create-home --home-dir /var/li
 id tgbridge >/dev/null 2>&1 || useradd --system --create-home --home-dir /var/lib/codex-tg-bridge --shell /usr/sbin/nologin tgbridge
 usermod -a -G codex-tg codexbot
 usermod -a -G codex-tg,codex-tg-wake tgbridge
+chown codexbot:codexbot "$SCHEMA_DIR"
 
 install -d -o root -g root -m 0755 "$INSTALL_ROOT/bridge"
 cp -a "$SOURCE_ROOT/bridge/." "$INSTALL_ROOT/bridge/"
