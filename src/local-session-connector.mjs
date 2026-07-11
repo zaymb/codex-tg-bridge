@@ -3,7 +3,6 @@ import { EventEmitter } from 'node:events'
 import {
   parseTelegramStructuredOutput,
   TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS,
-  TELEGRAM_BATCH_OUTPUT_SCHEMA,
 } from './codex-runner.mjs'
 import { RELAY_PROTOCOL_VERSION } from './relay-protocol.mjs'
 
@@ -334,7 +333,6 @@ export class LocalSessionConnector extends EventEmitter {
           },
           telegram_output_contract: { kind: 'application', value: TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS },
         },
-        outputSchema: TELEGRAM_BATCH_OUTPUT_SCHEMA,
         ...(this.#approvalPolicy ? { approvalPolicy: this.#approvalPolicy } : {}),
         ...(this.#sandboxPolicy ? { sandboxPolicy: this.#sandboxPolicy } : {}),
       })

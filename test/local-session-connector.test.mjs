@@ -134,6 +134,7 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
   assert.equal('cwd' in started.params, false)
   assert.equal(started.params.approvalPolicy, 'never')
   assert.deepEqual(started.params.sandboxPolicy, { type: 'dangerFullAccess' })
+  assert.equal('outputSchema' in started.params, false)
   assert.deepEqual(JSON.parse(started.params.additionalContext.telegram.value), {
     source: 'telegram',
     transportStatus: 'connected',
@@ -142,6 +143,8 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
     messages: batch().batch.jobs.map(job => job.payload.telegramContext),
   })
   assert.match(started.params.additionalContext.telegram_source.value, /originated from Telegram/)
+  assert.match(started.params.additionalContext.telegram_output_contract.value, /latest user input is marked \[TG\]/)
+  assert.match(started.params.additionalContext.telegram_output_contract.value, /answer it normally in plain text/)
   assert.deepEqual(setup.relay.frames.at(-1), {
     version: 1,
     type: 'job_accepted',
@@ -242,7 +245,7 @@ test('never sends a mixed Telegram and terminal turn back to Telegram', async t 
       id: 'mixed-answer',
       type: 'agentMessage',
       phase: 'final_answer',
-      text: JSON.stringify({ action: 'send', text: 'terminal-only answer', reason: 'mixed' }),
+      text: 'terminal-only answer',
     },
   })
   setup.app.emit('notification:turn/completed', {

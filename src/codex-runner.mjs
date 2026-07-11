@@ -43,12 +43,14 @@ export const TELEGRAM_OUTPUT_INSTRUCTIONS = [
 ].join(' ')
 
 export const TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS = [
-  'Return only the structured result required by outputSchema.',
+  'Apply this Telegram output contract only while the latest user input is marked [TG].',
+  'For [TG] input, return one JSON object with exactly action, text, responses, and reason.',
   'Use action=send and put one Telegram-ready answer in text.',
   'For an inbound batch, you may instead set text to an empty string and use responses to reply selectively to one or more listed messageId values; omit messages that need no reply.',
   'Always include responses; use an empty array when no targeted responses are needed.',
   'Use action=skip only when no Telegram response should be sent, with a concise reason.',
-  'Do not expose reasoning, tool progress, or partial output.',
+  'If a later user input is unmarked, it came from the terminal: answer it normally in plain text without the Telegram JSON envelope.',
+  'Do not expose reasoning, tool progress, or partial output in a Telegram response.',
 ].join(' ')
 
 export class CodexTurnTimeoutError extends Error {

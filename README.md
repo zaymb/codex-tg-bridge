@@ -19,8 +19,10 @@ VPS does not run Codex.
   TUI turns take priority.
 - One queued batch can produce one compatibility reply or multiple targeted
   replies to selected messages from that batch.
-- The strict batch output schema always includes `responses`; ordinary replies
-  and skips use an empty array.
+- A pure Telegram batch uses a structured envelope whose `responses` field is
+  always present; ordinary replies and skips use an empty array. The shared
+  session does not force this with `response_format`, because a local TUI steer
+  can join the active turn and must still receive a normal terminal answer.
 - Every injected Telegram message is prefixed with `[TG]` and its automatic
   `conversation_key`; an unmarked user turn came from the terminal or another
   local Codex client.
