@@ -46,7 +46,6 @@ Codex 会话「tg-engage」当前不在线。
 ## Tests
 
 ```bash
-cd bridge
 npm ci
 npm test
 ```
@@ -90,7 +89,6 @@ coordinates, never the Telegram token.
 Start or resume a Codex session through the channel launcher:
 
 ```bash
-cd bridge
 npm run channel -- <codex-session-id>
 ```
 
