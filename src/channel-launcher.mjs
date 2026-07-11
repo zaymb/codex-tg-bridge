@@ -74,6 +74,8 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
         BRIDGE_RELAY_NODE_PATH: local.relayNodePath ?? '/usr/local/bin/node',
         BRIDGE_RELAY_SCRIPT_PATH: local.relayScriptPath ?? '/opt/tg-engage/bridge/src/relay-stdio.mjs',
         BRIDGE_RELAY_DB_PATH: local.relayDbPath ?? '/var/lib/codex-tg-bridge/bridge.sqlite3',
+        CODEX_APPROVAL_POLICY: local.approvalPolicy ?? 'on-request',
+        CODEX_SANDBOX_MODE: local.sandboxMode ?? 'workspace-write',
       },
     })
     childExit(connector).then(({ code, signal }) => {

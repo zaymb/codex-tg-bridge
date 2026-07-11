@@ -122,6 +122,7 @@ export async function createBridgeRuntime({
       maxConcurrentTurns: config.maxConcurrentTurns,
       updateLeaseMs: config.updateLeaseMs,
       typingIntervalMs: config.typingIntervalMs,
+      botIdentity: bot,
     })
     const poller = new Poller({
       telegramClient,

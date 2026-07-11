@@ -149,6 +149,12 @@ function requireSimpleValue(value, name) {
   return result
 }
 
+function parseChoice(value, name, choices, fallback = null) {
+  const selected = value?.trim() || fallback
+  if (!choices.includes(selected)) throw new Error(`${name} must be one of: ${choices.join(', ')}`)
+  return selected
+}
+
 export function loadConfig(env = process.env) {
   const token = createTokenReader(env)
   const ownerUserId = parseId(env.TELEGRAM_OWNER_USER_ID, 'TELEGRAM_OWNER_USER_ID', true)
@@ -216,6 +222,12 @@ export function loadRelayConfig(env = process.env) {
 }
 
 export function loadLocalConnectorConfig(env = process.env) {
+  const sandboxMode = parseChoice(
+    env.CODEX_SANDBOX_MODE,
+    'CODEX_SANDBOX_MODE',
+    ['read-only', 'workspace-write', 'danger-full-access'],
+    'workspace-write',
+  )
   return {
     sessionLabel: parseSessionLabel(env.BRIDGE_SESSION_LABEL),
     codexSessionId: requireSimpleValue(env.CODEX_SESSION_ID, 'CODEX_SESSION_ID'),
@@ -232,5 +244,16 @@ export function loadLocalConnectorConfig(env = process.env) {
     remoteDbPath: requireAbsolutePath(env.BRIDGE_RELAY_DB_PATH ?? '/var/lib/codex-tg-bridge/bridge.sqlite3', 'BRIDGE_RELAY_DB_PATH'),
     frameMaxBytes: parseInteger(env, 'BRIDGE_RELAY_FRAME_MAX_BYTES', 262_144, 1_024, 1_048_576),
     heartbeatIntervalMs: parseInteger(env, 'BRIDGE_RELAY_HEARTBEAT_INTERVAL_MS', 5_000, 1_000, 30_000),
+    approvalPolicy: parseChoice(
+      env.CODEX_APPROVAL_POLICY,
+      'CODEX_APPROVAL_POLICY',
+      ['untrusted', 'on-request', 'never'],
+      'on-request',
+    ),
+    sandboxPolicy: sandboxMode === 'danger-full-access'
+      ? { type: 'dangerFullAccess' }
+      : sandboxMode === 'read-only'
+        ? { type: 'readOnly', networkAccess: false }
+        : { type: 'workspaceWrite', writableRoots: [], networkAccess: false },
   }
 }

@@ -11,9 +11,41 @@ export const TELEGRAM_OUTPUT_SCHEMA = Object.freeze({
   },
 })
 
+export const TELEGRAM_BATCH_OUTPUT_SCHEMA = Object.freeze({
+  type: 'object',
+  additionalProperties: false,
+  required: ['action', 'text', 'reason'],
+  properties: {
+    action: { type: 'string', enum: ['send', 'skip'] },
+    text: { type: 'string' },
+    responses: {
+      type: 'array',
+      maxItems: 32,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['messageId', 'text'],
+        properties: {
+          messageId: { type: 'string', pattern: '^\\d+$' },
+          text: { type: 'string', minLength: 1 },
+        },
+      },
+    },
+    reason: { type: 'string' },
+  },
+})
+
 export const TELEGRAM_OUTPUT_INSTRUCTIONS = [
   'Return only the structured result required by outputSchema.',
   'Use action=send and put the complete Telegram-ready final answer in text.',
+  'Use action=skip only when no Telegram response should be sent, with a concise reason.',
+  'Do not expose reasoning, tool progress, or partial output.',
+].join(' ')
+
+export const TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS = [
+  'Return only the structured result required by outputSchema.',
+  'Use action=send and put one Telegram-ready answer in text.',
+  'For an inbound batch, you may instead set text to an empty string and use responses to reply selectively to one or more listed messageId values; omit messages that need no reply.',
   'Use action=skip only when no Telegram response should be sent, with a concise reason.',
   'Do not expose reasoning, tool progress, or partial output.',
 ].join(' ')
@@ -92,15 +124,20 @@ export function parseTelegramStructuredOutput(text) {
   try {
     const parsed = JSON.parse(text)
     if (parsed?.action === 'skip') {
-      return { skipped: true, finalText: null, reason: String(parsed.reason ?? '') }
+      return { skipped: true, finalText: null, responses: [], reason: String(parsed.reason ?? '') }
     }
     if (parsed?.action === 'send' && typeof parsed.text === 'string') {
-      return { skipped: false, finalText: parsed.text, reason: String(parsed.reason ?? '') }
+      return {
+        skipped: false,
+        finalText: parsed.text,
+        responses: Array.isArray(parsed.responses) ? parsed.responses : [],
+        reason: String(parsed.reason ?? ''),
+      }
     }
   } catch {}
   const skip = text.match(/^\s*\[SKIP\](?:\s+理由[:：]?)?\s*(.*)$/isu)
-  if (skip) return { skipped: true, finalText: null, reason: skip[1].trim() }
-  return { skipped: false, finalText: text, reason: 'unstructured_compatibility_output' }
+  if (skip) return { skipped: true, finalText: null, responses: [], reason: skip[1].trim() }
+  return { skipped: false, finalText: text, responses: [], reason: 'unstructured_compatibility_output' }
 }
 
 class TurnCollector {

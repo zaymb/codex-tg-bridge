@@ -112,6 +112,89 @@ test('records one final reply for the batch using the latest Telegram message', 
   assert.deepEqual(setup.frames.at(-1).jobIds, ['telegram:1', 'telegram:2'])
 })
 
+test('records selective targeted responses to messages from the same batch', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  enqueue(setup.state, '1', '42', 1_000)
+  enqueue(setup.state, '2', '42', 1_001)
+  await hello(setup)
+  await setup.session.claimOnce()
+  const { batchId } = setup.frames.at(-1).batch
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_accepted',
+    batchId,
+    threadId: 'thread-a',
+    turnId: 'turn-a',
+  })
+
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_result',
+    batchId,
+    turnId: 'turn-a',
+    result: {
+      action: 'reply',
+      text: '',
+      responses: [
+        { messageId: '10', text: 'first targeted answer' },
+        { messageId: '20', text: 'second targeted answer' },
+      ],
+    },
+  })
+
+  const first = setup.state.getOutboundAction(`relay-batch:${batchId}:0000`)
+  const second = setup.state.getOutboundAction(`relay-batch:${batchId}:0001`)
+  assert.equal(first.actionType, 'reply')
+  assert.equal(first.payload.messageId, '10')
+  assert.equal(first.payload.text, 'first targeted answer')
+  assert.equal(second.actionType, 'reply')
+  assert.equal(second.payload.messageId, '20')
+  assert.equal(second.payload.text, 'second targeted answer')
+})
+
+test('rejects targeted responses outside the current batch and duplicate targets', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  enqueue(setup.state, '1', '42', 1_000)
+  await hello(setup)
+  await setup.session.claimOnce()
+  const { batchId } = setup.frames.at(-1).batch
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_accepted',
+    batchId,
+    threadId: 'thread-a',
+    turnId: 'turn-a',
+  })
+
+  await assert.rejects(setup.session.handleFrame({
+    version: 1,
+    type: 'job_result',
+    batchId,
+    turnId: 'turn-a',
+    result: {
+      action: 'reply',
+      text: '',
+      responses: [{ messageId: '999', text: 'wrong target' }],
+    },
+  }), /current batch/)
+  await assert.rejects(setup.session.handleFrame({
+    version: 1,
+    type: 'job_result',
+    batchId,
+    turnId: 'turn-a',
+    result: {
+      action: 'reply',
+      text: '',
+      responses: [
+        { messageId: '10', text: 'one' },
+        { messageId: '10', text: 'two' },
+      ],
+    },
+  }), /duplicate/)
+})
+
 test('records batch SKIP without outbound and rejects a mismatched turn', async t => {
   const setup = fixture()
   t.after(() => setup.state.close())

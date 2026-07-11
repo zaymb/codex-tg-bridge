@@ -10,17 +10,20 @@ export class OutboundDrain {
   #telegram
   #workerId
   #clock
+  #botIdentity
 
   constructor({
     stateStore,
     telegramClient,
     workerId = `outbound-${process.pid}`,
     clock = Date.now,
+    botIdentity = null,
   }) {
     this.#state = stateStore
     this.#telegram = telegramClient
     this.#workerId = workerId
     this.#clock = clock
+    this.#botIdentity = botIdentity
   }
 
   async #execute(action) {
@@ -52,6 +55,7 @@ export class OutboundDrain {
         telegramChatId: String(result?.chat?.id ?? action.payload.chatId),
         telegramMessageId: result?.message_id === undefined ? null : String(result.message_id),
         result,
+        botIdentity: this.#botIdentity,
       }, this.#clock())
       return 'sent'
     } catch (error) {

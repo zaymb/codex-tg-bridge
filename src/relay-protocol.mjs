@@ -13,31 +13,62 @@ function batchIdFor(jobs) {
 
 function outboundActions(batchId, jobs, result, nowMs) {
   if (result.action === 'skip') return []
-  if (result.action !== 'reply' || typeof result.text !== 'string' || !result.text.trim()) {
-    throw new Error('job result must be a non-empty reply or skip')
+  if (result.action !== 'reply' || typeof result.text !== 'string') {
+    throw new Error('job result must be a reply or skip')
   }
-  const latest = jobs.at(-1)
-  const context = latest.payload?.telegramContext
-  if (!context?.chatId || !context?.conversationKey) throw new Error('relay batch is missing Telegram reply context')
-  const chunks = splitTelegramText(result.text)
+  const contexts = jobs.map(job => job.payload?.telegramContext)
+  if (contexts.some(context => !context?.chatId || !context?.conversationKey)) {
+    throw new Error('relay batch is missing Telegram reply context')
+  }
+  const byMessageId = new Map(contexts
+    .filter(context => context.messageId)
+    .map(context => [String(context.messageId), context]))
+  const targeted = Array.isArray(result.responses) ? result.responses : []
+  if (targeted.length > 0 && result.text.trim()) {
+    throw new Error('job result cannot combine text with targeted responses')
+  }
+  const seen = new Set()
+  const selected = targeted.length > 0
+    ? targeted.map(response => {
+        const messageId = typeof response?.messageId === 'string' ? response.messageId : ''
+        if (seen.has(messageId)) throw new Error('job result contains a duplicate response target')
+        seen.add(messageId)
+        const context = byMessageId.get(messageId)
+        if (!context) throw new Error('job result response target is not in the current batch')
+        if (typeof response.text !== 'string' || !response.text.trim()) {
+          throw new Error('job result targeted response text must be non-empty')
+        }
+        return { context, text: response.text }
+      })
+    : [{ context: contexts.at(-1), text: result.text }]
+  if (selected.some(response => !response.text.trim())) {
+    throw new Error('job result must contain a non-empty reply or targeted responses')
+  }
   const group = `relay-batch:${batchId}`
-  return chunks.map((text, index) => {
-    const first = index === 0 && context.messageId
-    return {
-      actionId: `${group}:${String(index).padStart(4, '0')}`,
-      conversationKey: context.conversationKey,
-      actionType: first ? 'reply' : 'send_text',
-      payload: {
-        chatId: context.chatId,
-        messageId: first ? context.messageId : null,
-        threadId: context.threadId ?? null,
-        text,
-      },
-      sequenceGroup: group,
-      sequenceIndex: index,
-      nowMs,
+  const actions = []
+  for (const response of selected) {
+    const chunks = splitTelegramText(response.text)
+    for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+      const text = chunks[chunkIndex]
+      const index = actions.length
+      const first = chunkIndex === 0
+      actions.push({
+        actionId: `${group}:${String(index).padStart(4, '0')}`,
+        conversationKey: response.context.conversationKey,
+        actionType: first && response.context.messageId ? 'reply' : 'send_text',
+        payload: {
+          chatId: response.context.chatId,
+          messageId: first && response.context.messageId ? response.context.messageId : null,
+          threadId: response.context.threadId ?? null,
+          text,
+        },
+        sequenceGroup: group,
+        sequenceIndex: index,
+        nowMs,
+      })
     }
-  })
+  }
+  return actions
 }
 
 export class RelayProtocolSession {

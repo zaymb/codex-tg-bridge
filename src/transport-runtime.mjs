@@ -57,7 +57,7 @@ export async function createTransportRuntime({
       sessionLabel: config.sessionLabel,
       updateLeaseMs: config.updateLeaseMs,
     })
-    const outbound = new OutboundDrain({ stateStore, telegramClient })
+    const outbound = new OutboundDrain({ stateStore, telegramClient, botIdentity: bot })
     const poller = new Poller({
       telegramClient,
       stateStore,

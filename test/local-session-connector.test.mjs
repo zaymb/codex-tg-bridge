@@ -49,6 +49,8 @@ function fixture({ heartbeatIntervalMs = 60_000 } = {}) {
     codexSessionId: 'session-a',
     threadId: 'thread-a',
     heartbeatIntervalMs,
+    approvalPolicy: 'never',
+    sandboxPolicy: { type: 'dangerFullAccess' },
   })
   return { app, relay, connector }
 }
@@ -125,10 +127,12 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
   assert.equal(started.params.threadId, 'thread-a')
   assert.equal(started.params.clientUserMessageId, 'batch:telegram:1:telegram:2')
   assert.equal(started.params.input.length, 1)
-  assert.match(started.params.input[0].text, /1\. Alta: first message/)
-  assert.match(started.params.input[0].text, /2\. laurie_bot \(replying to Alta\): second message/)
+  assert.match(started.params.input[0].text, /1\. \[message_id=10\] Alta: first message/)
+  assert.match(started.params.input[0].text, /2\. \[message_id=11\] laurie_bot \(replying to Alta\): second message/)
   assert.ok(started.params.input[0].text.indexOf('first message') < started.params.input[0].text.indexOf('second message'))
   assert.equal('cwd' in started.params, false)
+  assert.equal(started.params.approvalPolicy, 'never')
+  assert.deepEqual(started.params.sandboxPolicy, { type: 'dangerFullAccess' })
   assert.deepEqual(JSON.parse(started.params.additionalContext.telegram.value), {
     batchId: 'batch:telegram:1:telegram:2',
     messageCount: 2,
@@ -148,7 +152,15 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
     item: {
       type: 'agentMessage',
       phase: 'final_answer',
-      text: JSON.stringify({ action: 'send', text: 'one consolidated answer', reason: 'done' }),
+      text: JSON.stringify({
+        action: 'send',
+        text: '',
+        responses: [
+          { messageId: '10', text: 'first answer' },
+          { messageId: '11', text: 'second answer' },
+        ],
+        reason: 'done',
+      }),
     },
   })
   setup.app.emit('notification:turn/completed', {
@@ -162,7 +174,15 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
     type: 'job_result',
     batchId: 'batch:telegram:1:telegram:2',
     turnId: 'turn-tg',
-    result: { action: 'reply', text: 'one consolidated answer', reason: 'done' },
+    result: {
+      action: 'reply',
+      text: '',
+      responses: [
+        { messageId: '10', text: 'first answer' },
+        { messageId: '11', text: 'second answer' },
+      ],
+      reason: 'done',
+    },
   })
 })
 

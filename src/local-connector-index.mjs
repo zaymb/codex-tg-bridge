@@ -47,6 +47,8 @@ export async function main(env = process.env) {
     codexSessionId: config.codexSessionId,
     threadId: config.threadId,
     heartbeatIntervalMs: config.heartbeatIntervalMs,
+    approvalPolicy: config.approvalPolicy,
+    sandboxPolicy: config.sandboxPolicy,
   })
   const controller = new AbortController()
   const shutdown = () => controller.abort()

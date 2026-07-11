@@ -3,7 +3,13 @@ import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
 import { AppServerClient } from '../src/app-server-client.mjs'
-import { CodexRunner, CodexTurnFailedError, CodexTurnTimeoutError } from '../src/codex-runner.mjs'
+import {
+  CodexRunner,
+  CodexTurnFailedError,
+  CodexTurnTimeoutError,
+  parseTelegramStructuredOutput,
+  TELEGRAM_BATCH_OUTPUT_SCHEMA,
+} from '../src/codex-runner.mjs'
 import { StateStore } from '../src/state-store.mjs'
 import { startFakeAppServer } from './fake-app-server.mjs'
 
@@ -37,6 +43,30 @@ function sendCompletedTurn(connection, { threadId, turnId, output, status = 'com
     })
   })
 }
+
+test('parses optional targeted Telegram responses without losing legacy text output', () => {
+  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+    action: 'send',
+    text: '',
+    responses: [
+      { messageId: '10', text: 'answer the first' },
+      { messageId: '20', text: 'answer the second' },
+    ],
+    reason: 'selective batch reply',
+  })), {
+    skipped: false,
+    finalText: '',
+    responses: [
+      { messageId: '10', text: 'answer the first' },
+      { messageId: '20', text: 'answer the second' },
+    ],
+    reason: 'selective batch reply',
+  })
+  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+    action: 'send', text: 'legacy reply', reason: 'compatibility',
+  })).responses, [])
+  assert.equal(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.responses.maxItems, 32)
+})
 
 test('starts and persists an owner-DM thread, then returns only structured final output', async t => {
   let turnParams

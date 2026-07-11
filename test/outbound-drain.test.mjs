@@ -23,6 +23,11 @@ class FakeTelegram {
     this.calls.push({ method: 'sendText', payload })
     return { message_id: 902, chat: { id: payload.chatId } }
   }
+
+  async react(payload) {
+    this.calls.push({ method: 'react', payload })
+    return true
+  }
 }
 
 function fixture() {
@@ -34,6 +39,7 @@ function fixture() {
     telegramClient: telegram,
     workerId: 'outbound-test',
     clock: () => now,
+    botIdentity: { id: '500', username: 'bridge_bot' },
   })
   return { state, telegram, drain, setNow(value) { now = value } }
 }
@@ -57,6 +63,38 @@ test('sends a durable outbound action and records Telegram message identity', as
   assert.equal(setup.telegram.calls.length, 1)
   assert.equal(setup.state.getOutboundAction('reply:1').status, 'sent')
   assert.equal(setup.state.getOutboundAction('reply:1').telegramMessageId, '901')
+})
+
+test('captures a successful outbound bot reaction for side-channel consumers', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  setup.state.createOutboundAction({
+    actionId: 'react:1',
+    conversationKey: '-100123',
+    actionType: 'react',
+    payload: {
+      chatId: '-100123',
+      messageId: '55',
+      reaction: { type: 'emoji', emoji: '👍' },
+    },
+    nowMs: 1_000,
+  })
+
+  assert.equal(await setup.drain.drainOnce(), 1)
+  assert.equal(setup.state.getOutboundAction('react:1').status, 'sent')
+  assert.deepEqual(setup.state.listBotReactionEvents({ afterEventId: 0 }).map(event => ({
+    actionId: event.actionId,
+    botId: event.botId,
+    messageId: event.messageId,
+    reaction: event.reaction,
+    extendsCooldown: event.extendsCooldown,
+  })), [{
+    actionId: 'react:1',
+    botId: '500',
+    messageId: '55',
+    reaction: { type: 'emoji', emoji: '👍' },
+    extendsCooldown: false,
+  }])
 })
 
 test('defers rate limits and does not retry ambiguous deliveries', async t => {

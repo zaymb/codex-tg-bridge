@@ -2,8 +2,8 @@ import { EventEmitter } from 'node:events'
 
 import {
   parseTelegramStructuredOutput,
-  TELEGRAM_OUTPUT_INSTRUCTIONS,
-  TELEGRAM_OUTPUT_SCHEMA,
+  TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS,
+  TELEGRAM_BATCH_OUTPUT_SCHEMA,
 } from './codex-runner.mjs'
 import { RELAY_PROTOCOL_VERSION } from './relay-protocol.mjs'
 
@@ -42,7 +42,7 @@ function batchInput(jobs) {
   }
   const lines = [
     `[Telegram inbound batch: ${jobs.length} messages received while the previous turn was busy]`,
-    'Read them in order and respond once to the batch as a whole.',
+    'Read them in order. You may answer once in text, or use responses to reply selectively to any listed message_id values.',
   ]
   jobs.forEach((job, index) => {
     const context = job.payload?.telegramContext ?? {}
@@ -51,7 +51,8 @@ function batchInput(jobs) {
       || context.replyTo?.senderUsername
       || context.replyTo?.senderId
     const replyNote = replyTarget ? ` (replying to ${replyTarget})` : ''
-    lines.push(`${index + 1}. ${sender}${replyNote}: ${job.payload?.text || '[no text]'}`)
+    const messageId = context.messageId ?? 'unknown'
+    lines.push(`${index + 1}. [message_id=${messageId}] ${sender}${replyNote}: ${job.payload?.text || '[no text]'}`)
   })
   return [{ type: 'text', text: lines.join('\n') }]
 }
@@ -64,6 +65,8 @@ export class LocalSessionConnector extends EventEmitter {
   #codexSessionId
   #threadId
   #heartbeatIntervalMs
+  #approvalPolicy
+  #sandboxPolicy
   #activeTurns = new Set()
   #items = new Map()
   #currentJob = null
@@ -81,6 +84,8 @@ export class LocalSessionConnector extends EventEmitter {
     codexSessionId,
     threadId,
     heartbeatIntervalMs = 5_000,
+    approvalPolicy = null,
+    sandboxPolicy = null,
   }) {
     super()
     this.#app = appServerClient
@@ -90,6 +95,8 @@ export class LocalSessionConnector extends EventEmitter {
     this.#codexSessionId = codexSessionId
     this.#threadId = threadId
     this.#heartbeatIntervalMs = heartbeatIntervalMs
+    this.#approvalPolicy = approvalPolicy
+    this.#sandboxPolicy = sandboxPolicy
   }
 
   #available() {
@@ -195,7 +202,12 @@ export class LocalSessionConnector extends EventEmitter {
           turnId: turn.id,
           result: output.skipped
             ? { action: 'skip', reason: output.reason }
-            : { action: 'reply', text: output.finalText, reason: output.reason },
+            : {
+                action: 'reply',
+                text: output.finalText,
+                responses: output.responses,
+                reason: output.reason,
+              },
         }))
       }
       this.#currentJob.awaitingRecord = true
@@ -249,9 +261,11 @@ export class LocalSessionConnector extends EventEmitter {
               messages: telegramMessages,
             }),
           },
-          telegram_output_contract: { kind: 'application', value: TELEGRAM_OUTPUT_INSTRUCTIONS },
+          telegram_output_contract: { kind: 'application', value: TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS },
         },
-        outputSchema: TELEGRAM_OUTPUT_SCHEMA,
+        outputSchema: TELEGRAM_BATCH_OUTPUT_SCHEMA,
+        ...(this.#approvalPolicy ? { approvalPolicy: this.#approvalPolicy } : {}),
+        ...(this.#sandboxPolicy ? { sandboxPolicy: this.#sandboxPolicy } : {}),
       })
       const turnId = response?.turn?.id
       if (!turnId) throw new Error('Codex turn/start returned no turn ID')

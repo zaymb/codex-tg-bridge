@@ -71,6 +71,22 @@ function mapOutbound(row) {
   }
 }
 
+function mapBotReactionEvent(row) {
+  if (!row) return null
+  return {
+    eventId: row.event_id,
+    actionId: row.action_id,
+    conversationKey: row.conversation_key,
+    botId: row.bot_id,
+    botUsername: row.bot_username,
+    chatId: row.telegram_chat_id,
+    messageId: row.telegram_message_id,
+    reaction: parse(row.reaction_json),
+    extendsCooldown: row.extends_cooldown === 1,
+    createdAtMs: row.created_at_ms,
+  }
+}
+
 function mapApproval(row) {
   if (!row) return null
   return {
@@ -297,6 +313,22 @@ export class StateStore {
       );
       CREATE INDEX IF NOT EXISTS outbound_actions_status
         ON outbound_actions(status, next_attempt_at_ms, sequence_group, sequence_index);
+
+      CREATE TABLE IF NOT EXISTS bot_reaction_events (
+        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        action_id TEXT NOT NULL UNIQUE REFERENCES outbound_actions(action_id),
+        conversation_key TEXT NOT NULL,
+        bot_id TEXT NOT NULL,
+        bot_username TEXT,
+        telegram_chat_id TEXT NOT NULL,
+        telegram_message_id TEXT NOT NULL,
+        reaction_json TEXT NOT NULL,
+        extends_cooldown INTEGER NOT NULL DEFAULT 0,
+        created_at_ms INTEGER NOT NULL,
+        CHECK (extends_cooldown IN (0, 1))
+      );
+      CREATE INDEX IF NOT EXISTS bot_reaction_events_cursor
+        ON bot_reaction_events(event_id);
 
       CREATE TABLE IF NOT EXISTS approvals (
         token_hash TEXT PRIMARY KEY,
@@ -835,13 +867,32 @@ export class StateStore {
     `).run(nowMs, actionId, nowMs).changes === 1
   }
 
-  markOutboundSent(actionId, { telegramChatId = null, telegramMessageId = null, result = null } = {}, nowMs = Date.now()) {
-    return this.#db.prepare(`
-      UPDATE outbound_actions
-      SET status = 'sent', telegram_chat_id = ?, telegram_message_id = ?, result_json = ?,
-          next_attempt_at_ms = NULL, last_error = NULL, updated_at_ms = ?
-      WHERE action_id = ? AND status = 'sending'
-    `).run(telegramChatId, telegramMessageId, stringify(result), nowMs, actionId).changes === 1
+  markOutboundSent(actionId, {
+    telegramChatId = null,
+    telegramMessageId = null,
+    result = null,
+    botIdentity = null,
+  } = {}, nowMs = Date.now()) {
+    const transaction = this.#db.transaction(() => {
+      const sent = this.#db.prepare(`
+        UPDATE outbound_actions
+        SET status = 'sent', telegram_chat_id = ?, telegram_message_id = ?, result_json = ?,
+            next_attempt_at_ms = NULL, last_error = NULL, updated_at_ms = ?
+        WHERE action_id = ? AND status = 'sending'
+      `).run(telegramChatId, telegramMessageId, stringify(result), nowMs, actionId).changes === 1
+      if (!sent) return false
+      const action = this.getOutboundAction(actionId)
+      if (action.actionType === 'react' && botIdentity?.id) {
+        this.recordBotReactionEvent({
+          actionId,
+          botId: botIdentity.id,
+          botUsername: botIdentity.username ?? null,
+          nowMs,
+        })
+      }
+      return true
+    })
+    return transaction()
   }
 
   markOutboundAmbiguous(actionId, error, nowMs = Date.now()) {
@@ -906,6 +957,52 @@ export class StateStore {
       WHERE status = 'sent' AND telegram_chat_id = ? AND telegram_message_id = ?
       ORDER BY updated_at_ms DESC LIMIT 1
     `).get(String(telegramChatId), String(telegramMessageId)))
+  }
+
+  recordBotReactionEvent({ actionId, botId, botUsername = null, nowMs = Date.now() }) {
+    if (!botId) throw new Error('bot reaction event requires botId')
+    const action = this.getOutboundAction(actionId)
+    if (!action || action.actionType !== 'react' || action.status !== 'sent') {
+      throw new Error('bot reaction event requires a sent reaction action')
+    }
+    const { chatId, messageId, reaction } = action.payload ?? {}
+    if (!chatId || !messageId || !reaction) throw new Error('sent reaction action is missing event context')
+    const created = this.#db.prepare(`
+      INSERT OR IGNORE INTO bot_reaction_events(
+        action_id, conversation_key, bot_id, bot_username, telegram_chat_id,
+        telegram_message_id, reaction_json, extends_cooldown, created_at_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+    `).run(
+      String(actionId),
+      action.conversationKey,
+      String(botId),
+      botUsername === null || botUsername === undefined ? null : String(botUsername),
+      String(chatId),
+      String(messageId),
+      stringify(reaction),
+      nowMs,
+    ).changes === 1
+    return {
+      created,
+      event: mapBotReactionEvent(this.#db.prepare(`
+        SELECT * FROM bot_reaction_events WHERE action_id = ?
+      `).get(String(actionId))),
+    }
+  }
+
+  listBotReactionEvents({ afterEventId = 0, limit = 100 } = {}) {
+    if (!Number.isSafeInteger(afterEventId) || afterEventId < 0) {
+      throw new Error('afterEventId must be a non-negative integer')
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+      throw new Error('bot reaction event limit must be between 1 and 1000')
+    }
+    return this.#db.prepare(`
+      SELECT * FROM bot_reaction_events
+      WHERE event_id > ?
+      ORDER BY event_id
+      LIMIT ?
+    `).all(afterEventId, limit).map(mapBotReactionEvent)
   }
 
   createApproval({

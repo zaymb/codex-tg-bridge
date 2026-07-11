@@ -326,6 +326,49 @@ test('finds a sent bot message for reaction-to-topic routing', async t => {
   assert.equal(store.findSentOutboundMessage('-100123', 'missing'), null)
 })
 
+test('records a successful bot reaction as an idempotent non-extending event', async t => {
+  const { store } = await openStore()
+  t.after(() => store.close())
+  store.createOutboundAction({
+    actionId: 'react:1',
+    conversationKey: '-100123',
+    actionType: 'react',
+    payload: {
+      chatId: '-100123',
+      messageId: '55',
+      reaction: { type: 'emoji', emoji: '👍' },
+    },
+    nowMs: 100,
+  })
+  store.markOutboundSending('react:1', 110)
+  store.markOutboundSent('react:1', { telegramChatId: '-100123', result: true }, 120)
+
+  assert.equal(store.recordBotReactionEvent({
+    actionId: 'react:1',
+    botId: '500',
+    botUsername: 'bridge_bot',
+    nowMs: 130,
+  }).created, true)
+  assert.equal(store.recordBotReactionEvent({
+    actionId: 'react:1',
+    botId: '500',
+    botUsername: 'bridge_bot',
+    nowMs: 140,
+  }).created, false)
+  assert.deepEqual(store.listBotReactionEvents({ afterEventId: 0 }), [{
+    eventId: 1,
+    actionId: 'react:1',
+    conversationKey: '-100123',
+    botId: '500',
+    botUsername: 'bridge_bot',
+    chatId: '-100123',
+    messageId: '55',
+    reaction: { type: 'emoji', emoji: '👍' },
+    extendsCooldown: false,
+    createdAtMs: 130,
+  }])
+})
+
 test('resolves an approval once, only for the configured owner, before expiry', async t => {
   const { store } = await openStore()
   t.after(() => store.close())

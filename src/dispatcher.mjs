@@ -93,6 +93,7 @@ export class Dispatcher {
   #updateLeaseMs
   #typingIntervalMs
   #clock
+  #botIdentity
   #semaphore
   #chains = new Map()
 
@@ -109,6 +110,7 @@ export class Dispatcher {
     updateLeaseMs = 120_000,
     typingIntervalMs = 4_000,
     clock = Date.now,
+    botIdentity = null,
   }) {
     this.#state = stateStore
     this.#telegram = telegramClient
@@ -121,6 +123,7 @@ export class Dispatcher {
     this.#updateLeaseMs = updateLeaseMs
     this.#typingIntervalMs = typingIntervalMs
     this.#clock = clock
+    this.#botIdentity = botIdentity
     this.#semaphore = new Semaphore(maxConcurrentTurns)
   }
 
@@ -447,6 +450,7 @@ export class Dispatcher {
         telegramChatId: String(result?.chat?.id ?? action.payload.chatId),
         telegramMessageId: result?.message_id === undefined ? null : String(result.message_id),
         result,
+        botIdentity: this.#botIdentity,
       }, this.#clock())
       return 'sent'
     } catch (error) {

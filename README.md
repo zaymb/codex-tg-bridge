@@ -13,6 +13,8 @@ VPS does not run Codex.
   or exposed publicly on the VPS.
 - A Telegram job is claimed only while the target Codex thread is idle. Local
   TUI turns take priority.
+- One queued batch can produce one compatibility reply or multiple targeted
+  replies to selected messages from that batch.
 - Jobs older than 24 hours expire silently before acceptance.
 
 When the local connector is absent, each Telegram conversation receives this
@@ -98,6 +100,8 @@ For owner DM, no group configuration is needed. Before group acceptance:
 - Telegram rate limits defer the outbound row. Ambiguous sends are never
   automatically repeated.
 - Final relay result and outbound actions commit in one SQLite transaction.
+- Successful bot reactions are captured in a durable, idempotent event outbox
+  for side-channel consumers and never extend engagement cooldown.
 - Attachments, Telegram action tools, remote approvals, and `/stop` are later
   delivery phases. The current deployed path is text plus structured
   `REPLY/SKIP`.

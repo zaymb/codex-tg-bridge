@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { loadConfig, loadTransportConfig } from '../src/config.mjs'
+import { loadConfig, loadLocalConnectorConfig, loadTransportConfig } from '../src/config.mjs'
 
 async function tokenFixture(mode = 0o600, content = '123456:secret-token\n') {
   const dir = await mkdtemp(join(tmpdir(), 'tg-bridge-config-'))
@@ -160,4 +160,27 @@ test('can explicitly enable approved-group passthrough for transport testing', a
   env.BRIDGE_DELIVER_ALL_GROUP_MESSAGES = 'true'
 
   assert.equal(loadTransportConfig(env).deliverAllGroupMessages, true)
+})
+
+test('loads explicit no-prompt permissions for the local Telegram connector', () => {
+  const env = {
+    BRIDGE_SESSION_LABEL: 'tg-engage',
+    CODEX_SESSION_ID: 'session-a',
+    APP_SERVER_SOCKET: '/tmp/app.sock',
+    CODEX_CONTRACT_PATH: '/opt/tg-engage/contract.json',
+    BRIDGE_RELAY_HOST: 'relay.example',
+    BRIDGE_RELAY_SSH_USER: 'ubuntu',
+    BRIDGE_RELAY_IDENTITY_FILE: '/home/alta/.ssh/id_ed25519',
+    CODEX_APPROVAL_POLICY: 'never',
+    CODEX_SANDBOX_MODE: 'danger-full-access',
+  }
+
+  const config = loadLocalConnectorConfig(env)
+  assert.equal(config.approvalPolicy, 'never')
+  assert.deepEqual(config.sandboxPolicy, { type: 'dangerFullAccess' })
+  env.CODEX_APPROVAL_POLICY = 'sometimes'
+  assert.throws(() => loadLocalConnectorConfig(env), /CODEX_APPROVAL_POLICY/)
+  env.CODEX_APPROVAL_POLICY = 'never'
+  env.CODEX_SANDBOX_MODE = 'everything'
+  assert.throws(() => loadLocalConnectorConfig(env), /CODEX_SANDBOX_MODE/)
 })
