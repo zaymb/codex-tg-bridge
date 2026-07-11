@@ -66,6 +66,7 @@ test('parses optional targeted Telegram responses without losing legacy text out
     action: 'send', text: 'legacy reply', reason: 'compatibility',
   })).responses, [])
   assert.equal(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.responses.maxItems, 32)
+  assert.deepEqual(TELEGRAM_BATCH_OUTPUT_SCHEMA.required, ['action', 'text', 'responses', 'reason'])
 })
 
 test('starts and persists an owner-DM thread, then returns only structured final output', async t => {
