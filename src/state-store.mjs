@@ -2,7 +2,7 @@ import Database from 'better-sqlite3'
 import { chmodSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 
-const SCHEMA_VERSION = '1'
+const SCHEMA_VERSION = '2'
 
 function stringify(value) {
   return value === undefined ? null : JSON.stringify(value)
@@ -153,6 +153,45 @@ function mapAttachment(row) {
   }
 }
 
+function mapRelayJob(row) {
+  if (!row) return null
+  return {
+    jobId: row.job_id,
+    sourceType: row.source_type,
+    sourceId: row.source_id,
+    conversationKey: row.conversation_key,
+    sessionLabel: row.session_label,
+    payload: parse(row.payload_json),
+    status: row.status,
+    attempts: row.attempts,
+    leaseOwner: row.lease_owner,
+    leaseExpiresAtMs: row.lease_expires_at_ms,
+    codexSessionId: row.codex_session_id,
+    threadId: row.thread_id,
+    turnId: row.turn_id,
+    result: parse(row.result_json),
+    lastError: row.last_error,
+    expiresAtMs: row.expires_at_ms,
+    createdAtMs: row.created_at_ms,
+    updatedAtMs: row.updated_at_ms,
+  }
+}
+
+function mapRelaySession(row) {
+  if (!row) return null
+  return {
+    sessionLabel: row.session_label,
+    connectorId: row.connector_id,
+    codexSessionId: row.codex_session_id,
+    status: row.status,
+    leaseExpiresAtMs: row.lease_expires_at_ms,
+    offlineEpoch: row.offline_epoch,
+    connectedAtMs: row.connected_at_ms,
+    disconnectedAtMs: row.disconnected_at_ms,
+    updatedAtMs: row.updated_at_ms,
+  }
+}
+
 export class StateStore {
   static open(path) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
@@ -299,6 +338,52 @@ export class StateStore {
       CREATE INDEX IF NOT EXISTS wake_requests_due
         ON wake_requests(status, earliest_at_ms, expires_at_ms, lease_expires_at_ms);
 
+      CREATE TABLE IF NOT EXISTS relay_jobs (
+        job_id TEXT PRIMARY KEY,
+        source_type TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        conversation_key TEXT NOT NULL,
+        session_label TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        lease_owner TEXT,
+        lease_expires_at_ms INTEGER,
+        codex_session_id TEXT,
+        thread_id TEXT,
+        turn_id TEXT,
+        result_json TEXT,
+        last_error TEXT,
+        expires_at_ms INTEGER NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        UNIQUE(source_type, source_id),
+        CHECK (status IN ('pending', 'leased', 'accepted', 'completed', 'failed', 'expired'))
+      );
+      CREATE INDEX IF NOT EXISTS relay_jobs_claimable
+        ON relay_jobs(session_label, status, expires_at_ms, lease_expires_at_ms, created_at_ms);
+
+      CREATE TABLE IF NOT EXISTS relay_sessions (
+        session_label TEXT PRIMARY KEY,
+        connector_id TEXT,
+        codex_session_id TEXT,
+        status TEXT NOT NULL DEFAULT 'offline',
+        lease_expires_at_ms INTEGER,
+        offline_epoch INTEGER NOT NULL DEFAULT 1,
+        connected_at_ms INTEGER,
+        disconnected_at_ms INTEGER,
+        updated_at_ms INTEGER NOT NULL,
+        CHECK (status IN ('online', 'offline'))
+      );
+
+      CREATE TABLE IF NOT EXISTS relay_offline_notices (
+        session_label TEXT NOT NULL,
+        conversation_key TEXT NOT NULL,
+        offline_epoch INTEGER NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        PRIMARY KEY(session_label, conversation_key, offline_epoch)
+      );
+
       CREATE TABLE IF NOT EXISTS attachments (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         update_id TEXT,
@@ -312,10 +397,11 @@ export class StateStore {
         UNIQUE(telegram_file_id, local_path)
       );
     `)
-    if (this.getSetting('schema_version') === null) {
+    const schemaVersion = this.getSetting('schema_version')
+    if (schemaVersion === null || schemaVersion === '1') {
       this.setSetting('schema_version', SCHEMA_VERSION, Date.now())
-    } else if (this.getSetting('schema_version') !== SCHEMA_VERSION) {
-      throw new Error(`unsupported state schema version: ${this.getSetting('schema_version')}`)
+    } else if (schemaVersion !== SCHEMA_VERSION) {
+      throw new Error(`unsupported state schema version: ${schemaVersion}`)
     }
   }
 
@@ -872,6 +958,235 @@ export class StateStore {
         WHERE token_hash = ? AND state = 'pending'
       `).run(decision, stringify(response), nowMs, tokenHash)
       return { resolved: true, approval: this.getApproval(tokenHash) }
+    })
+    return transaction()
+  }
+
+  enqueueRelayJob({
+    jobId,
+    sourceType,
+    sourceId,
+    conversationKey,
+    sessionLabel,
+    payload,
+    expiresAtMs,
+    nowMs = Date.now(),
+  }) {
+    if (!jobId || !sourceType || !sourceId || !conversationKey || !sessionLabel) {
+      throw new Error('relay job identity fields are required')
+    }
+    if (!Number.isSafeInteger(expiresAtMs) || expiresAtMs <= nowMs) {
+      throw new Error('relay job expiry must be after creation')
+    }
+    const created = this.#db.prepare(`
+      INSERT OR IGNORE INTO relay_jobs(
+        job_id, source_type, source_id, conversation_key, session_label,
+        payload_json, status, expires_at_ms, created_at_ms, updated_at_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+    `).run(
+      String(jobId),
+      String(sourceType),
+      String(sourceId),
+      String(conversationKey),
+      String(sessionLabel),
+      stringify(payload),
+      expiresAtMs,
+      nowMs,
+      nowMs,
+    ).changes === 1
+    return { created, job: this.getRelayJob(jobId) }
+  }
+
+  getRelayJob(jobId) {
+    return mapRelayJob(this.#db.prepare('SELECT * FROM relay_jobs WHERE job_id = ?').get(String(jobId)))
+  }
+
+  expireRelayJobs(nowMs = Date.now()) {
+    return this.#db.prepare(`
+      UPDATE relay_jobs
+      SET status = 'expired', lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?
+      WHERE
+        (status = 'pending' AND expires_at_ms <= ?)
+        OR
+        (status = 'leased' AND lease_expires_at_ms <= ? AND expires_at_ms <= ?)
+    `).run(nowMs, nowMs, nowMs, nowMs).changes
+  }
+
+  claimRelayJobs({
+    sessionLabel,
+    connectorId,
+    limit = 1,
+    leaseMs = 120_000,
+    nowMs = Date.now(),
+  }) {
+    if (!sessionLabel || !connectorId) throw new Error('relay sessionLabel and connectorId are required')
+    const transaction = this.#db.transaction(() => {
+      this.expireRelayJobs(nowMs)
+      this.#db.prepare(`
+        UPDATE relay_jobs
+        SET status = 'pending', lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?
+        WHERE status = 'leased' AND lease_expires_at_ms <= ? AND expires_at_ms > ?
+      `).run(nowMs, nowMs, nowMs)
+      const rows = this.#db.prepare(`
+        SELECT job_id FROM relay_jobs
+        WHERE session_label = ? AND status = 'pending' AND expires_at_ms > ?
+        ORDER BY created_at_ms, job_id
+        LIMIT ?
+      `).all(String(sessionLabel), nowMs, limit)
+      const claim = this.#db.prepare(`
+        UPDATE relay_jobs
+        SET status = 'leased', attempts = attempts + 1, lease_owner = ?,
+            lease_expires_at_ms = ?, updated_at_ms = ?
+        WHERE job_id = ? AND status = 'pending' AND expires_at_ms > ?
+      `)
+      const claimed = []
+      for (const row of rows) {
+        if (claim.run(connectorId, nowMs + leaseMs, nowMs, row.job_id, nowMs).changes === 1) {
+          claimed.push(this.getRelayJob(row.job_id))
+        }
+      }
+      return claimed
+    })
+    return transaction()
+  }
+
+  acceptRelayJob({
+    jobId,
+    connectorId,
+    codexSessionId,
+    threadId,
+    turnId,
+    nowMs = Date.now(),
+  }) {
+    if (!codexSessionId || !threadId || !turnId) throw new Error('accepted relay job requires Codex identifiers')
+    return this.#db.prepare(`
+      UPDATE relay_jobs
+      SET status = 'accepted', codex_session_id = ?, thread_id = ?, turn_id = ?,
+          lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?
+      WHERE job_id = ? AND status = 'leased' AND lease_owner = ?
+    `).run(
+      String(codexSessionId),
+      String(threadId),
+      String(turnId),
+      nowMs,
+      String(jobId),
+      String(connectorId),
+    ).changes === 1
+  }
+
+  completeRelayJob({ jobId, turnId, result, nowMs = Date.now() }) {
+    return this.#db.prepare(`
+      UPDATE relay_jobs
+      SET status = 'completed', result_json = ?, updated_at_ms = ?
+      WHERE job_id = ? AND status = 'accepted' AND turn_id = ?
+    `).run(stringify(result), nowMs, String(jobId), String(turnId)).changes === 1
+  }
+
+  failRelayJob({ jobId, error, connectorId = null, turnId = null, nowMs = Date.now() }) {
+    const leased = connectorId === null ? 0 : this.#db.prepare(`
+      UPDATE relay_jobs
+      SET status = 'failed', lease_owner = NULL, lease_expires_at_ms = NULL,
+          last_error = ?, updated_at_ms = ?
+      WHERE job_id = ? AND status = 'leased' AND lease_owner = ?
+    `).run(String(error), nowMs, String(jobId), String(connectorId)).changes
+    if (leased === 1) return true
+    if (turnId === null) return false
+    return this.#db.prepare(`
+      UPDATE relay_jobs
+      SET status = 'failed', last_error = ?, updated_at_ms = ?
+      WHERE job_id = ? AND status = 'accepted' AND turn_id = ?
+    `).run(String(error), nowMs, String(jobId), String(turnId)).changes === 1
+  }
+
+  ensureRelaySession(sessionLabel, nowMs = Date.now()) {
+    this.#db.prepare(`
+      INSERT OR IGNORE INTO relay_sessions(
+        session_label, status, offline_epoch, updated_at_ms
+      ) VALUES (?, 'offline', 1, ?)
+    `).run(String(sessionLabel), nowMs)
+    return this.getRelaySession(sessionLabel, nowMs)
+  }
+
+  getRelaySession(sessionLabel, nowMs = Date.now()) {
+    const transaction = this.#db.transaction(() => {
+      this.#db.prepare(`
+        UPDATE relay_sessions
+        SET status = 'offline', connector_id = NULL, lease_expires_at_ms = NULL,
+            offline_epoch = offline_epoch + 1, disconnected_at_ms = ?, updated_at_ms = ?
+        WHERE session_label = ? AND status = 'online' AND lease_expires_at_ms <= ?
+      `).run(nowMs, nowMs, String(sessionLabel), nowMs)
+      return mapRelaySession(this.#db.prepare(
+        'SELECT * FROM relay_sessions WHERE session_label = ?',
+      ).get(String(sessionLabel)))
+    })
+    return transaction()
+  }
+
+  registerRelaySession({
+    sessionLabel,
+    connectorId,
+    codexSessionId,
+    leaseMs = 20_000,
+    nowMs = Date.now(),
+  }) {
+    if (!sessionLabel || !connectorId || !codexSessionId) {
+      throw new Error('relay registration fields are required')
+    }
+    const transaction = this.#db.transaction(() => {
+      this.ensureRelaySession(sessionLabel, nowMs)
+      const current = this.getRelaySession(sessionLabel, nowMs)
+      if (current.status === 'online' && current.connectorId !== connectorId) {
+        return { registered: false, reason: 'already_connected', session: current }
+      }
+      this.#db.prepare(`
+        UPDATE relay_sessions
+        SET connector_id = ?, codex_session_id = ?, status = 'online',
+            lease_expires_at_ms = ?, connected_at_ms = ?, disconnected_at_ms = NULL,
+            updated_at_ms = ?
+        WHERE session_label = ?
+      `).run(
+        String(connectorId),
+        String(codexSessionId),
+        nowMs + leaseMs,
+        nowMs,
+        nowMs,
+        String(sessionLabel),
+      )
+      return { registered: true, session: this.getRelaySession(sessionLabel, nowMs) }
+    })
+    return transaction()
+  }
+
+  heartbeatRelaySession({ sessionLabel, connectorId, leaseMs = 20_000, nowMs = Date.now() }) {
+    return this.#db.prepare(`
+      UPDATE relay_sessions SET lease_expires_at_ms = ?, updated_at_ms = ?
+      WHERE session_label = ? AND connector_id = ? AND status = 'online'
+    `).run(nowMs + leaseMs, nowMs, String(sessionLabel), String(connectorId)).changes === 1
+  }
+
+  disconnectRelaySession({ sessionLabel, connectorId, nowMs = Date.now() }) {
+    return this.#db.prepare(`
+      UPDATE relay_sessions
+      SET status = 'offline', connector_id = NULL, lease_expires_at_ms = NULL,
+          offline_epoch = offline_epoch + 1, disconnected_at_ms = ?, updated_at_ms = ?
+      WHERE session_label = ? AND connector_id = ? AND status = 'online'
+    `).run(nowMs, nowMs, String(sessionLabel), String(connectorId)).changes === 1
+  }
+
+  claimOfflineNotice({ sessionLabel, conversationKey, nowMs = Date.now() }) {
+    const transaction = this.#db.transaction(() => {
+      const session = this.ensureRelaySession(sessionLabel, nowMs)
+      if (session.status !== 'offline') return false
+      return this.#db.prepare(`
+        INSERT OR IGNORE INTO relay_offline_notices(
+          session_label, conversation_key, offline_epoch, created_at_ms
+        ) VALUES (?, ?, ?, ?)
+      `).run(
+        String(sessionLabel),
+        String(conversationKey),
+        session.offlineEpoch,
+        nowMs,
+      ).changes === 1
     })
     return transaction()
   }

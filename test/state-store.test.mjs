@@ -17,12 +17,12 @@ test('opens in WAL mode and applies the current schema once', async t => {
   t.after(() => store.close())
 
   assert.equal(store.pragma('journal_mode', { simple: true }), 'wal')
-  assert.equal(store.getSetting('schema_version'), '1')
+  assert.equal(store.getSetting('schema_version'), '2')
 
   store.close()
   const reopened = StateStore.open(path)
   t.after(() => reopened.close())
-  assert.equal(reopened.getSetting('schema_version'), '1')
+  assert.equal(reopened.getSetting('schema_version'), '2')
 })
 
 test('stores an update and advances offset only after durable insertion', async t => {
@@ -547,4 +547,183 @@ test('expires a processing wake when its lease and business deadline have passed
 
   assert.equal(store.claimWakes({ workerId: 'wake-b', nowMs: 500 }).length, 0)
   assert.equal(store.getWake(wake.id).status, 'expired')
+})
+
+test('relay jobs deduplicate, reclaim expired leases, and never replay accepted turns', async t => {
+  const { store } = await openStore()
+  t.after(() => store.close())
+
+  const first = store.enqueueRelayJob({
+    jobId: 'telegram:100',
+    sourceType: 'telegram',
+    sourceId: '100',
+    conversationKey: '42',
+    sessionLabel: 'tg-engage',
+    payload: { text: 'hello' },
+    expiresAtMs: 1_000,
+    nowMs: 100,
+  })
+  const duplicate = store.enqueueRelayJob({
+    jobId: 'telegram:100',
+    sourceType: 'telegram',
+    sourceId: '100',
+    conversationKey: '42',
+    sessionLabel: 'tg-engage',
+    payload: { text: 'changed' },
+    expiresAtMs: 1_000,
+    nowMs: 110,
+  })
+
+  assert.equal(first.created, true)
+  assert.equal(duplicate.created, false)
+  assert.equal(duplicate.job.payload.text, 'hello')
+
+  const claimed = store.claimRelayJobs({
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-a',
+    leaseMs: 100,
+    nowMs: 200,
+  })
+  assert.equal(claimed[0].attempts, 1)
+  assert.equal(store.claimRelayJobs({
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-b',
+    leaseMs: 100,
+    nowMs: 299,
+  }).length, 0)
+  const reclaimed = store.claimRelayJobs({
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-b',
+    leaseMs: 100,
+    nowMs: 300,
+  })
+  assert.equal(reclaimed[0].attempts, 2)
+
+  assert.equal(store.acceptRelayJob({
+    jobId: 'telegram:100',
+    connectorId: 'connector-b',
+    codexSessionId: 'session-1',
+    threadId: 'thread-1',
+    turnId: 'turn-1',
+    nowMs: 310,
+  }), true)
+  assert.equal(store.expireRelayJobs(2_000), 0)
+  assert.equal(store.getRelayJob('telegram:100').status, 'accepted')
+  assert.equal(store.claimRelayJobs({
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-c',
+    nowMs: 2_000,
+  }).length, 0)
+})
+
+test('relay jobs expire silently before acceptance and complete only the accepted turn', async t => {
+  const { store } = await openStore()
+  t.after(() => store.close())
+
+  store.enqueueRelayJob({
+    jobId: 'telegram:expired',
+    sourceType: 'telegram',
+    sourceId: 'expired',
+    conversationKey: '42',
+    sessionLabel: 'tg-engage',
+    payload: { text: 'too old' },
+    expiresAtMs: 500,
+    nowMs: 100,
+  })
+  assert.equal(store.claimRelayJobs({
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-a',
+    nowMs: 500,
+  }).length, 0)
+  assert.equal(store.getRelayJob('telegram:expired').status, 'expired')
+
+  store.enqueueRelayJob({
+    jobId: 'telegram:complete',
+    sourceType: 'telegram',
+    sourceId: 'complete',
+    conversationKey: '42',
+    sessionLabel: 'tg-engage',
+    payload: { text: 'complete me' },
+    expiresAtMs: 5_000,
+    nowMs: 1_000,
+  })
+  store.claimRelayJobs({ sessionLabel: 'tg-engage', connectorId: 'connector-a', nowMs: 1_100 })
+  store.acceptRelayJob({
+    jobId: 'telegram:complete',
+    connectorId: 'connector-a',
+    codexSessionId: 'session-1',
+    threadId: 'thread-1',
+    turnId: 'turn-1',
+    nowMs: 1_200,
+  })
+  assert.equal(store.completeRelayJob({
+    jobId: 'telegram:complete',
+    turnId: 'other-turn',
+    result: { action: 'send', text: 'wrong' },
+    nowMs: 1_300,
+  }), false)
+  assert.equal(store.completeRelayJob({
+    jobId: 'telegram:complete',
+    turnId: 'turn-1',
+    result: { action: 'send', text: 'done' },
+    nowMs: 1_400,
+  }), true)
+  assert.equal(store.getRelayJob('telegram:complete').result.text, 'done')
+})
+
+test('relay session leases reject a second connector and scope offline notices by epoch', async t => {
+  const { store } = await openStore()
+  t.after(() => store.close())
+
+  assert.deepEqual(store.ensureRelaySession('tg-engage', 100), {
+    sessionLabel: 'tg-engage',
+    connectorId: null,
+    codexSessionId: null,
+    status: 'offline',
+    leaseExpiresAtMs: null,
+    offlineEpoch: 1,
+    connectedAtMs: null,
+    disconnectedAtMs: null,
+    updatedAtMs: 100,
+  })
+  assert.equal(store.claimOfflineNotice({
+    sessionLabel: 'tg-engage',
+    conversationKey: '42',
+    nowMs: 110,
+  }), true)
+  assert.equal(store.claimOfflineNotice({
+    sessionLabel: 'tg-engage',
+    conversationKey: '42',
+    nowMs: 120,
+  }), false)
+
+  assert.equal(store.registerRelaySession({
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-a',
+    codexSessionId: 'session-1',
+    leaseMs: 100,
+    nowMs: 200,
+  }).registered, true)
+  assert.equal(store.registerRelaySession({
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-b',
+    codexSessionId: 'session-2',
+    leaseMs: 100,
+    nowMs: 250,
+  }).registered, false)
+  assert.equal(store.heartbeatRelaySession({
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-a',
+    leaseMs: 100,
+    nowMs: 250,
+  }), true)
+  assert.equal(store.getRelaySession('tg-engage', 349).status, 'online')
+  const offline = store.getRelaySession('tg-engage', 350)
+  assert.equal(offline.status, 'offline')
+  assert.equal(offline.offlineEpoch, 2)
+  assert.equal(store.claimOfflineNotice({
+    sessionLabel: 'tg-engage',
+    conversationKey: '42',
+    nowMs: 360,
+  }), true)
 })
