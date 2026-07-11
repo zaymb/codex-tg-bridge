@@ -21,5 +21,5 @@ while [ ! -S "$socket_path" ]; do
 done
 
 chgrp "$socket_group" "$socket_directory" "$socket_path"
-chmod 2750 "$socket_directory"
+chmod 0750 "$socket_directory"
 chmod 0660 "$socket_path"

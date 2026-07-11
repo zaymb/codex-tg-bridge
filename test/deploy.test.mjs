@@ -101,7 +101,7 @@ test('socket preparation restores group traversal after app-server locks its dir
   const preparedDirectory = await stat(directory)
   const preparedSocket = await stat(socketPath)
   assert.equal(preparedDirectory.gid, targetGid)
-  assert.equal(preparedDirectory.mode & 0o7777, 0o2750)
+  assert.equal(preparedDirectory.mode & 0o7777, 0o750)
   assert.equal(preparedSocket.isSocket(), true)
   assert.equal(preparedSocket.gid, targetGid)
   assert.equal(preparedSocket.mode & 0o777, 0o660)
