@@ -56,7 +56,7 @@ test('holds the app service in startup until its socket is shared with the bridg
   )
 })
 
-test('socket preparation waits for a 0600 Unix socket then applies group-only access', async (t) => {
+test('socket preparation restores group traversal after app-server locks its directory', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'codex-tg-socket-'))
   const socketPath = join(directory, 'app.sock')
   const targetGid = process.getgroups().find((gid) => gid !== process.getgid()) ?? process.getgid()
@@ -89,17 +89,22 @@ test('socket preparation waits for a 0600 Unix socket then applies group-only ac
     process.umask(previousUmask)
   }
 
-  const original = await stat(socketPath)
-  assert.equal(original.mode & 0o777, 0o600)
+  const originalDirectory = await stat(directory)
+  const originalSocket = await stat(socketPath)
+  assert.equal(originalDirectory.mode & 0o7777, 0o700)
+  assert.equal(originalSocket.mode & 0o777, 0o600)
   if (targetGid !== process.getgid()) {
-    assert.notEqual(original.gid, targetGid)
+    assert.notEqual(originalSocket.gid, targetGid)
   }
   await preparation
 
-  const prepared = await stat(socketPath)
-  assert.equal(prepared.isSocket(), true)
-  assert.equal(prepared.gid, targetGid)
-  assert.equal(prepared.mode & 0o777, 0o660)
+  const preparedDirectory = await stat(directory)
+  const preparedSocket = await stat(socketPath)
+  assert.equal(preparedDirectory.gid, targetGid)
+  assert.equal(preparedDirectory.mode & 0o7777, 0o2750)
+  assert.equal(preparedSocket.isSocket(), true)
+  assert.equal(preparedSocket.gid, targetGid)
+  assert.equal(preparedSocket.mode & 0o777, 0o660)
 })
 
 test('keeps the Codex export surface read-only to the token-holding bridge', async () => {

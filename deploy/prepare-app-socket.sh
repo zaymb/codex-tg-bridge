@@ -3,6 +3,10 @@ set -eu
 
 socket_path=${1:?socket path is required}
 socket_group=${2:?socket group is required}
+case "$socket_path" in
+  */*) socket_directory=${socket_path%/*} ;;
+  *) socket_directory=. ;;
+esac
 wait_attempts=${SOCKET_WAIT_ATTEMPTS:-100}
 wait_interval=${SOCKET_WAIT_INTERVAL:-0.1}
 attempt=0
@@ -16,5 +20,6 @@ while [ ! -S "$socket_path" ]; do
   sleep "$wait_interval"
 done
 
-chgrp "$socket_group" "$socket_path"
+chgrp "$socket_group" "$socket_directory" "$socket_path"
+chmod 2750 "$socket_directory"
 chmod 0660 "$socket_path"
