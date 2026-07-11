@@ -35,6 +35,27 @@ function commandName(update) {
   return text.match(/^\/(new|stop)(?:@[A-Za-z0-9_]+)?(?:\s|$)/iu)?.[1]?.toLowerCase() ?? null
 }
 
+function isOwnerStop(update, ownerUserId) {
+  return commandName(update) === 'stop' && update.actor?.id === ownerUserId
+}
+
+function isOwnerCallback(update, ownerUserId) {
+  return update.type === 'callback_query'
+    && update.actor?.id === ownerUserId
+    && update.chat?.type === 'private'
+    && update.chat?.id === ownerUserId
+}
+
+function hasEquivalentSentAction(state, turn, conversationKey) {
+  return (turn.sentActionIds ?? []).some(actionId => {
+    const action = state.getOutboundAction(actionId)
+    return action?.status === 'sent'
+      && ['send_text', 'reply'].includes(action.actionType)
+      && action.conversationKey === conversationKey
+      && action.payload?.text === turn.finalText
+  })
+}
+
 function topicId(update) {
   if (update.message?.threadId) return update.message.threadId
   const key = update.conversationKey ?? ''
@@ -122,14 +143,51 @@ export class Dispatcher {
       leaseMs: this.#updateLeaseMs,
       nowMs: this.#clock(),
     })
-    const scheduled = rows.map(row => {
+    const scheduled = []
+    const preemptiveStops = []
+    for (const row of rows) {
       let key = row.conversationKey
-      if (!key) {
-        try { key = normalizeUpdate(row.raw).conversationKey } catch {}
+      let update = null
+      try {
+        update = normalizeUpdate(row.raw)
+        if (!key) key = update.conversationKey
+      } catch {}
+      if (update && isOwnerStop(update, this.#ownerUserId)) {
+        preemptiveStops.push(row)
+      } else {
+        scheduled.push(this.#schedule(key ?? `update:${row.updateId}`, () => this.processClaimedUpdate(row)))
       }
-      return this.#schedule(key ?? `update:${row.updateId}`, () => this.processClaimedUpdate(row))
-    })
+    }
+    if (preemptiveStops.length > 0) {
+      await new Promise(resolve => setImmediate(resolve))
+      scheduled.push(...preemptiveStops.map(row => this.processClaimedUpdate(row)))
+    }
     const results = await Promise.all(scheduled)
+    return {
+      claimed: rows.length,
+      processed: results.filter(result => result.status === 'completed').length,
+      failed: results.filter(result => result.status === 'failed').length,
+    }
+  }
+
+  async drainControlsOnce({ limit = 8 } = {}) {
+    await this.#approvalRouter.expirePending()
+    const rows = this.#state.claimUpdatesMatching({
+      workerId: this.#workerId,
+      predicate: row => {
+        try {
+          const update = normalizeUpdate(row.raw)
+          return isOwnerStop(update, this.#ownerUserId) || isOwnerCallback(update, this.#ownerUserId)
+        } catch {
+          return false
+        }
+      },
+      scanLimit: null,
+      limit,
+      leaseMs: this.#updateLeaseMs,
+      nowMs: this.#clock(),
+    })
+    const results = await Promise.all(rows.map(row => this.processClaimedUpdate(row)))
     return {
       claimed: rows.length,
       processed: results.filter(result => result.status === 'completed').length,
@@ -210,7 +268,7 @@ export class Dispatcher {
         return { status: 'completed', action: 'stored', reason: decision.reason }
       }
 
-      const command = commandName(update)
+      const command = update.actor?.id === this.#ownerUserId ? commandName(update) : null
       if (command === 'new') {
         this.#state.detachThread(update.conversationKey, 'owner requested /new', this.#clock())
         await this.#sendSystemReply(update, row.updateId, 'A new Codex conversation will start with your next message.')
@@ -250,10 +308,7 @@ export class Dispatcher {
       if (turn.contextBreak) {
         await this.#sendContextBreakNotice(update, row.updateId, turn.replacedThreadId)
       }
-      const equivalentSent = (turn.sentActionIds ?? []).some(actionId => {
-        const action = this.#state.getOutboundAction(actionId)
-        return action?.status === 'sent' && action.conversationKey === update.conversationKey
-      })
+      const equivalentSent = hasEquivalentSentAction(this.#state, turn, update.conversationKey)
       if (!turn.skipped && turn.finalText && !equivalentSent) {
         await this.#queueFinalAnswer(update, row.updateId, turn.finalText)
       }
@@ -261,7 +316,9 @@ export class Dispatcher {
       this.#state.completeUpdate({ updateId: row.updateId, workerId: this.#workerId, nowMs: this.#clock() })
       return { status: 'completed', action: turn.skipped ? 'skipped' : equivalentSent ? 'tool_sent' : 'answered' }
     } catch (error) {
-      const permanent = row.attempts >= 5 || (error instanceof TelegramApiError && !(error instanceof RateLimitError))
+      const permanent = error?.turnAccepted === true
+        || row.attempts >= 5
+        || (error instanceof TelegramApiError && !(error instanceof RateLimitError))
       this.#state.failUpdate({
         updateId: row.updateId,
         workerId: this.#workerId,
@@ -478,10 +535,7 @@ export class Dispatcher {
       if (turn.contextBreak) {
         await this.#sendContextBreakNotice(syntheticUpdate, `wake-${wake.id}`, turn.replacedThreadId)
       }
-      const equivalentSent = (turn.sentActionIds ?? []).some(actionId => {
-        const action = this.#state.getOutboundAction(actionId)
-        return action?.status === 'sent' && action.conversationKey === wake.conversationKey
-      })
+      const equivalentSent = hasEquivalentSentAction(this.#state, turn, wake.conversationKey)
       if (!turn.skipped && turn.finalText && !equivalentSent) {
         await this.#queueFinalAnswer(syntheticUpdate, `wake-${wake.id}`, turn.finalText)
       }
@@ -493,7 +547,7 @@ export class Dispatcher {
         workerId: this.#workerId,
         error: error.message,
         retryAtMs: this.#clock() + Math.min(60_000, 1_000 * (2 ** Math.max(0, wake.attempts - 1))),
-        permanent: wake.attempts >= 5,
+        permanent: error?.turnAccepted === true || wake.attempts >= 5,
         nowMs: this.#clock(),
       })
       return { status: 'failed', error }

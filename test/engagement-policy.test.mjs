@@ -73,6 +73,29 @@ test('starts approved group turns for commands, direct mentions, and replies to 
   assert.ok([command, mention, reply].every(update => policy.evaluate(update).action === 'turn'))
 })
 
+test('reserves /new and /stop in approved groups for the owner', () => {
+  const policy = new EngagementPolicy(config())
+
+  for (const command of ['/new', '/stop@bridge_bot']) {
+    const outsider = message({ message: { ...message().message, text: command } })
+    assert.deepEqual(policy.evaluate(outsider), {
+      action: 'store',
+      reason: 'owner_only_system_command',
+      extendsSilence: true,
+    })
+
+    const owner = message({
+      actor: { id: '42', isBot: false, username: 'owner', displayName: 'Owner' },
+      message: { ...message().message, text: command },
+    })
+    assert.deepEqual(policy.evaluate(owner), {
+      action: 'turn',
+      reason: 'owner_system_command',
+      extendsSilence: true,
+    })
+  }
+})
+
 test('stores ordinary approved group traffic and marks bot traffic as non-extending', () => {
   const policy = new EngagementPolicy(config(), { botUserId: '500', botUsername: 'bridge_bot' })
   const human = message()

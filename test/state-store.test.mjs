@@ -78,6 +78,61 @@ test('claims updates with leases and recovers only expired processing rows', asy
   assert.equal(reclaimed[0].attempts, 2)
 })
 
+test('claims only pending updates selected by a synchronous predicate', async t => {
+  const { store } = await openStore()
+  t.after(() => store.close())
+  for (const [updateId, text] of [['1', 'hello'], ['2', '/stop'], ['3', 'later']]) {
+    store.storeUpdate({
+      updateId,
+      raw: { update_id: Number(updateId), message: { text } },
+      normalizedType: 'message',
+      nowMs: 100,
+    })
+  }
+
+  const claimed = store.claimUpdatesMatching({
+    workerId: 'stop-worker',
+    predicate: row => row.raw.message.text === '/stop',
+    scanLimit: 10,
+    limit: 2,
+    leaseMs: 500,
+    nowMs: 200,
+  })
+
+  assert.deepEqual(claimed.map(row => row.updateId), ['2'])
+  assert.equal(store.getUpdate('1').status, 'pending')
+  assert.equal(store.getUpdate('2').leaseOwner, 'stop-worker')
+})
+
+test('can scan the full pending backlog for an urgent control update', async t => {
+  const { store } = await openStore()
+  t.after(() => store.close())
+  for (let updateId = 1; updateId <= 1_025; updateId += 1) {
+    store.storeUpdate({
+      updateId: String(updateId),
+      raw: { update_id: updateId, message: { text: 'ordinary' } },
+      normalizedType: 'message',
+      nowMs: 100,
+    })
+  }
+  store.storeUpdate({
+    updateId: '1026',
+    raw: { update_id: 1026, message: { text: '/stop' } },
+    normalizedType: 'message',
+    nowMs: 100,
+  })
+
+  const claimed = store.claimUpdatesMatching({
+    workerId: 'control-worker',
+    predicate: row => row.raw.message.text === '/stop',
+    scanLimit: null,
+    limit: 1,
+    nowMs: 200,
+  })
+
+  assert.deepEqual(claimed.map(row => row.updateId), ['1026'])
+})
+
 test('requires the lease owner to complete or retry an update', async t => {
   const { store } = await openStore()
   t.after(() => store.close())
@@ -130,6 +185,55 @@ test('keeps conversation settings and clears only the exact active turn', async 
   })
 })
 
+test('persists the source before turn start and atomically replaces the placeholder', async t => {
+  const { store } = await openStore()
+  t.after(() => store.close())
+  store.upsertConversation({ conversationKey: '42', threadId: 'thread-1', nowMs: 100 })
+
+  assert.equal(store.beginActiveTurn({
+    conversationKey: '42',
+    placeholderTurnId: 'starting:telegram:77',
+    sourceId: 'telegram:77',
+    nowMs: 110,
+  }), true)
+  assert.deepEqual(store.listActiveConversations().map(item => ({
+    turnId: item.activeTurnId,
+    sourceId: item.activeSourceId,
+  })), [{ turnId: 'starting:telegram:77', sourceId: 'telegram:77' }])
+  assert.equal(store.replaceActiveTurn({
+    conversationKey: '42',
+    expectedTurnId: 'starting:telegram:77',
+    turnId: 'turn-1',
+    nowMs: 120,
+  }), true)
+  assert.equal(store.listActiveConversations()[0].activeTurnId, 'turn-1')
+  assert.equal(store.clearActiveTurn({ conversationKey: '42', turnId: 'turn-1', nowMs: 130 }), true)
+  assert.deepEqual(store.listActiveConversations(), [])
+})
+
+test('marks a correlated Telegram update or wake permanently failed after an uncertain turn', async t => {
+  const { store } = await openStore()
+  t.after(() => store.close())
+  store.storeUpdate({ updateId: '77', raw: { update_id: 77 }, normalizedType: 'message', nowMs: 1 })
+  store.claimUpdates({ workerId: 'worker', nowMs: 2 })
+  const wake = store.enqueueWake({
+    conversationKey: '42',
+    source: 'manual',
+    reason: 'test',
+    dedupeKey: 'wake-1',
+    earliestAtMs: 1,
+    expiresAtMs: 10_000,
+    nowMs: 1,
+  }).wake
+  store.claimWakes({ workerId: 'worker', nowMs: 2 })
+
+  assert.equal(store.failUncertainSource('telegram:77', 'turn outcome unknown', 100), true)
+  assert.equal(store.getUpdate('77').status, 'failed')
+  assert.match(store.getUpdate('77').lastError, /outcome unknown/)
+  assert.equal(store.failUncertainSource(`wake:${wake.id}`, 'turn outcome unknown', 100), true)
+  assert.equal(store.getWake(wake.id).status, 'failed')
+})
+
 test('deduplicates outbound actions and preserves ambiguous sends', async t => {
   const { store } = await openStore()
   t.after(() => store.close())
@@ -156,6 +260,27 @@ test('deduplicates outbound actions and preserves ambiguous sends', async t => {
   assert.equal(store.markOutboundAmbiguous('answer:update:42', 'connection reset after upload', 400), true)
   assert.equal(store.getOutboundAction('answer:update:42').status, 'ambiguous')
   assert.equal(store.markOutboundSending('answer:update:42', 500), false)
+})
+
+test('marks sends interrupted by a process restart as ambiguous', async t => {
+  const { store } = await openStore()
+  t.after(() => store.close())
+  for (const actionId of ['sending', 'pending']) {
+    store.createOutboundAction({
+      actionId,
+      conversationKey: '-100123',
+      actionType: 'send_text',
+      payload: { text: actionId },
+      nowMs: 100,
+    })
+  }
+  store.markOutboundSending('sending', 200)
+
+  assert.equal(store.recoverInterruptedOutboundActions(300), 1)
+  assert.equal(store.getOutboundAction('sending').status, 'ambiguous')
+  assert.match(store.getOutboundAction('sending').lastError, /restart.*result unknown/iu)
+  assert.equal(store.getOutboundAction('pending').status, 'pending')
+  assert.equal(store.recoverInterruptedOutboundActions(400), 0)
 })
 
 test('claims due outbound actions in sequence without rerunning the source update', async t => {
@@ -254,6 +379,26 @@ test('expires approvals instead of resolving them late', async t => {
     { resolved: false, reason: 'expired' },
   )
   assert.equal(store.getApproval('hash-expired').state, 'expired')
+})
+
+test('expires orphaned pending approvals during bridge startup', async t => {
+  const { store } = await openStore()
+  t.after(() => store.close())
+  store.createApproval({
+    tokenHash: 'orphaned',
+    requestId: 'connection-a:1',
+    method: 'item/commandExecution/requestApproval',
+    conversationKey: '42',
+    threadId: 'thread-1',
+    turnId: 'turn-1',
+    ownerUserId: '42',
+    expiresAtMs: 10_000,
+    nowMs: 1,
+  })
+
+  assert.equal(store.expirePendingApprovals(100), 1)
+  assert.equal(store.getApproval('orphaned').state, 'expired')
+  assert.equal(store.expirePendingApprovals(200), 0)
 })
 
 test('deduplicates wake requests and claims only due, unexpired rows', async t => {

@@ -42,6 +42,16 @@ test('long polls with a durable offset and an explicit allowed_updates surface',
   assert.deepEqual(body, { offset: '10', timeout: 50, allowed_updates: ALLOWED_UPDATES })
 })
 
+test('reads the bot identity for mention and self-message routing', async () => {
+  const { client, calls } = clientWith(() => jsonResponse({
+    ok: true,
+    result: { id: 500, is_bot: true, username: 'bridge_bot', first_name: 'Bridge' },
+  }))
+
+  assert.equal((await client.getMe()).username, 'bridge_bot')
+  assert.equal(calls[0].url.endsWith('/getMe'), true)
+})
+
 test('sends text, reply, edit, delete, typing, and callback acknowledgement', async () => {
   const { client, calls } = clientWith((url, options) => {
     const method = url.split('/').at(-1)

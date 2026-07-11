@@ -1,0 +1,39 @@
+[Unit]
+Description=Codex app-server for Telegram bridge
+After=network-online.target systemd-tmpfiles-setup.service
+Wants=network-online.target
+Before=codex-tg-bridge.service
+
+[Service]
+Type=simple
+User=codexbot
+Group=codexbot
+SupplementaryGroups=codex-tg
+WorkingDirectory=/srv/codex-workspace
+Environment=HOME=/var/lib/codexbot
+Environment=CODEX_HOME=/var/lib/codexbot/.codex
+ExecStart=/usr/local/bin/codex app-server --listen unix:///run/codex-tg/app/app.sock -c 'mcp_servers.telegram.command="/usr/bin/node"' -c 'mcp_servers.telegram.args=["/opt/tg-engage/bridge/src/mcp-server.mjs"]' -c 'mcp_servers.telegram.env={BRIDGE_ACTION_SOCKET="/run/codex-tg/action/action.sock"}'
+ExecStartPost=/opt/tg-engage/bridge/deploy/prepare-app-socket.sh /run/codex-tg/app/app.sock codex-tg
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/run/codex-tg/app /var/lib/codexbot /srv/codex-workspace /srv/codex-inbox
+MemoryMax=3G
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

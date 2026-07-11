@@ -4,16 +4,21 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { WebSocketServer } from 'ws'
 
-export async function startFakeAppServer({ onMessage } = {}) {
+export async function startFakeAppServer({
+  onMessage,
+  userAgent = 'Codex Desktop/0.143.0 (Mac OS 26.5.0; x86_64) dumb (tg_engage_bridge; 0.1.0)',
+} = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'tg-bridge-app-server-'))
   const socketPath = join(dir, 'app.sock')
   const httpServer = createServer()
   const webSocketServer = new WebSocketServer({ server: httpServer })
   const messages = []
+  const upgradeHeaders = []
   const waiters = []
   let socket = null
 
-  webSocketServer.on('connection', client => {
+  webSocketServer.on('connection', (client, request) => {
+    upgradeHeaders.push(request.headers)
     socket = client
     client.on('message', async data => {
       const message = JSON.parse(data.toString())
@@ -27,7 +32,7 @@ export async function startFakeAppServer({ onMessage } = {}) {
       if (message.method === 'initialize' && message.id !== undefined) {
         client.send(JSON.stringify({
           id: message.id,
-          result: { userAgent: 'codex-cli-test', platformFamily: 'unix', platformOs: 'linux' },
+          result: { userAgent, platformFamily: 'unix', platformOs: 'linux' },
         }))
       }
       await onMessage?.(message, {
@@ -46,6 +51,7 @@ export async function startFakeAppServer({ onMessage } = {}) {
   return {
     socketPath,
     messages,
+    upgradeHeaders,
     send(message) {
       if (!socket) throw new Error('fake app-server has no connected client')
       socket.send(JSON.stringify(message))

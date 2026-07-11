@@ -15,16 +15,24 @@ async function loadContract() {
   return JSON.parse(await readFile(contractPath, 'utf8'))
 }
 
+const OBSERVED_CODEX_USER_AGENT =
+  'Codex Desktop/0.143.0 (Mac OS 26.5.0; x86_64) dumb (tg_engage_bridge; 0.1.0)'
+
+async function connectToFake(fake, options = {}) {
+  return AppServerClient.connect({
+    socketPath: fake.socketPath,
+    contract: await loadContract(),
+    ...options,
+  })
+}
+
 test('connects over a Unix WebSocket and performs initialize then initialized', async t => {
   const fake = await startFakeAppServer()
   t.after(() => fake.close())
-  const client = await AppServerClient.connect({
-    socketPath: fake.socketPath,
-    contract: await loadContract(),
-    requestTimeoutMs: 1_000,
-  })
+  const client = await connectToFake(fake, { requestTimeoutMs: 1_000 })
   t.after(() => client.close())
   await fake.waitForMessage(message => message.method === 'initialized')
+  assert.equal(fake.upgradeHeaders[0]['sec-websocket-extensions'], undefined)
 
   assert.deepEqual(fake.messages.slice(0, 2), [
     {
@@ -50,7 +58,34 @@ test('connects over a Unix WebSocket and performs initialize then initialized', 
     },
     { method: 'initialized', params: {} },
   ])
-  assert.equal(client.initializeResult.userAgent, 'codex-cli-test')
+  assert.equal(client.initializeResult.userAgent, OBSERVED_CODEX_USER_AGENT)
+})
+
+test('fails startup when explicitly given an unversioned fake app-server userAgent', async t => {
+  const fake = await startFakeAppServer({ userAgent: 'codex-cli-test' })
+  t.after(() => fake.close())
+
+  await assert.rejects(
+    AppServerClient.connect({ socketPath: fake.socketPath, contract: await loadContract() }),
+    /cannot verify.*initializeResult\.userAgent "codex-cli-test".*does not expose live schema hashes/,
+  )
+  assert.equal(fake.messages.some(message => message.method === 'initialized'), false)
+})
+
+test('fails startup when the running version differs from contract.codexVersion', async t => {
+  const fake = await startFakeAppServer({ userAgent: OBSERVED_CODEX_USER_AGENT })
+  t.after(() => fake.close())
+  const contract = await loadContract()
+  contract.codexVersion = 'codex-cli 0.144.0'
+
+  await assert.rejects(
+    AppServerClient.connect({
+      socketPath: fake.socketPath,
+      contract,
+    }),
+    /app-server version is incompatible.*running 0\.143\.0.*captured 0\.144\.0.*does not expose live schema hashes/,
+  )
+  assert.equal(fake.messages.some(message => message.method === 'initialized'), false)
 })
 
 test('correlates out-of-order JSON-RPC responses', async t => {
@@ -66,7 +101,7 @@ test('correlates out-of-order JSON-RPC responses', async t => {
     },
   })
   t.after(() => fake.close())
-  const client = await AppServerClient.connect({ socketPath: fake.socketPath, contract: await loadContract() })
+  const client = await connectToFake(fake)
   t.after(() => client.close())
 
   const first = client.request('thread/start', { cwd: '/workspace' })
@@ -78,7 +113,7 @@ test('correlates out-of-order JSON-RPC responses', async t => {
 test('emits notifications but never treats delta text as a final response', async t => {
   const fake = await startFakeAppServer()
   t.after(() => fake.close())
-  const client = await AppServerClient.connect({ socketPath: fake.socketPath, contract: await loadContract() })
+  const client = await connectToFake(fake)
   t.after(() => client.close())
   const received = []
   client.on('notification', notification => received.push(notification))
@@ -96,7 +131,7 @@ test('emits notifications but never treats delta text as a final response', asyn
 test('surfaces server requests and sends one explicit response', async t => {
   const fake = await startFakeAppServer()
   t.after(() => fake.close())
-  const client = await AppServerClient.connect({ socketPath: fake.socketPath, contract: await loadContract() })
+  const client = await connectToFake(fake)
   t.after(() => client.close())
 
   const requestPromise = new Promise(resolve => client.once('request', resolve))
@@ -125,7 +160,7 @@ test('turns JSON-RPC errors into typed errors', async t => {
     },
   })
   t.after(() => fake.close())
-  const client = await AppServerClient.connect({ socketPath: fake.socketPath, contract: await loadContract() })
+  const client = await connectToFake(fake)
   t.after(() => client.close())
 
   await assert.rejects(client.request('thread/resume', { threadId: 'missing' }), error => {
@@ -140,7 +175,7 @@ test('fails closed on malformed frames and rejects pending requests', async t =>
   let connection
   const fake = await startFakeAppServer({ onMessage(_message, context) { connection = context } })
   t.after(() => fake.close())
-  const client = await AppServerClient.connect({ socketPath: fake.socketPath, contract: await loadContract() })
+  const client = await connectToFake(fake)
   t.after(() => client.close())
 
   const pending = client.request('thread/start', {})

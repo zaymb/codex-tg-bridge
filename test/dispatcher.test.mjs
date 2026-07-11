@@ -29,6 +29,22 @@ function rawMessage(updateId, {
   }
 }
 
+function rawCallback(updateId, data = 'ap:abcdefgh:approve') {
+  return {
+    update_id: updateId,
+    callback_query: {
+      id: `callback-${updateId}`,
+      from: { id: 42, is_bot: false, first_name: 'Owner' },
+      data,
+      message: {
+        message_id: updateId * 10,
+        date: 1,
+        chat: { id: 42, type: 'private' },
+      },
+    },
+  }
+}
+
 function policy() {
   return new EngagementPolicy({
     ownerUserId: '42',
@@ -174,7 +190,7 @@ test('does not send an automatic answer for structured SKIP or an equivalent Tel
     actionId: 'tool-action-1',
     conversationKey: '42',
     actionType: 'send_text',
-    payload: { chatId: '42', text: 'sent by tool' },
+    payload: { chatId: '42', text: 'final answer' },
     nowMs: 900,
   })
   toolSent.state.markOutboundSending('tool-action-1', 900)
@@ -182,6 +198,53 @@ test('does not send an automatic answer for structured SKIP or an equivalent Tel
   toolSent.runner.result = { ...toolSent.runner.result, sentActionIds: ['tool-action-1'] }
   await toolSent.dispatcher.processClaimedUpdate(storeAndClaim(toolSent.state, rawMessage(3)))
   assert.equal(toolSent.telegram.calls.some(call => ['reply', 'sendText'].includes(call.method)), false)
+
+  const toolReplied = fixture()
+  t.after(() => toolReplied.state.close())
+  toolReplied.state.createOutboundAction({
+    actionId: 'tool-action-2',
+    conversationKey: '42',
+    actionType: 'reply',
+    payload: { chatId: '42', messageId: '30', text: 'final answer' },
+    nowMs: 900,
+  })
+  toolReplied.state.markOutboundSending('tool-action-2', 900)
+  toolReplied.state.markOutboundSent('tool-action-2', { telegramChatId: '42', telegramMessageId: '100' }, 901)
+  toolReplied.runner.result = { ...toolReplied.runner.result, sentActionIds: ['tool-action-2'] }
+  await toolReplied.dispatcher.processClaimedUpdate(storeAndClaim(toolReplied.state, rawMessage(29)))
+  assert.equal(toolReplied.telegram.calls.some(call => ['reply', 'sendText'].includes(call.method)), false)
+})
+
+test('only suppresses an automatic answer for an equivalent sent text or reply action', async t => {
+  const cases = [
+    { name: 'reaction', actionType: 'react', payload: { chatId: '42', messageId: '30', reaction: { type: 'emoji', emoji: '👍' } } },
+    { name: 'edit', actionType: 'edit_own_message', payload: { chatId: '42', messageId: '30', text: 'final answer' } },
+    { name: 'delete', actionType: 'delete_own_message', payload: { chatId: '42', messageId: '30' } },
+    { name: 'different text', actionType: 'send_text', payload: { chatId: '42', text: 'side note' } },
+    { name: 'different conversation', actionType: 'reply', conversationKey: '-100123', payload: { chatId: '-100123', messageId: '30', text: 'final answer' } },
+  ]
+
+  for (const [index, item] of cases.entries()) {
+    await t.test(item.name, async t => {
+      const setup = fixture()
+      t.after(() => setup.state.close())
+      const actionId = `non-equivalent-${index}`
+      setup.state.createOutboundAction({
+        actionId,
+        conversationKey: item.conversationKey ?? '42',
+        actionType: item.actionType,
+        payload: item.payload,
+        nowMs: 900,
+      })
+      setup.state.markOutboundSending(actionId, 900)
+      setup.state.markOutboundSent(actionId, { telegramChatId: item.payload.chatId, telegramMessageId: '99' }, 901)
+      setup.runner.result = { ...setup.runner.result, sentActionIds: [actionId] }
+
+      await setup.dispatcher.processClaimedUpdate(storeAndClaim(setup.state, rawMessage(30 + index)))
+
+      assert.equal(setup.telegram.calls.filter(call => call.method === 'reply').length, 1)
+    })
+  }
 })
 
 test('handles /new, /stop, and approval callbacks without a Codex turn', async t => {
@@ -208,6 +271,164 @@ test('handles /new, /stop, and approval callbacks without a Codex turn', async t
 
   assert.equal(setup.runner.jobs.length, 0)
   assert.equal(setup.callbacks.length, 1)
+})
+
+test('does not detach or interrupt for non-owner system commands in an approved group', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  setup.state.upsertConversation({ conversationKey: '-100123', threadId: 'old-thread', nowMs: 1 })
+
+  await setup.dispatcher.processClaimedUpdate(storeAndClaim(setup.state, rawMessage(40, {
+    chatId: -100123,
+    chatType: 'supergroup',
+    senderId: 99,
+    text: '/new',
+  })))
+  await setup.dispatcher.processClaimedUpdate(storeAndClaim(setup.state, rawMessage(41, {
+    chatId: -100123,
+    chatType: 'supergroup',
+    senderId: 99,
+    text: '/stop',
+  })))
+
+  assert.equal(setup.state.getConversation('-100123').threadId, 'old-thread')
+  assert.deepEqual(setup.runner.interrupts, [])
+  assert.equal(setup.runner.jobs.length, 0)
+})
+
+test('preempts an active turn with an owner /stop claimed by the dedicated control drain', { timeout: 1_000 }, async t => {
+  const state = StateStore.open(':memory:')
+  t.after(() => state.close())
+  let started
+  const turnStarted = new Promise(resolve => { started = resolve })
+  let finish
+  const turnFinished = new Promise(resolve => { finish = resolve })
+  const interrupts = []
+  const runner = {
+    async runTurn(job) {
+      started(job.conversationKey)
+      await turnFinished
+      return { finalText: null, skipped: true, sentActionIds: [], contextBreak: false }
+    },
+    async interrupt(key) {
+      interrupts.push(key)
+      finish()
+      return true
+    },
+  }
+  const setup = fixture({ state, runner, maxConcurrentTurns: 1 })
+  const active = rawMessage(42, {
+    chatId: -100123,
+    chatType: 'supergroup',
+    senderId: 42,
+    text: '/ask',
+    threadId: 7,
+  })
+  state.storeUpdate({ updateId: '42', raw: active, normalizedType: 'message', nowMs: 1_000 })
+  const activeDrain = setup.dispatcher.drainOnce({ limit: 1 })
+  assert.equal(await turnStarted, '-100123:7')
+
+  const stop = rawMessage(43, {
+    chatId: -100123,
+    chatType: 'supergroup',
+    senderId: 42,
+    text: '/stop',
+    threadId: 7,
+  })
+  state.storeUpdate({ updateId: '43', raw: stop, normalizedType: 'message', nowMs: 1_000 })
+  const stopDrain = setup.dispatcher.drainControlsOnce({ limit: 8 })
+
+  const [activeResult, stopResult] = await Promise.all([activeDrain, stopDrain])
+  assert.deepEqual(interrupts, ['-100123:7'])
+  assert.equal(activeResult.processed, 1)
+  assert.equal(stopResult.processed, 1)
+  assert.equal(state.getUpdate('42').status, 'completed')
+  assert.equal(state.getUpdate('43').status, 'completed')
+})
+
+test('dedicated control drain resolves owner approval callbacks and advances expiry', async t => {
+  let expiryCalls = 0
+  const callbacks = []
+  const approvalRouter = {
+    async handleCallback(update) { callbacks.push(update); return true },
+    async expirePending() { expiryCalls += 1; return 0 },
+  }
+  const setup = fixture({ approvalRouter })
+  t.after(() => setup.state.close())
+  const raw = rawCallback(48)
+  setup.state.storeUpdate({ updateId: '48', raw, normalizedType: 'callback_query', nowMs: 1_000 })
+
+  const result = await setup.dispatcher.drainControlsOnce()
+
+  assert.equal(result.processed, 1)
+  assert.equal(callbacks.length, 1)
+  assert.equal(expiryCalls, 1)
+  assert.equal(setup.state.getUpdate('48').status, 'completed')
+})
+
+test('preempts an active turn with an owner /stop in the same drain batch', { timeout: 1_000 }, async t => {
+  const state = StateStore.open(':memory:')
+  t.after(() => state.close())
+  let finish
+  const turnFinished = new Promise(resolve => { finish = resolve })
+  const interrupts = []
+  let turnStarted = false
+  const runner = {
+    async runTurn() {
+      turnStarted = true
+      await turnFinished
+      return { finalText: null, skipped: true, sentActionIds: [], contextBreak: false }
+    },
+    async interrupt(key) {
+      assert.equal(turnStarted, true)
+      interrupts.push(key)
+      finish()
+      return true
+    },
+  }
+  const setup = fixture({ state, runner, maxConcurrentTurns: 1 })
+  for (const raw of [
+    rawMessage(44, { chatId: -100123, chatType: 'supergroup', senderId: 42, text: '/ask', threadId: 7 }),
+    rawMessage(45, { chatId: -100123, chatType: 'supergroup', senderId: 42, text: '/stop', threadId: 7 }),
+  ]) {
+    state.storeUpdate({ updateId: String(raw.update_id), raw, normalizedType: 'message', nowMs: 1_000 })
+  }
+
+  const result = await setup.dispatcher.drainOnce({ limit: 2 })
+
+  assert.deepEqual(interrupts, ['-100123:7'])
+  assert.equal(result.processed, 2)
+})
+
+test('marks accepted-turn update failures permanent without retrying them', async t => {
+  const runner = new FakeRunner()
+  runner.runTurn = async job => {
+    runner.jobs.push(job)
+    const error = new Error('connection lost after turn/start')
+    error.turnAccepted = true
+    throw error
+  }
+  const setup = fixture({ runner })
+  t.after(() => setup.state.close())
+
+  const result = await setup.dispatcher.processClaimedUpdate(storeAndClaim(setup.state, rawMessage(46)))
+
+  assert.equal(result.status, 'failed')
+  assert.equal(setup.state.getUpdate('46').status, 'failed')
+})
+
+test('keeps pre-acceptance update failures retryable', async t => {
+  const runner = new FakeRunner()
+  runner.runTurn = async job => {
+    runner.jobs.push(job)
+    throw new Error('turn/start was not accepted')
+  }
+  const setup = fixture({ runner })
+  t.after(() => setup.state.close())
+
+  await setup.dispatcher.processClaimedUpdate(storeAndClaim(setup.state, rawMessage(47)))
+
+  assert.equal(setup.state.getUpdate('47').status, 'pending')
 })
 
 test('downloads approved attachments before starting the turn', async t => {
@@ -388,4 +609,38 @@ test('completes a wake without sending when Codex returns SKIP', async t => {
 
   assert.equal(setup.telegram.calls.some(call => ['reply', 'sendText'].includes(call.method)), false)
   assert.equal(setup.state.getWakeByDedupe('manual', 'manual:skip').status, 'completed')
+})
+
+test('marks accepted-turn wake failures permanent without retrying them', async t => {
+  const runner = new FakeRunner()
+  runner.runTurn = async job => {
+    runner.jobs.push(job)
+    const error = new Error('connection lost after wake turn/start')
+    error.turnAccepted = true
+    throw error
+  }
+  const setup = fixture({ runner })
+  t.after(() => setup.state.close())
+  setup.state.upsertApprovedChat({
+    conversationKey: '42',
+    telegramChatId: '42',
+    alias: 'owner',
+    title: 'Owner DM',
+    kind: 'private',
+    nowMs: 1,
+  })
+  setup.state.enqueueWake({
+    conversationKey: '42',
+    source: 'manual',
+    reason: 'accepted failure',
+    dedupeKey: 'manual:accepted-failure',
+    earliestAtMs: 1_000,
+    expiresAtMs: 10_000,
+    nowMs: 100,
+  })
+
+  const result = await setup.dispatcher.drainWakesOnce()
+
+  assert.equal(result.failed, 1)
+  assert.equal(setup.state.getWakeByDedupe('manual', 'manual:accepted-failure').status, 'failed')
 })

@@ -8,6 +8,11 @@ function isCommand(update) {
   return (update.message?.entities ?? []).some(entity => entity.type === 'bot_command' && entity.offset === 0)
 }
 
+function systemCommandName(update) {
+  const text = update.message?.text ?? update.message?.caption ?? ''
+  return text.match(/^\/(new|stop)(?:@[A-Za-z0-9_]+)?(?:\s|$)/iu)?.[1]?.toLowerCase() ?? null
+}
+
 function isDirectMention(update, botUserId, botUsername) {
   const text = update.message?.text ?? update.message?.caption ?? ''
   for (const entity of update.message?.entities ?? []) {
@@ -70,6 +75,12 @@ export class EngagementPolicy {
     if (!update.message) return result('store', 'unsupported_update')
 
     const humanAuthored = actor?.isBot !== true && chat.type !== 'channel'
+    if (systemCommandName(update)) {
+      if (humanAuthored && actor?.id === this.#config.ownerUserId) {
+        return result('turn', 'owner_system_command', true)
+      }
+      return result('store', 'owner_only_system_command', humanAuthored)
+    }
     if (isCommand(update)) return result('turn', 'command', humanAuthored)
     if (isDirectMention(update, this.#botUserId, this.#botUsername)) {
       return result('turn', 'direct_mention', humanAuthored)

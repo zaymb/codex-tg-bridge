@@ -133,6 +133,10 @@ export class TelegramClient {
     }, { signal })
   }
 
+  getMe() {
+    return this.#request('getMe')
+  }
+
   sendText({ chatId, text, threadId = null, replyMarkup = null }) {
     return this.#request('sendMessage', {
       chat_id: String(chatId),

@@ -24,6 +24,10 @@ function sha256(buffer) {
   return createHash('sha256').update(buffer).digest('hex')
 }
 
+const VERSION_TOKEN = '[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?'
+const CAPTURED_CODEX_VERSION = new RegExp(`^codex-cli (${VERSION_TOKEN})$`)
+const APP_SERVER_USER_AGENT_VERSION = new RegExp(`^[^/]+/(${VERSION_TOKEN})(?:\\s|$)`)
+
 export function validateContract(contract) {
   if (!contract || contract.protocol !== 'codex-app-server') {
     throw new Error('invalid Codex app-server contract')
@@ -42,6 +46,30 @@ export function validateContract(contract) {
     }
   }
   return contract
+}
+
+export function assertRuntimeContractCompatible(contract, initializeResult) {
+  validateContract(contract)
+  const capturedVersion = CAPTURED_CODEX_VERSION.exec(contract.codexVersion)?.[1]
+  if (!capturedVersion) {
+    throw new Error(`cannot verify Codex app-server runtime compatibility: contract.codexVersion ${JSON.stringify(contract.codexVersion)} is not in "codex-cli VERSION" format`)
+  }
+
+  const userAgent = initializeResult?.userAgent
+  const runningVersion = typeof userAgent === 'string'
+    ? APP_SERVER_USER_AGENT_VERSION.exec(userAgent)?.[1]
+    : undefined
+
+  // Initialize exposes a versioned user agent, but no live schema hashes. Exact
+  // version equality is therefore the strongest runtime contract check available.
+  if (!runningVersion) {
+    throw new Error(`cannot verify Codex app-server runtime compatibility: initializeResult.userAgent ${JSON.stringify(userAgent)} does not expose a Codex version; app-server does not expose live schema hashes`)
+  }
+  if (runningVersion !== capturedVersion) {
+    throw new Error(`Codex app-server version is incompatible with captured contract: running ${runningVersion} from initializeResult.userAgent, captured ${capturedVersion} from contract.codexVersion; app-server does not expose live schema hashes`)
+  }
+
+  return initializeResult
 }
 
 export async function captureContract({ schemaDir, codexVersion }) {

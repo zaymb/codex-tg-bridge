@@ -340,6 +340,10 @@ export class StateStore {
     `).run(key, String(value), nowMs)
   }
 
+  deleteSetting(key) {
+    return this.#db.prepare('DELETE FROM settings WHERE key = ?').run(key).changes === 1
+  }
+
   getPollOffset() {
     return this.getSetting('telegram_poll_offset')
   }
@@ -390,6 +394,47 @@ export class StateStore {
     return transaction()
   }
 
+  claimUpdatesMatching({
+    workerId,
+    predicate,
+    scanLimit = 1_024,
+    limit = 8,
+    leaseMs = 120_000,
+    nowMs = Date.now(),
+  }) {
+    if (!workerId) throw new Error('workerId is required')
+    if (typeof predicate !== 'function') throw new Error('predicate is required')
+    const transaction = this.#db.transaction(() => {
+      const limitClause = scanLimit === null ? '' : 'LIMIT ?'
+      if (scanLimit !== null && (!Number.isSafeInteger(scanLimit) || scanLimit < 1)) {
+        throw new Error('scanLimit must be null or a positive integer')
+      }
+      const statement = this.#db.prepare(`
+        SELECT update_id FROM telegram_updates
+        WHERE status = 'pending' AND available_at_ms <= ?
+        ORDER BY length(update_id), update_id
+        ${limitClause}
+      `)
+      const rows = scanLimit === null ? statement.all(nowMs) : statement.all(nowMs, scanLimit)
+      const candidates = rows.map(row => this.getUpdate(row.update_id))
+      const selected = candidates.filter(predicate).slice(0, limit)
+      const claim = this.#db.prepare(`
+        UPDATE telegram_updates
+        SET status = 'processing', attempts = attempts + 1, lease_owner = ?,
+            lease_expires_at_ms = ?, updated_at_ms = ?
+        WHERE update_id = ? AND status = 'pending'
+      `)
+      const claimed = []
+      for (const row of selected) {
+        if (claim.run(workerId, nowMs + leaseMs, nowMs, row.updateId).changes === 1) {
+          claimed.push(this.getUpdate(row.updateId))
+        }
+      }
+      return claimed
+    })
+    return transaction()
+  }
+
   recoverExpiredLeases(nowMs = Date.now()) {
     return this.#db.prepare(`
       UPDATE telegram_updates
@@ -413,6 +458,28 @@ export class StateStore {
           last_error = ?, updated_at_ms = ?
       WHERE update_id = ? AND status = 'processing' AND lease_owner = ?
     `).run(permanent ? 'failed' : 'pending', retryAtMs, String(error), nowMs, String(updateId), workerId).changes === 1
+  }
+
+  failUncertainSource(sourceId, error, nowMs = Date.now()) {
+    const telegram = String(sourceId).match(/^telegram:(\d+)$/u)
+    if (telegram) {
+      return this.#db.prepare(`
+        UPDATE telegram_updates
+        SET status = 'failed', lease_owner = NULL, lease_expires_at_ms = NULL,
+            last_error = ?, updated_at_ms = ?
+        WHERE update_id = ? AND status IN ('pending', 'processing')
+      `).run(String(error), nowMs, telegram[1]).changes === 1
+    }
+    const wake = String(sourceId).match(/^wake:(\d+)$/u)
+    if (wake) {
+      return this.#db.prepare(`
+        UPDATE wake_requests
+        SET status = 'failed', lease_owner = NULL, lease_expires_at_ms = NULL,
+            last_error = ?, updated_at_ms = ?
+        WHERE id = ? AND status IN ('pending', 'processing')
+      `).run(String(error), nowMs, Number(wake[1])).changes === 1
+    }
+    return false
   }
 
   upsertConversation({ conversationKey, threadId, modelOverride, effortOverride, nowMs = Date.now() }) {
@@ -449,33 +516,67 @@ export class StateStore {
     return mapConversation(this.#db.prepare('SELECT * FROM conversations WHERE conversation_key = ?').get(conversationKey))
   }
 
+  listActiveConversations() {
+    return this.#db.prepare(`
+      SELECT * FROM conversations
+      WHERE thread_id IS NOT NULL AND active_turn_id IS NOT NULL
+      ORDER BY conversation_key
+    `).all().map(row => {
+      const conversation = mapConversation(row)
+      return {
+        ...conversation,
+        activeSourceId: this.getSetting(`active_source:${conversation.conversationKey}`),
+      }
+    })
+  }
+
   getConversationByThreadId(threadId) {
     return mapConversation(this.#db.prepare('SELECT * FROM conversations WHERE thread_id = ?').get(threadId))
   }
 
   setActiveTurn({ conversationKey, turnId, nowMs = Date.now() }) {
+    return this.beginActiveTurn({ conversationKey, placeholderTurnId: turnId, sourceId: null, nowMs })
+  }
+
+  beginActiveTurn({ conversationKey, placeholderTurnId, sourceId = null, nowMs = Date.now() }) {
     const transaction = this.#db.transaction(() => {
       if (!this.getConversation(conversationKey)) this.upsertConversation({ conversationKey, nowMs })
       const current = this.getConversation(conversationKey)
-      if (current.activeTurnId && current.activeTurnId !== turnId) {
+      if (current.activeTurnId && current.activeTurnId !== placeholderTurnId) {
         throw new Error(`${conversationKey} already has active turn ${current.activeTurnId}`)
       }
       this.#db.prepare(`
         UPDATE conversations
         SET active_turn_id = ?, active_turn_started_at_ms = ?, updated_at_ms = ?
         WHERE conversation_key = ?
-      `).run(turnId, nowMs, nowMs, conversationKey)
+      `).run(placeholderTurnId, nowMs, nowMs, conversationKey)
+      const sourceKey = `active_source:${conversationKey}`
+      if (sourceId === null) this.deleteSetting(sourceKey)
+      else this.setSetting(sourceKey, sourceId, nowMs)
       return true
     })
     return transaction()
   }
 
-  clearActiveTurn({ conversationKey, turnId, nowMs = Date.now() }) {
+  replaceActiveTurn({ conversationKey, expectedTurnId, turnId, nowMs = Date.now() }) {
     return this.#db.prepare(`
       UPDATE conversations
-      SET active_turn_id = NULL, active_turn_started_at_ms = NULL, updated_at_ms = ?
+      SET active_turn_id = ?, updated_at_ms = ?
       WHERE conversation_key = ? AND active_turn_id = ?
-    `).run(nowMs, conversationKey, turnId).changes === 1
+    `).run(turnId, nowMs, conversationKey, expectedTurnId).changes === 1
+  }
+
+  clearActiveTurn({ conversationKey, turnId, nowMs = Date.now() }) {
+    const transaction = this.#db.transaction(() => {
+      const cleared = this.#db.prepare(`
+        UPDATE conversations
+        SET active_turn_id = NULL, active_turn_started_at_ms = NULL, updated_at_ms = ?
+        WHERE conversation_key = ? AND active_turn_id = ?
+      `).run(nowMs, conversationKey, turnId).changes === 1
+      if (cleared) this.deleteSetting(`active_source:${conversationKey}`)
+      return cleared
+    })
+    return transaction()
   }
 
   detachThread(conversationKey, staleReason = null, nowMs = Date.now()) {
@@ -502,6 +603,22 @@ export class StateStore {
         updated_at_ms = excluded.updated_at_ms
     `).run(conversationKey, telegramChatId, alias, title, kind, nowMs)
     return this.getApprovedChat(conversationKey)
+  }
+
+  replaceApprovedChats(chats, nowMs = Date.now()) {
+    const transaction = this.#db.transaction(() => {
+      this.#db.prepare('UPDATE approved_chats SET alias = NULL, updated_at_ms = ?').run(nowMs)
+      const keys = chats.map(chat => chat.conversationKey)
+      if (keys.length === 0) {
+        this.#db.prepare('DELETE FROM approved_chats').run()
+      } else {
+        const placeholders = keys.map(() => '?').join(', ')
+        this.#db.prepare(`DELETE FROM approved_chats WHERE conversation_key NOT IN (${placeholders})`).run(...keys)
+      }
+      for (const chat of chats) this.upsertApprovedChat({ ...chat, nowMs })
+      return this.listApprovedChats()
+    })
+    return transaction()
   }
 
   getApprovedChat(conversationKey) {
@@ -657,6 +774,16 @@ export class StateStore {
     `).run(retryAtMs, String(error), nowMs, actionId).changes === 1
   }
 
+  recoverInterruptedOutboundActions(nowMs = Date.now()) {
+    return this.#db.prepare(`
+      UPDATE outbound_actions
+      SET status = 'ambiguous', next_attempt_at_ms = NULL,
+          last_error = 'bridge restart interrupted Telegram delivery; result unknown',
+          updated_at_ms = ?
+      WHERE status = 'sending'
+    `).run(nowMs).changes
+  }
+
   claimDueOutboundActions({ workerId, limit = 1, nowMs = Date.now() }) {
     if (!workerId) throw new Error('workerId is required')
     const transaction = this.#db.transaction(() => {
@@ -717,6 +844,13 @@ export class StateStore {
 
   getApproval(tokenHash) {
     return mapApproval(this.#db.prepare('SELECT * FROM approvals WHERE token_hash = ?').get(tokenHash))
+  }
+
+  expirePendingApprovals(nowMs = Date.now()) {
+    return this.#db.prepare(`
+      UPDATE approvals SET state = 'expired', updated_at_ms = ?
+      WHERE state = 'pending'
+    `).run(nowMs).changes
   }
 
   resolveApproval({ tokenHash, ownerUserId, decision, response = null, nowMs = Date.now() }) {

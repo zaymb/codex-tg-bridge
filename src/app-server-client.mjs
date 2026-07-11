@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events'
 import { isAbsolute } from 'node:path'
 import WebSocket from 'ws'
 
-import { validateContract } from './contract.mjs'
+import { assertRuntimeContractCompatible, validateContract } from './contract.mjs'
 
 const DELTA_NOTIFICATIONS = Object.freeze([
   'item/agentMessage/delta',
@@ -46,7 +46,9 @@ export class AppServerClient extends EventEmitter {
   }) {
     validateContract(contract)
     if (!isAbsolute(socketPath)) throw new Error('app-server socketPath must be absolute')
-    const socket = new WebSocketImpl(`ws+unix://${socketPath}:/`)
+    const socket = new WebSocketImpl(`ws+unix://${socketPath}:/`, {
+      perMessageDeflate: false,
+    })
     const client = new AppServerClient({ socket, contract, requestTimeoutMs })
     await client.#open()
     try {
@@ -61,6 +63,7 @@ export class AppServerClient extends EventEmitter {
           optOutNotificationMethods: DELTA_NOTIFICATIONS,
         },
       })
+      assertRuntimeContractCompatible(contract, client.initializeResult)
       client.notify('initialized', {})
       return client
     } catch (error) {

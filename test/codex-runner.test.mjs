@@ -197,6 +197,36 @@ test('does not replace a thread for non-stale resume errors', async t => {
   assert.equal(store.getConversation('42').threadId, 'thread-keep')
 })
 
+test('keeps an explicit turn/start RPC rejection retryable', async t => {
+  const fake = await startFakeAppServer({
+    onMessage(message, connection) {
+      if (message.method === 'thread/start') {
+        connection.send({ id: message.id, result: { thread: { id: 'thread-rejected' } } })
+      }
+      if (message.method === 'turn/start') {
+        connection.send({ id: message.id, error: { code: -32602, message: 'invalid turn parameters' } })
+      }
+    },
+  })
+  t.after(() => fake.close())
+  const client = await AppServerClient.connect({ socketPath: fake.socketPath, contract: await contract() })
+  t.after(() => client.close())
+  const store = StateStore.open(':memory:')
+  t.after(() => store.close())
+  const runner = new CodexRunner({ client, stateStore: store, config: config() })
+
+  await assert.rejects(
+    runner.runTurn({
+      conversationKey: '42',
+      ownerDm: true,
+      text: 'hello',
+      clientUserMessageId: 'telegram:55',
+    }),
+    error => /invalid turn parameters/.test(error.message) && error.turnAccepted !== true,
+  )
+  assert.equal(store.getConversation('42').activeTurnId, null)
+})
+
 test('interrupts the exact timed-out turn and clears active state', async t => {
   let interrupted
   const fake = await startFakeAppServer({
@@ -258,6 +288,240 @@ test('reports failed turns and clears active state', async t => {
     error => error instanceof CodexTurnFailedError && /model unavailable/.test(error.message),
   )
   assert.equal(store.getConversation('42').activeTurnId, null)
+})
+
+test('rejects immediately and clears active state when app-server disconnects mid-turn', async t => {
+  const fake = await startFakeAppServer({
+    onMessage(message, connection) {
+      if (message.method === 'thread/start') {
+        connection.send({ id: message.id, result: { thread: { id: 'thread-disconnect' } } })
+      }
+      if (message.method === 'turn/start') {
+        connection.send({ id: message.id, result: { turn: { id: 'turn-disconnect', status: 'inProgress', items: [] } } })
+        queueMicrotask(() => connection.close())
+      }
+    },
+  })
+  t.after(() => fake.close())
+  const client = await AppServerClient.connect({ socketPath: fake.socketPath, contract: await contract() })
+  t.after(() => client.close())
+  const store = StateStore.open(':memory:')
+  t.after(() => store.close())
+  const runner = new CodexRunner({ client, stateStore: store, config: config({ turnTimeoutMs: 10_000 }) })
+
+  await assert.rejects(
+    runner.runTurn({ conversationKey: '42', ownerDm: true, text: 'hello' }),
+    error => /app-server closed/iu.test(error.message) && error.turnAccepted === true,
+  )
+  assert.equal(store.getConversation('42').activeTurnId, null)
+})
+
+test('interrupts and clears active turns left by a hard bridge restart', async t => {
+  const interrupted = []
+  const fake = await startFakeAppServer({
+    onMessage(message, connection) {
+      if (message.method === 'turn/interrupt') {
+        interrupted.push(message.params)
+        connection.send({ id: message.id, result: {} })
+      }
+    },
+  })
+  t.after(() => fake.close())
+  const client = await AppServerClient.connect({ socketPath: fake.socketPath, contract: await contract() })
+  t.after(() => client.close())
+  const store = StateStore.open(':memory:')
+  t.after(() => store.close())
+  store.storeUpdate({ updateId: '88', raw: { update_id: 88 }, normalizedType: 'message', nowMs: 1 })
+  store.claimUpdates({ workerId: 'old-worker', nowMs: 2 })
+  store.upsertConversation({ conversationKey: '-100123:7', threadId: 'thread-old', nowMs: 1 })
+  store.beginActiveTurn({
+    conversationKey: '-100123:7',
+    placeholderTurnId: 'turn-old',
+    sourceId: 'telegram:88',
+    nowMs: 2,
+  })
+  const runner = new CodexRunner({ client, stateStore: store, config: config() })
+
+  assert.equal(await runner.recoverInterruptedTurns(), 1)
+  assert.deepEqual(interrupted, [{ threadId: 'thread-old', turnId: 'turn-old' }])
+  assert.equal(store.getConversation('-100123:7').activeTurnId, null)
+  assert.equal(store.getUpdate('88').status, 'failed')
+  assert.match(store.getUpdate('88').lastError, /restart.*outcome unknown/iu)
+  assert.equal(await runner.recoverInterruptedTurns(), 0)
+})
+
+test('persists a starting marker before sending turn/start', async t => {
+  let marker
+  const store = StateStore.open(':memory:')
+  t.after(() => store.close())
+  const fake = await startFakeAppServer({
+    onMessage(message, connection) {
+      if (message.method === 'thread/start') {
+        connection.send({ id: message.id, result: { thread: { id: 'thread-marker' } } })
+      }
+      if (message.method === 'turn/start') {
+        marker = store.listActiveConversations()[0]
+        connection.send({ id: message.id, result: { turn: { id: 'turn-marker', status: 'inProgress', items: [] } } })
+        sendCompletedTurn(connection, {
+          threadId: 'thread-marker',
+          turnId: 'turn-marker',
+          output: JSON.stringify({ action: 'skip', text: '', reason: 'test' }),
+        })
+      }
+    },
+  })
+  t.after(() => fake.close())
+  const client = await AppServerClient.connect({ socketPath: fake.socketPath, contract: await contract() })
+  t.after(() => client.close())
+  const runner = new CodexRunner({ client, stateStore: store, config: config() })
+
+  await runner.runTurn({
+    conversationKey: '42',
+    ownerDm: true,
+    text: 'hello',
+    clientUserMessageId: 'telegram:99',
+  })
+
+  assert.equal(marker.activeTurnId, 'starting:telegram:99')
+  assert.equal(marker.activeSourceId, 'telegram:99')
+})
+
+test('does not replay a source left in the pre-response turn/start window', async t => {
+  const interrupts = []
+  const fake = await startFakeAppServer({
+    onMessage(message, connection) {
+      if (message.method === 'turn/interrupt') {
+        interrupts.push(message.params)
+        connection.send({ id: message.id, result: {} })
+      }
+    },
+  })
+  t.after(() => fake.close())
+  const client = await AppServerClient.connect({ socketPath: fake.socketPath, contract: await contract() })
+  t.after(() => client.close())
+  const store = StateStore.open(':memory:')
+  t.after(() => store.close())
+  store.storeUpdate({ updateId: '100', raw: { update_id: 100 }, normalizedType: 'message', nowMs: 1 })
+  store.claimUpdates({ workerId: 'old-worker', nowMs: 2 })
+  store.upsertConversation({ conversationKey: '42', threadId: 'thread-starting', nowMs: 1 })
+  store.beginActiveTurn({
+    conversationKey: '42',
+    placeholderTurnId: 'starting:telegram:100',
+    sourceId: 'telegram:100',
+    nowMs: 2,
+  })
+  const runner = new CodexRunner({ client, stateStore: store, config: config() })
+
+  assert.equal(await runner.recoverInterruptedTurns(), 1)
+  assert.deepEqual(interrupts, [])
+  assert.equal(store.getUpdate('100').status, 'failed')
+  assert.match(store.getUpdate('100').lastError, /automatic replay disabled/)
+})
+
+test('queues stop during turn/start and interrupts only after the real turn is started', async t => {
+  let releaseStart
+  const allowStartResponse = new Promise(resolve => { releaseStart = resolve })
+  const interrupts = []
+  const fake = await startFakeAppServer({
+    async onMessage(message, connection) {
+      if (message.method === 'thread/start') {
+        connection.send({ id: message.id, result: { thread: { id: 'thread-race' } } })
+      }
+      if (message.method === 'turn/start') {
+        await allowStartResponse
+        connection.send({ id: message.id, result: { turn: { id: 'turn-race', status: 'inProgress', items: [] } } })
+        connection.send({
+          method: 'turn/started',
+          params: { threadId: 'thread-race', turn: { id: 'turn-race', status: 'inProgress', items: [] } },
+        })
+      }
+      if (message.method === 'turn/interrupt') {
+        interrupts.push(message.params)
+        connection.send({ id: message.id, result: {} })
+        connection.send({
+          method: 'turn/completed',
+          params: { threadId: 'thread-race', turn: { id: 'turn-race', status: 'interrupted', items: [] } },
+        })
+      }
+    },
+  })
+  t.after(() => fake.close())
+  const client = await AppServerClient.connect({ socketPath: fake.socketPath, contract: await contract() })
+  t.after(() => client.close())
+  const store = StateStore.open(':memory:')
+  t.after(() => store.close())
+  const runner = new CodexRunner({ client, stateStore: store, config: config() })
+  const running = runner.runTurn({
+    conversationKey: '42',
+    ownerDm: true,
+    text: 'long task',
+    clientUserMessageId: 'telegram:101',
+  })
+  await fake.waitForMessage(message => message.method === 'turn/start')
+
+  assert.equal(store.getConversation('42').activeTurnId, 'starting:telegram:101')
+  assert.equal(await runner.interrupt('42'), true)
+  assert.deepEqual(interrupts, [])
+  releaseStart()
+  await assert.rejects(running, /interrupted/)
+
+  assert.deepEqual(interrupts, [{ threadId: 'thread-race', turnId: 'turn-race' }])
+  assert.equal(store.getConversation('42').activeTurnId, null)
+})
+
+test('queues stop while thread creation is still pending', async t => {
+  let releaseThread
+  const allowThreadResponse = new Promise(resolve => { releaseThread = resolve })
+  const interrupts = []
+  const fake = await startFakeAppServer({
+    async onMessage(message, connection) {
+      if (message.method === 'thread/start') {
+        await allowThreadResponse
+        connection.send({ id: message.id, result: { thread: { id: 'thread-before-marker' } } })
+      }
+      if (message.method === 'turn/start') {
+        connection.send({ id: message.id, result: { turn: { id: 'turn-before-marker', status: 'inProgress', items: [] } } })
+        connection.send({
+          method: 'turn/started',
+          params: {
+            threadId: 'thread-before-marker',
+            turn: { id: 'turn-before-marker', status: 'inProgress', items: [] },
+          },
+        })
+      }
+      if (message.method === 'turn/interrupt') {
+        interrupts.push(message.params)
+        connection.send({ id: message.id, result: {} })
+        connection.send({
+          method: 'turn/completed',
+          params: {
+            threadId: 'thread-before-marker',
+            turn: { id: 'turn-before-marker', status: 'interrupted', items: [] },
+          },
+        })
+      }
+    },
+  })
+  t.after(() => fake.close())
+  const client = await AppServerClient.connect({ socketPath: fake.socketPath, contract: await contract() })
+  t.after(() => client.close())
+  const store = StateStore.open(':memory:')
+  t.after(() => store.close())
+  const runner = new CodexRunner({ client, stateStore: store, config: config() })
+  const running = runner.runTurn({
+    conversationKey: '42',
+    ownerDm: true,
+    text: 'long task',
+    clientUserMessageId: 'telegram:102',
+  })
+  await fake.waitForMessage(message => message.method === 'thread/start')
+
+  assert.equal(store.getConversation('42'), null)
+  assert.equal(await runner.interrupt('42'), true)
+  releaseThread()
+  await assert.rejects(running, /interrupted/)
+
+  assert.deepEqual(interrupts, [{ threadId: 'thread-before-marker', turnId: 'turn-before-marker' }])
 })
 
 test('manual interrupt targets only the requested conversation key', async t => {

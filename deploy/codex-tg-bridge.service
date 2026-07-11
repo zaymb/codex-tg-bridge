@@ -1,0 +1,46 @@
+[Unit]
+Description=Telegram transport bridge for Codex
+Requires=codex-tg-app.service
+After=network-online.target codex-tg-app.service systemd-tmpfiles-setup.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=tgbridge
+Group=tgbridge
+SupplementaryGroups=codex-tg codex-tg-wake
+WorkingDirectory=/opt/tg-engage/bridge
+EnvironmentFile=/etc/codex-tg-bridge/bridge.env
+LoadCredential=telegram-token:/etc/codex-tg-bridge/telegram-token
+Environment=TELEGRAM_TOKEN_FILE=/run/credentials/%n/telegram-token
+Environment=APP_SERVER_SOCKET=/run/codex-tg/app/app.sock
+Environment=BRIDGE_ACTION_SOCKET=/run/codex-tg/action/action.sock
+Environment=BRIDGE_WAKE_SOCKET=/run/codex-tg/wake/wake.sock
+ExecStart=/usr/bin/node /opt/tg-engage/bridge/src/index.mjs
+Restart=on-failure
+RestartPreventExitStatus=78
+RestartSec=5
+TimeoutStopSec=30
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/opt/tg-engage /srv/codex-workspace/exports
+ReadWritePaths=/run/codex-tg/action /run/codex-tg/wake /var/lib/codex-tg-bridge /srv/codex-inbox
+MemoryMax=768M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

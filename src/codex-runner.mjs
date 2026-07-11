@@ -109,8 +109,13 @@ class TurnCollector {
   #items = new Map()
   #completions = new Map()
   #waiters = new Map()
+  #started = new Set()
+  #startWaiters = new Map()
   #onItem
   #onTurn
+  #onStarted
+  #onFailure
+  #failure = null
 
   constructor(client, threadId) {
     this.#client = client
@@ -134,11 +139,39 @@ class TurnCollector {
         this.#completions.set(turnId, value)
       }
     }
+    this.#onStarted = params => {
+      if (params.threadId !== this.#threadId || !params.turn?.id) return
+      const turnId = params.turn.id
+      this.#started.add(turnId)
+      const waiter = this.#startWaiters.get(turnId)
+      if (!waiter) return
+      this.#startWaiters.delete(turnId)
+      clearTimeout(waiter.timer)
+      waiter.resolve()
+    }
+    this.#onFailure = error => {
+      if (this.#failure) return
+      this.#failure = error
+      for (const waiter of this.#waiters.values()) {
+        clearTimeout(waiter.timer)
+        waiter.reject(error)
+      }
+      this.#waiters.clear()
+      for (const waiter of this.#startWaiters.values()) {
+        clearTimeout(waiter.timer)
+        waiter.reject(error)
+      }
+      this.#startWaiters.clear()
+    }
     client.on('notification:item/completed', this.#onItem)
     client.on('notification:turn/completed', this.#onTurn)
+    client.on('notification:turn/started', this.#onStarted)
+    client.on('close', this.#onFailure)
+    client.on('protocolError', this.#onFailure)
   }
 
   wait(turnId, timeoutMs, onTimeout) {
+    if (this.#failure) return Promise.reject(this.#failure)
     if (this.#completions.has(turnId)) {
       const value = this.#completions.get(turnId)
       this.#completions.delete(turnId)
@@ -157,14 +190,35 @@ class TurnCollector {
     })
   }
 
+  waitStarted(turnId, timeoutMs) {
+    if (this.#failure) return Promise.reject(this.#failure)
+    if (this.#started.has(turnId)) return Promise.resolve()
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.#startWaiters.delete(turnId)
+        reject(new Error(`timed out waiting for Codex turn ${turnId} to start`))
+      }, timeoutMs)
+      timer.unref?.()
+      this.#startWaiters.set(turnId, { resolve, reject, timer })
+    })
+  }
+
   dispose(error = new Error('turn collector disposed')) {
     this.#client.off('notification:item/completed', this.#onItem)
     this.#client.off('notification:turn/completed', this.#onTurn)
+    this.#client.off('notification:turn/started', this.#onStarted)
+    this.#client.off('close', this.#onFailure)
+    this.#client.off('protocolError', this.#onFailure)
     for (const waiter of this.#waiters.values()) {
       clearTimeout(waiter.timer)
       waiter.reject(error)
     }
     this.#waiters.clear()
+    for (const waiter of this.#startWaiters.values()) {
+      clearTimeout(waiter.timer)
+      waiter.reject(error)
+    }
+    this.#startWaiters.clear()
   }
 }
 
@@ -172,6 +226,9 @@ export class CodexRunner {
   #client
   #state
   #config
+  #activeTurns = new Map()
+  #startingConversations = new Set()
+  #pendingInterrupts = new Set()
 
   constructor({ client, stateStore, config }) {
     this.#client = client
@@ -227,10 +284,28 @@ export class CodexRunner {
     telegramContext = {},
     clientUserMessageId = null,
   }) {
-    const thread = await this.#getOrCreateThread(conversationKey, ownerDm)
+    this.#startingConversations.add(conversationKey)
+    let thread
+    try {
+      thread = await this.#getOrCreateThread(conversationKey, ownerDm)
+    } catch (error) {
+      this.#startingConversations.delete(conversationKey)
+      this.#pendingInterrupts.delete(conversationKey)
+      throw error
+    }
     const collector = new TurnCollector(this.#client, thread.threadId)
     let turnId = null
+    let activeTurnId = null
     try {
+      const sourceId = clientUserMessageId ?? null
+      const startingTurnId = `starting:${sourceId ?? `${thread.threadId}:${Date.now()}`}`
+      this.#state.beginActiveTurn({
+        conversationKey,
+        placeholderTurnId: startingTurnId,
+        sourceId,
+      })
+      activeTurnId = startingTurnId
+      this.#startingConversations.delete(conversationKey)
       const turnResponse = await this.#client.request('turn/start', compact({
         threadId: thread.threadId,
         input: buildInput(text, attachments),
@@ -255,7 +330,21 @@ export class CodexRunner {
         outputSchema: OUTPUT_SCHEMA,
       }))
       turnId = turnResponse.turn.id
-      this.#state.setActiveTurn({ conversationKey, turnId })
+      if (!this.#state.replaceActiveTurn({
+        conversationKey,
+        expectedTurnId: activeTurnId,
+        turnId,
+      })) throw new Error(`failed to persist active Codex turn ${turnId}`)
+      activeTurnId = turnId
+      const active = {
+        conversationKey,
+        threadId: thread.threadId,
+        turnId,
+        collector,
+        interruptPromise: null,
+      }
+      this.#activeTurns.set(conversationKey, active)
+      if (this.#pendingInterrupts.delete(conversationKey)) await this.#interruptActive(active)
 
       const completion = await collector.wait(
         turnId,
@@ -279,20 +368,89 @@ export class CodexRunner {
         contextBreak: thread.contextBreak,
         replacedThreadId: thread.replacedThreadId,
       }
+    } catch (error) {
+      const definitivelyRejected = turnId === null
+        && error instanceof AppServerRpcError
+        && error.code !== 'TIMEOUT'
+      if (activeTurnId && !definitivelyRejected) error.turnAccepted = true
+      throw error
     } finally {
-      if (turnId) this.#state.clearActiveTurn({ conversationKey, turnId })
+      this.#startingConversations.delete(conversationKey)
+      const active = this.#activeTurns.get(conversationKey)
+      if (active?.turnId === turnId) this.#activeTurns.delete(conversationKey)
+      this.#pendingInterrupts.delete(conversationKey)
+      if (activeTurnId) this.#state.clearActiveTurn({ conversationKey, turnId: activeTurnId })
       collector.dispose()
     }
   }
 
   async interrupt(conversationKey) {
+    const active = this.#activeTurns.get(conversationKey)
+    if (active) {
+      await this.#interruptActive(active)
+      return true
+    }
+    if (this.#startingConversations.has(conversationKey)) {
+      this.#pendingInterrupts.add(conversationKey)
+      return true
+    }
     const conversation = this.#state.getConversation(conversationKey)
     if (!conversation?.threadId || !conversation.activeTurnId) return false
+    if (conversation.activeTurnId.startsWith('starting:')) {
+      this.#pendingInterrupts.add(conversationKey)
+      return true
+    }
     await this.#client.request('turn/interrupt', {
       threadId: conversation.threadId,
       turnId: conversation.activeTurnId,
     })
     this.#state.clearActiveTurn({ conversationKey, turnId: conversation.activeTurnId })
     return true
+  }
+
+  #interruptActive(active) {
+    if (!active.interruptPromise) {
+      active.interruptPromise = (async () => {
+        await active.collector.waitStarted(active.turnId, Math.min(this.#config.turnTimeoutMs, 30_000))
+        await this.#client.request('turn/interrupt', {
+          threadId: active.threadId,
+          turnId: active.turnId,
+        })
+        this.#state.clearActiveTurn({
+          conversationKey: active.conversationKey,
+          turnId: active.turnId,
+        })
+      })()
+    }
+    return active.interruptPromise
+  }
+
+  async recoverInterruptedTurns() {
+    let recovered = 0
+    for (const conversation of this.#state.listActiveConversations()) {
+      if (!conversation.activeTurnId.startsWith('starting:')) {
+        try {
+          await this.#client.request('turn/interrupt', {
+            threadId: conversation.threadId,
+            turnId: conversation.activeTurnId,
+          })
+        } catch (error) {
+          const alreadyInactive = error instanceof AppServerRpcError
+            && /(turn|thread).{0,50}(missing|not found|not active|already (?:completed|stopped|interrupted))/iu.test(error.message)
+          if (!alreadyInactive) throw error
+        }
+      }
+      if (conversation.activeSourceId) {
+        this.#state.failUncertainSource(
+          conversation.activeSourceId,
+          'bridge restart interrupted an accepted Codex turn; outcome unknown and automatic replay disabled',
+        )
+      }
+      if (this.#state.clearActiveTurn({
+        conversationKey: conversation.conversationKey,
+        turnId: conversation.activeTurnId,
+      })) recovered += 1
+    }
+    return recovered
   }
 }

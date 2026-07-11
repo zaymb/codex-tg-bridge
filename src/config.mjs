@@ -62,7 +62,7 @@ function parsePathList(value, name) {
   return result
 }
 
-function parseAliases(value, approvedIds) {
+function parseAliases(value, allowedChatIds, allowedChannelIds) {
   if (!value) return new Map()
   let parsed
   try {
@@ -77,8 +77,15 @@ function parseAliases(value, approvedIds) {
   const aliases = new Map()
   for (const [alias, target] of Object.entries(parsed)) {
     if (!ALIAS.test(alias)) throw new Error(`invalid Telegram chat alias: ${alias}`)
-    parseId(target, `alias ${alias}`)
-    if (!approvedIds.has(target)) {
+    if (alias === 'owner') throw new Error('Telegram chat alias owner is reserved')
+    if (typeof target !== 'string') throw new Error(`alias ${alias} must target a conversation key string`)
+    const match = target.match(/^(-?\d+)(?::(\d+))?$/u)
+    if (!match) throw new Error(`alias ${alias} must target a Telegram conversation key`)
+    const [, chatId, threadId] = match
+    const approved = threadId
+      ? allowedChatIds.has(chatId)
+      : allowedChatIds.has(chatId) || allowedChannelIds.has(chatId)
+    if (!approved) {
       throw new Error(`alias ${alias} targets an unapproved chat`)
     }
     aliases.set(alias, target)
@@ -121,13 +128,12 @@ export function loadConfig(env = process.env) {
   const ownerUserId = parseId(env.TELEGRAM_OWNER_USER_ID, 'TELEGRAM_OWNER_USER_ID', true)
   const allowedChatIds = parseIdSet(env.TELEGRAM_ALLOWED_CHAT_IDS, 'TELEGRAM_ALLOWED_CHAT_IDS')
   const allowedChannelIds = parseIdSet(env.TELEGRAM_ALLOWED_CHANNEL_IDS, 'TELEGRAM_ALLOWED_CHANNEL_IDS')
-  const approvedIds = new Set([...allowedChatIds, ...allowedChannelIds])
 
   const config = {
     ownerUserId,
     allowedChatIds,
     allowedChannelIds,
-    chatAliases: parseAliases(env.TELEGRAM_CHAT_ALIASES, approvedIds),
+    chatAliases: parseAliases(env.TELEGRAM_CHAT_ALIASES, allowedChatIds, allowedChannelIds),
     tokenFile: token.tokenFile,
     appServerSocket: requireAbsolutePath(env.APP_SERVER_SOCKET, 'APP_SERVER_SOCKET'),
     actionSocket: requireAbsolutePath(env.BRIDGE_ACTION_SOCKET, 'BRIDGE_ACTION_SOCKET'),

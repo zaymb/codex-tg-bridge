@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 
 const SUPPORTED_METHODS = new Set([
   'item/commandExecution/requestApproval',
@@ -58,6 +58,7 @@ export class ApprovalRouter {
   #tokenFactory
   #pending = new Map()
   #boundRequest = null
+  #connectionId = randomUUID()
 
   constructor({
     appServerClient,
@@ -123,7 +124,7 @@ export class ApprovalRouter {
     const responseOnDeny = responseFor(request.method, params, false)
     this.#state.createApproval({
       tokenHash,
-      requestId: String(request.id),
+      requestId: `${this.#connectionId}:${request.id}`,
       method: request.method,
       conversationKey: conversation.conversationKey,
       threadId: params.threadId,

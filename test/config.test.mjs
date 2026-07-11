@@ -49,6 +49,16 @@ test('loads production config without rounding Telegram IDs', async () => {
   assert.equal(config.effort, 'high')
 })
 
+test('accepts a forum-topic alias when its base group is approved', async () => {
+  const tokenPath = await tokenFixture()
+  const env = validEnv(tokenPath)
+  env.TELEGRAM_CHAT_ALIASES = '{"sandbox-topic":"-1001234567890123456:77"}'
+
+  const config = loadConfig(env)
+
+  assert.equal(config.chatAliases.get('sandbox-topic'), '-1001234567890123456:77')
+})
+
 test('reads and trims the token only through a non-enumerable function', async () => {
   const tokenPath = await tokenFixture()
   const config = loadConfig(validEnv(tokenPath))
@@ -87,6 +97,10 @@ test('rejects malformed Telegram IDs and aliases to unknown chats', async () => 
   const unknownAlias = validEnv(tokenPath)
   unknownAlias.TELEGRAM_CHAT_ALIASES = '{"unknown":"-1000000000000000000"}'
   assert.throws(() => loadConfig(unknownAlias), /alias unknown targets an unapproved chat/)
+
+  const reservedAlias = validEnv(tokenPath)
+  reservedAlias.TELEGRAM_CHAT_ALIASES = '{"owner":"-1001234567890123456"}'
+  assert.throws(() => loadConfig(reservedAlias), /alias owner is reserved/)
 })
 
 test('requires every filesystem path to be absolute', async () => {
