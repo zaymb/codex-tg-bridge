@@ -21,7 +21,7 @@ function rawMessage(updateId, { text = 'hello' } = {}) {
 function policy() {
   return new EngagementPolicy({
     ownerUserId: '42',
-    allowedChatIds: new Set(),
+    allowedChatIds: new Set(['-100123']),
     allowedChannelIds: new Set(),
   }, { botUserId: '500', botUsername: 'bridge_bot' })
 }
@@ -69,9 +69,71 @@ test('queues an approved Telegram update as a durable 24-hour relay job', async 
       updateType: 'message',
       chatId: '42',
       conversationKey: '42',
+      threadId: null,
       messageId: '10',
       senderId: '42',
       senderIsBot: false,
+      senderUsername: null,
+      senderDisplayName: 'Owner',
+      replyTo: null,
+    },
+  })
+})
+
+test('includes the replied-to message and actor identity in the relay job', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  const raw = rawMessage(7, { text: 'yes, that one' })
+  raw.message.from.username = 'owner'
+  raw.message.message_thread_id = 9
+  raw.message.chat = { id: -100123, type: 'supergroup', title: 'Sandbox', is_forum: true }
+  raw.message.reply_to_message = {
+    message_id: 63,
+    date: 1,
+    chat: raw.message.chat,
+    from: {
+      id: 500,
+      is_bot: true,
+      username: 'bridge_bot',
+      first_name: 'Elio',
+    },
+    text: 'which option?',
+  }
+  setup.state.storeUpdate({
+    updateId: '7',
+    raw,
+    normalizedType: 'message',
+    nowMs: 1_000,
+  })
+  const [row] = setup.state.claimUpdates({
+    workerId: 'relay-test',
+    limit: 1,
+    leaseMs: 10_000,
+    nowMs: 1_000,
+  })
+
+  assert.deepEqual(await setup.dispatcher.processClaimedUpdate(row), {
+    status: 'completed',
+    action: 'queued',
+  })
+  assert.deepEqual(setup.state.getRelayJob('telegram:7').payload.telegramContext, {
+    updateId: '7',
+    updateType: 'message',
+    chatId: '-100123',
+    conversationKey: '-100123:9',
+    threadId: '9',
+    messageId: '70',
+    senderId: '42',
+    senderIsBot: false,
+    senderUsername: 'owner',
+    senderDisplayName: 'Owner',
+    replyTo: {
+      messageId: '63',
+      senderId: '500',
+      senderIsBot: true,
+      senderUsername: 'bridge_bot',
+      senderDisplayName: 'Elio',
+      text: 'which option?',
     },
   })
 })

@@ -17,6 +17,7 @@ export async function main(env = process.env, input = process.stdin, output = pr
     writeFrame,
     leaseMs: config.sessionLeaseMs,
     jobLeaseMs: config.jobLeaseMs,
+    frameMaxBytes: config.frameMaxBytes,
   })
   const lines = createInterface({ input, crlfDelay: Infinity })
   let chain = Promise.resolve()

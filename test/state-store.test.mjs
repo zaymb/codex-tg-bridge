@@ -671,6 +671,103 @@ test('relay jobs expire silently before acceptance and complete only the accepte
   assert.equal(store.getRelayJob('telegram:complete').result.text, 'done')
 })
 
+test('claims, accepts, and finalizes one conversation batch atomically', async t => {
+  const { store } = await openStore()
+  t.after(() => store.close())
+  for (const [id, conversationKey, nowMs] of [
+    ['1', 'group-a', 100],
+    ['2', 'group-a', 110],
+    ['3', 'group-b', 120],
+  ]) {
+    store.enqueueRelayJob({
+      jobId: `telegram:${id}`,
+      sourceType: 'telegram',
+      sourceId: id,
+      conversationKey,
+      sessionLabel: 'tg-engage',
+      payload: { text: `message ${id}` },
+      expiresAtMs: 10_000,
+      nowMs,
+    })
+  }
+
+  const batch = store.claimRelayJobBatch({
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-a',
+    maxBatchBytes: 100_000,
+    nowMs: 200,
+  })
+  assert.deepEqual(batch.map(job => job.jobId), ['telegram:1', 'telegram:2'])
+  assert.equal(store.getRelayJob('telegram:3').status, 'pending')
+  assert.equal(store.acceptRelayJobBatch({
+    jobIds: batch.map(job => job.jobId),
+    connectorId: 'connector-a',
+    codexSessionId: 'session-a',
+    threadId: 'thread-a',
+    turnId: 'turn-a',
+    nowMs: 210,
+  }), true)
+  assert.equal(store.acceptRelayJobBatch({
+    jobIds: ['telegram:1', 'telegram:3'],
+    connectorId: 'connector-a',
+    codexSessionId: 'session-a',
+    threadId: 'thread-a',
+    turnId: 'wrong-turn',
+    nowMs: 220,
+  }), false)
+
+  assert.equal(store.finalizeRelayJobBatch({
+    jobIds: batch.map(job => job.jobId),
+    turnId: 'turn-a',
+    result: { action: 'reply', text: 'one answer' },
+    outboundActions: [{
+      actionId: 'batch-answer',
+      conversationKey: 'group-a',
+      actionType: 'reply',
+      payload: { chatId: 'group-a', messageId: '2', text: 'one answer' },
+    }],
+    nowMs: 230,
+  }), true)
+  assert.equal(store.getRelayJob('telegram:1').status, 'completed')
+  assert.equal(store.getRelayJob('telegram:2').status, 'completed')
+  assert.equal(store.getOutboundAction('batch-answer').status, 'pending')
+})
+
+test('releases every unaccepted job in a deferred batch without crossing conversations', async t => {
+  const { store } = await openStore()
+  t.after(() => store.close())
+  for (const id of ['1', '2']) {
+    store.enqueueRelayJob({
+      jobId: `telegram:${id}`,
+      sourceType: 'telegram',
+      sourceId: id,
+      conversationKey: 'group-a',
+      sessionLabel: 'tg-engage',
+      payload: { text: `message ${id}` },
+      expiresAtMs: 10_000,
+      nowMs: 100 + Number(id),
+    })
+  }
+  const batch = store.claimRelayJobBatch({
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-a',
+    maxBatchBytes: 100_000,
+    nowMs: 200,
+  })
+
+  assert.equal(store.releaseRelayJobBatch({
+    jobIds: batch.map(job => job.jobId),
+    connectorId: 'wrong-connector',
+    nowMs: 210,
+  }), false)
+  assert.equal(store.releaseRelayJobBatch({
+    jobIds: batch.map(job => job.jobId),
+    connectorId: 'connector-a',
+    nowMs: 220,
+  }), true)
+  assert.deepEqual(batch.map(job => store.getRelayJob(job.jobId).status), ['pending', 'pending'])
+})
+
 test('relay session leases reject a second connector and scope offline notices by epoch', async t => {
   const { store } = await openStore()
   t.after(() => store.close())

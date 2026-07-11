@@ -1050,6 +1050,63 @@ export class StateStore {
     return transaction()
   }
 
+  claimRelayJobBatch({
+    sessionLabel,
+    connectorId,
+    maxBatchBytes,
+    leaseMs = 120_000,
+    nowMs = Date.now(),
+  }) {
+    if (!sessionLabel || !connectorId) throw new Error('relay sessionLabel and connectorId are required')
+    if (!Number.isSafeInteger(maxBatchBytes) || maxBatchBytes <= 0) {
+      throw new Error('relay maxBatchBytes must be a positive integer')
+    }
+    const transaction = this.#db.transaction(() => {
+      this.expireRelayJobs(nowMs)
+      this.#db.prepare(`
+        UPDATE relay_jobs
+        SET status = 'pending', lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?
+        WHERE status = 'leased' AND lease_expires_at_ms <= ? AND expires_at_ms > ?
+      `).run(nowMs, nowMs, nowMs)
+      const oldest = this.#db.prepare(`
+        SELECT conversation_key FROM relay_jobs
+        WHERE session_label = ? AND status = 'pending' AND expires_at_ms > ?
+        ORDER BY created_at_ms, job_id LIMIT 1
+      `).get(String(sessionLabel), nowMs)
+      if (!oldest) return []
+
+      const candidates = this.#db.prepare(`
+        SELECT * FROM relay_jobs
+        WHERE session_label = ? AND conversation_key = ?
+          AND status = 'pending' AND expires_at_ms > ?
+        ORDER BY created_at_ms, job_id
+      `).all(String(sessionLabel), oldest.conversation_key, nowMs).map(mapRelayJob)
+      const selected = []
+      let usedBytes = 2
+      for (const job of candidates) {
+        const jobBytes = Buffer.byteLength(JSON.stringify(job)) + (selected.length === 0 ? 0 : 1)
+        if (usedBytes + jobBytes > maxBatchBytes) break
+        selected.push(job)
+        usedBytes += jobBytes
+      }
+      if (selected.length === 0) throw new Error('oldest relay job exceeds the frame byte limit')
+
+      const claim = this.#db.prepare(`
+        UPDATE relay_jobs
+        SET status = 'leased', attempts = attempts + 1, lease_owner = ?,
+            lease_expires_at_ms = ?, updated_at_ms = ?
+        WHERE job_id = ? AND status = 'pending' AND expires_at_ms > ?
+      `)
+      for (const job of selected) {
+        if (claim.run(connectorId, nowMs + leaseMs, nowMs, job.jobId, nowMs).changes !== 1) {
+          throw new Error(`failed to claim relay batch job ${job.jobId}`)
+        }
+      }
+      return selected.map(job => this.getRelayJob(job.jobId))
+    })
+    return transaction()
+  }
+
   acceptRelayJob({
     jobId,
     connectorId,
@@ -1074,6 +1131,44 @@ export class StateStore {
     ).changes === 1
   }
 
+  acceptRelayJobBatch({
+    jobIds,
+    connectorId,
+    codexSessionId,
+    threadId,
+    turnId,
+    nowMs = Date.now(),
+  }) {
+    if (!Array.isArray(jobIds) || jobIds.length === 0 || new Set(jobIds).size !== jobIds.length) {
+      throw new Error('accepted relay batch requires unique job IDs')
+    }
+    if (!codexSessionId || !threadId || !turnId) throw new Error('accepted relay batch requires Codex identifiers')
+    const transaction = this.#db.transaction(() => {
+      const accept = this.#db.prepare(`
+        UPDATE relay_jobs
+        SET status = 'accepted', codex_session_id = ?, thread_id = ?, turn_id = ?,
+            lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?
+        WHERE job_id = ? AND status = 'leased' AND lease_owner = ?
+      `)
+      for (const jobId of jobIds) {
+        if (accept.run(
+          String(codexSessionId),
+          String(threadId),
+          String(turnId),
+          nowMs,
+          String(jobId),
+          String(connectorId),
+        ).changes !== 1) throw new Error('relay batch could not be accepted atomically')
+      }
+      return true
+    })
+    try {
+      return transaction()
+    } catch {
+      return false
+    }
+  }
+
   releaseRelayJob({ jobId, connectorId, nowMs = Date.now() }) {
     const transaction = this.#db.transaction(() => {
       const released = this.#db.prepare(`
@@ -1085,6 +1180,31 @@ export class StateStore {
       return released
     })
     return transaction()
+  }
+
+  releaseRelayJobBatch({ jobIds, connectorId, nowMs = Date.now() }) {
+    if (!Array.isArray(jobIds) || jobIds.length === 0 || new Set(jobIds).size !== jobIds.length) {
+      throw new Error('released relay batch requires unique job IDs')
+    }
+    const transaction = this.#db.transaction(() => {
+      const release = this.#db.prepare(`
+        UPDATE relay_jobs
+        SET status = CASE WHEN expires_at_ms <= ? THEN 'expired' ELSE 'pending' END,
+            lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?
+        WHERE job_id = ? AND status = 'leased' AND lease_owner = ?
+      `)
+      for (const jobId of jobIds) {
+        if (release.run(nowMs, nowMs, String(jobId), String(connectorId)).changes !== 1) {
+          throw new Error('relay batch could not be released atomically')
+        }
+      }
+      return true
+    })
+    try {
+      return transaction()
+    } catch {
+      return false
+    }
   }
 
   completeRelayJob({ jobId, turnId, result, nowMs = Date.now() }) {
@@ -1104,6 +1224,26 @@ export class StateStore {
     return transaction()
   }
 
+  finalizeRelayJobBatch({ jobIds, turnId, result, outboundActions = [], nowMs = Date.now() }) {
+    if (!Array.isArray(jobIds) || jobIds.length === 0 || new Set(jobIds).size !== jobIds.length) {
+      throw new Error('finalized relay batch requires unique job IDs')
+    }
+    const transaction = this.#db.transaction(() => {
+      for (const jobId of jobIds) {
+        if (!this.completeRelayJob({ jobId, turnId, result, nowMs })) {
+          throw new Error('relay batch could not be finalized atomically')
+        }
+      }
+      for (const action of outboundActions) this.createOutboundAction({ ...action, nowMs })
+      return true
+    })
+    try {
+      return transaction()
+    } catch {
+      return false
+    }
+  }
+
   failRelayJob({ jobId, error, connectorId = null, turnId = null, nowMs = Date.now() }) {
     const leased = connectorId === null ? 0 : this.#db.prepare(`
       UPDATE relay_jobs
@@ -1118,6 +1258,25 @@ export class StateStore {
       SET status = 'failed', last_error = ?, updated_at_ms = ?
       WHERE job_id = ? AND status = 'accepted' AND turn_id = ?
     `).run(String(error), nowMs, String(jobId), String(turnId)).changes === 1
+  }
+
+  failRelayJobBatch({ jobIds, error, connectorId = null, turnId = null, nowMs = Date.now() }) {
+    if (!Array.isArray(jobIds) || jobIds.length === 0 || new Set(jobIds).size !== jobIds.length) {
+      throw new Error('failed relay batch requires unique job IDs')
+    }
+    const transaction = this.#db.transaction(() => {
+      for (const jobId of jobIds) {
+        if (!this.failRelayJob({ jobId, error, connectorId, turnId, nowMs })) {
+          throw new Error('relay batch could not be failed atomically')
+        }
+      }
+      return true
+    })
+    try {
+      return transaction()
+    } catch {
+      return false
+    }
   }
 
   ensureRelaySession(sessionLabel, nowMs = Date.now()) {

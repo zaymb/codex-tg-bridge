@@ -27,6 +27,19 @@ function messageIdForReply(update) {
   return update.message?.id ?? update.reaction?.messageId ?? null
 }
 
+function replyContext(update) {
+  const reply = update.message?.replyTo
+  if (!reply) return null
+  return {
+    messageId: reply.messageId,
+    senderId: reply.actor?.id ?? null,
+    senderIsBot: reply.actor?.isBot ?? false,
+    senderUsername: reply.actor?.username ?? null,
+    senderDisplayName: reply.actor?.displayName ?? null,
+    text: reply.text ?? reply.caption ?? null,
+  }
+}
+
 export class RelayDispatcher {
   #state
   #policy
@@ -147,9 +160,13 @@ export class RelayDispatcher {
             updateType: update.type,
             chatId: update.chat.id,
             conversationKey: update.conversationKey,
+            threadId: topicId(update),
             messageId: messageIdForReply(update),
             senderId: update.actor?.id ?? null,
             senderIsBot: update.actor?.isBot ?? false,
+            senderUsername: update.actor?.username ?? null,
+            senderDisplayName: update.actor?.displayName ?? null,
+            replyTo: replyContext(update),
           },
         },
         expiresAtMs,

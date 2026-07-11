@@ -7,15 +7,20 @@ function requireText(value, name) {
   return value
 }
 
-function outboundActions(job, result, nowMs) {
+function batchIdFor(jobs) {
+  return `batch:${jobs[0].jobId}:${jobs.at(-1).jobId}`
+}
+
+function outboundActions(batchId, jobs, result, nowMs) {
   if (result.action === 'skip') return []
   if (result.action !== 'reply' || typeof result.text !== 'string' || !result.text.trim()) {
     throw new Error('job result must be a non-empty reply or skip')
   }
-  const context = job.payload?.telegramContext
-  if (!context?.chatId || !context?.conversationKey) throw new Error('relay job is missing Telegram reply context')
+  const latest = jobs.at(-1)
+  const context = latest.payload?.telegramContext
+  if (!context?.chatId || !context?.conversationKey) throw new Error('relay batch is missing Telegram reply context')
   const chunks = splitTelegramText(result.text)
-  const group = `relay-result:${job.jobId}`
+  const group = `relay-batch:${batchId}`
   return chunks.map((text, index) => {
     const first = index === 0 && context.messageId
     return {
@@ -42,9 +47,10 @@ export class RelayProtocolSession {
   #clock
   #leaseMs
   #jobLeaseMs
+  #frameMaxBytes
   #connectorId = null
   #codexSessionId = null
-  #inflightJobId = null
+  #inflightBatch = null
   #acceptingJobs = false
   #closed = false
 
@@ -55,6 +61,7 @@ export class RelayProtocolSession {
     clock = Date.now,
     leaseMs = 20_000,
     jobLeaseMs = 120_000,
+    frameMaxBytes = 262_144,
   }) {
     this.#state = stateStore
     this.#sessionLabel = sessionLabel
@@ -62,6 +69,7 @@ export class RelayProtocolSession {
     this.#clock = clock
     this.#leaseMs = leaseMs
     this.#jobLeaseMs = jobLeaseMs
+    this.#frameMaxBytes = frameMaxBytes
   }
 
   get ready() {
@@ -69,7 +77,11 @@ export class RelayProtocolSession {
   }
 
   #write(frame) {
-    this.#writeFrame({ version: RELAY_PROTOCOL_VERSION, ...frame })
+    const versioned = { version: RELAY_PROTOCOL_VERSION, ...frame }
+    if (Buffer.byteLength(JSON.stringify(versioned)) > this.#frameMaxBytes) {
+      throw new Error('relay frame exceeds maximum size')
+    }
+    this.#writeFrame(versioned)
   }
 
   async handleFrame(frame) {
@@ -115,86 +127,108 @@ export class RelayProtocolSession {
   }
 
   async claimOnce() {
-    if (!this.ready || !this.#acceptingJobs || this.#inflightJobId) return false
-    const [job] = this.#state.claimRelayJobs({
+    if (!this.ready || !this.#acceptingJobs || this.#inflightBatch) return false
+    const jobs = this.#state.claimRelayJobBatch({
       sessionLabel: this.#sessionLabel,
       connectorId: this.#connectorId,
-      limit: 1,
+      maxBatchBytes: this.#frameMaxBytes,
       leaseMs: this.#jobLeaseMs,
       nowMs: this.#clock(),
     })
-    if (!job) return false
-    this.#inflightJobId = job.jobId
+    if (jobs.length === 0) return false
+    const batch = { batchId: batchIdFor(jobs), jobs }
+    const frame = { type: 'job_batch', batch }
+    if (Buffer.byteLength(JSON.stringify({ version: RELAY_PROTOCOL_VERSION, ...frame })) > this.#frameMaxBytes) {
+      this.#state.releaseRelayJobBatch({
+        jobIds: jobs.map(job => job.jobId),
+        connectorId: this.#connectorId,
+        nowMs: this.#clock(),
+      })
+      throw new Error('relay batch exceeds maximum frame size')
+    }
+    this.#inflightBatch = batch
     this.#acceptingJobs = false
-    this.#write({ type: 'job', job })
+    this.#write(frame)
     return true
   }
 
   #requireInflight(frame) {
-    const jobId = requireText(frame.jobId, 'jobId')
-    if (jobId !== this.#inflightJobId) throw new Error('relay frame does not match the inflight job')
-    const job = this.#state.getRelayJob(jobId)
-    if (!job) throw new Error('relay job no longer exists')
-    return job
+    const batchId = requireText(frame.batchId, 'batchId')
+    if (batchId !== this.#inflightBatch?.batchId) throw new Error('relay frame does not match the inflight batch')
+    return this.#inflightBatch
   }
 
   #handleAccepted(frame) {
-    this.#requireInflight(frame)
+    const batch = this.#requireInflight(frame)
     const threadId = requireText(frame.threadId, 'threadId')
     const turnId = requireText(frame.turnId, 'turnId')
-    if (!this.#state.acceptRelayJob({
-      jobId: frame.jobId,
+    if (!this.#state.acceptRelayJobBatch({
+      jobIds: batch.jobs.map(job => job.jobId),
       connectorId: this.#connectorId,
       codexSessionId: this.#codexSessionId,
       threadId,
       turnId,
       nowMs: this.#clock(),
-    })) throw new Error('relay job could not be accepted')
+    })) throw new Error('relay batch could not be accepted')
   }
 
   #handleDeferred(frame) {
-    this.#requireInflight(frame)
+    const batch = this.#requireInflight(frame)
     requireText(frame.reason, 'reason')
-    if (!this.#state.releaseRelayJob({
-      jobId: frame.jobId,
+    if (!this.#state.releaseRelayJobBatch({
+      jobIds: batch.jobs.map(job => job.jobId),
       connectorId: this.#connectorId,
       nowMs: this.#clock(),
-    })) throw new Error('relay job could not be deferred')
-    this.#inflightJobId = null
-    this.#write({ type: 'job_recorded', jobId: frame.jobId })
+    })) throw new Error('relay batch could not be deferred')
+    this.#inflightBatch = null
+    this.#write({
+      type: 'job_recorded',
+      batchId: batch.batchId,
+      jobIds: batch.jobs.map(job => job.jobId),
+    })
   }
 
   #handleResult(frame) {
-    const job = this.#requireInflight(frame)
+    const batch = this.#requireInflight(frame)
     const turnId = requireText(frame.turnId, 'turnId')
-    if (job.status !== 'accepted' || job.turnId !== turnId) {
+    const jobs = batch.jobs.map(job => this.#state.getRelayJob(job.jobId))
+    if (jobs.some(job => job?.status !== 'accepted' || job.turnId !== turnId)) {
       throw new Error('relay result does not match the accepted turn')
     }
-    const actions = outboundActions(job, frame.result ?? {}, this.#clock())
-    if (!this.#state.finalizeRelayJob({
-      jobId: job.jobId,
+    const actions = outboundActions(batch.batchId, jobs, frame.result ?? {}, this.#clock())
+    if (!this.#state.finalizeRelayJobBatch({
+      jobIds: jobs.map(job => job.jobId),
       turnId,
       result: frame.result,
       outboundActions: actions,
       nowMs: this.#clock(),
     })) throw new Error('relay result could not be recorded')
-    this.#inflightJobId = null
-    this.#write({ type: 'job_recorded', jobId: job.jobId })
+    this.#inflightBatch = null
+    this.#write({
+      type: 'job_recorded',
+      batchId: batch.batchId,
+      jobIds: jobs.map(job => job.jobId),
+    })
   }
 
   #handleFailed(frame) {
-    const job = this.#requireInflight(frame)
+    const batch = this.#requireInflight(frame)
     const error = requireText(frame.error, 'error')
-    const failed = this.#state.failRelayJob({
-      jobId: job.jobId,
+    const jobs = batch.jobs.map(job => this.#state.getRelayJob(job.jobId))
+    const accepted = jobs.every(job => job?.status === 'accepted')
+    if (!this.#state.failRelayJobBatch({
+      jobIds: jobs.map(job => job.jobId),
       error,
-      connectorId: job.status === 'leased' ? this.#connectorId : null,
-      turnId: job.status === 'accepted' ? frame.turnId : null,
+      connectorId: accepted ? null : this.#connectorId,
+      turnId: accepted ? frame.turnId : null,
       nowMs: this.#clock(),
+    })) throw new Error('relay failure does not match the active batch')
+    this.#inflightBatch = null
+    this.#write({
+      type: 'job_recorded',
+      batchId: batch.batchId,
+      jobIds: jobs.map(job => job.jobId),
     })
-    if (!failed) throw new Error('relay failure does not match the active job')
-    this.#inflightJobId = null
-    this.#write({ type: 'job_recorded', jobId: job.jobId })
   }
 
   async close() {

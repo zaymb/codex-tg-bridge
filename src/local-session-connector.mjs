@@ -22,6 +22,40 @@ function finalText(turn, collectedItems) {
   return (finals.length > 0 ? finals : messages).at(-1)?.text ?? ''
 }
 
+function normalizeInbound(frame) {
+  if (frame.type === 'job_batch') {
+    const batch = frame.batch
+    if (!batch?.batchId || !Array.isArray(batch.jobs) || batch.jobs.length === 0) {
+      throw new Error('relay job_batch is malformed')
+    }
+    return { mode: 'batch', batchId: batch.batchId, jobs: batch.jobs }
+  }
+  if (frame.type === 'job' && frame.job?.jobId) {
+    return { mode: 'legacy', batchId: frame.job.jobId, jobs: [frame.job] }
+  }
+  return null
+}
+
+function batchInput(jobs) {
+  if (jobs.length === 1) {
+    return [{ type: 'text', text: jobs[0].payload?.text || '[Telegram event with no text content]' }]
+  }
+  const lines = [
+    `[Telegram inbound batch: ${jobs.length} messages received while the previous turn was busy]`,
+    'Read them in order and respond once to the batch as a whole.',
+  ]
+  jobs.forEach((job, index) => {
+    const context = job.payload?.telegramContext ?? {}
+    const sender = context.senderDisplayName || context.senderUsername || context.senderId || 'unknown sender'
+    const replyTarget = context.replyTo?.senderDisplayName
+      || context.replyTo?.senderUsername
+      || context.replyTo?.senderId
+    const replyNote = replyTarget ? ` (replying to ${replyTarget})` : ''
+    lines.push(`${index + 1}. ${sender}${replyNote}: ${job.payload?.text || '[no text]'}`)
+  })
+  return [{ type: 'text', text: lines.join('\n') }]
+}
+
 export class LocalSessionConnector extends EventEmitter {
   #app
   #relay
@@ -77,6 +111,20 @@ export class LocalSessionConnector extends EventEmitter {
     this.#listeners.push(() => emitter.off(event, listener))
   }
 
+  #replaceActiveTurns(thread) {
+    this.#activeTurns = new Set((thread?.turns ?? [])
+      .filter(turn => turn?.id && isActiveStatus(turn.status))
+      .map(turn => turn.id))
+  }
+
+  async #reconcileAvailability() {
+    if (this.#currentJob) return
+    const resumed = await this.#app.request('thread/resume', { threadId: this.#threadId })
+    if (resumed?.thread?.id !== this.#threadId) throw new Error('Codex app-server resumed a different thread')
+    this.#replaceActiveTurns(resumed.thread)
+    this.#send({ type: 'heartbeat', acceptingJobs: this.#available() })
+  }
+
   async start() {
     if (this.#started) return
     const onTurnStarted = params => this.#schedule(() => this.#handleTurnStarted(params))
@@ -90,9 +138,7 @@ export class LocalSessionConnector extends EventEmitter {
 
     const resumed = await this.#app.request('thread/resume', { threadId: this.#threadId })
     if (resumed?.thread?.id !== this.#threadId) throw new Error('Codex app-server resumed a different thread')
-    for (const turn of resumed.thread.turns ?? []) {
-      if (turn?.id && isActiveStatus(turn.status)) this.#activeTurns.add(turn.id)
-    }
+    this.#replaceActiveTurns(resumed.thread)
     await this.#relay.connect({
       version: RELAY_PROTOCOL_VERSION,
       type: 'hello',
@@ -102,7 +148,9 @@ export class LocalSessionConnector extends EventEmitter {
       acceptingJobs: this.#available(),
     })
     this.#heartbeatTimer = setInterval(() => {
-      if (!this.#closed) this.#send({ type: 'heartbeat', acceptingJobs: this.#available() })
+      if (this.#closed) return
+      this.#send({ type: 'heartbeat', acceptingJobs: this.#available() })
+      if (!this.#currentJob) this.#schedule(() => this.#reconcileAvailability())
     }, this.#heartbeatIntervalMs)
     this.#heartbeatTimer.unref?.()
     this.#started = true
@@ -121,6 +169,13 @@ export class LocalSessionConnector extends EventEmitter {
     this.#items.set(params.turnId, items)
   }
 
+  #resultFrame(type, fields = {}) {
+    if (this.#currentJob.mode === 'legacy') {
+      return { type, jobId: this.#currentJob.jobs[0].jobId, ...fields }
+    }
+    return { type, batchId: this.#currentJob.batchId, ...fields }
+  }
+
   #handleTurnCompleted(params) {
     if (params.threadId !== this.#threadId || !params.turn?.id) return
     const turn = params.turn
@@ -130,22 +185,18 @@ export class LocalSessionConnector extends EventEmitter {
 
     if (this.#currentJob?.turnId === turn.id) {
       if (turn.status !== 'completed') {
-        this.#send({
-          type: 'job_failed',
-          jobId: this.#currentJob.job.jobId,
+        this.#send(this.#resultFrame('job_failed', {
           turnId: turn.id,
           error: turn.error?.message ?? `Codex turn ended with status ${turn.status}`,
-        })
+        }))
       } else {
         const output = parseTelegramStructuredOutput(finalText(turn, items))
-        this.#send({
-          type: 'job_result',
-          jobId: this.#currentJob.job.jobId,
+        this.#send(this.#resultFrame('job_result', {
           turnId: turn.id,
           result: output.skipped
             ? { action: 'skip', reason: output.reason }
             : { action: 'reply', text: output.finalText, reason: output.reason },
-        })
+        }))
       }
       this.#currentJob.awaitingRecord = true
       return
@@ -153,31 +204,51 @@ export class LocalSessionConnector extends EventEmitter {
     this.#send({ type: 'heartbeat', acceptingJobs: this.#available() })
   }
 
+  #recordedMatches(frame) {
+    if (!this.#currentJob) return false
+    return this.#currentJob.mode === 'legacy'
+      ? frame.jobId === this.#currentJob.jobs[0].jobId
+      : frame.batchId === this.#currentJob.batchId
+  }
+
   async #handleRelayFrame(frame) {
     if (!frame || frame.version !== RELAY_PROTOCOL_VERSION) throw new Error('unsupported relay protocol version')
     if (frame.type === 'heartbeat' || frame.type === 'ready') return
     if (frame.type === 'error') throw new Error(`VPS relay error: ${frame.message}`)
     if (frame.type === 'job_recorded') {
-      if (this.#currentJob?.job.jobId !== frame.jobId) return
+      if (!this.#recordedMatches(frame)) return
       this.#currentJob = null
       this.#send({ type: 'heartbeat', acceptingJobs: this.#available() })
       return
     }
-    if (frame.type !== 'job') throw new Error(`unsupported relay frame type: ${frame.type}`)
+
+    const inbound = normalizeInbound(frame)
+    if (!inbound) throw new Error(`unsupported relay frame type: ${frame.type}`)
     if (this.#currentJob || !this.#available()) {
-      this.#send({ type: 'job_deferred', jobId: frame.job.jobId, reason: 'target thread is active' })
+      const deferred = inbound.mode === 'legacy'
+        ? { type: 'job_deferred', jobId: inbound.jobs[0].jobId, reason: 'target thread is active' }
+        : { type: 'job_deferred', batchId: inbound.batchId, reason: 'target thread is active' }
+      this.#send(deferred)
       return
     }
 
-    this.#currentJob = { job: frame.job, turnId: null, awaitingRecord: false }
+    this.#currentJob = { ...inbound, turnId: null, awaitingRecord: false }
     this.#send({ type: 'heartbeat', acceptingJobs: false })
     try {
+      const telegramMessages = inbound.jobs.map(job => job.payload?.telegramContext ?? {})
       const response = await this.#app.request('turn/start', {
         threadId: this.#threadId,
-        input: [{ type: 'text', text: frame.job.payload?.text || '[Telegram event with no text content]' }],
-        clientUserMessageId: frame.job.jobId,
+        input: batchInput(inbound.jobs),
+        clientUserMessageId: inbound.mode === 'legacy' ? inbound.jobs[0].jobId : inbound.batchId,
         additionalContext: {
-          telegram: { kind: 'untrusted', value: JSON.stringify(frame.job.payload?.telegramContext ?? {}) },
+          telegram: {
+            kind: 'untrusted',
+            value: JSON.stringify({
+              batchId: inbound.batchId,
+              messageCount: inbound.jobs.length,
+              messages: telegramMessages,
+            }),
+          },
           telegram_output_contract: { kind: 'application', value: TELEGRAM_OUTPUT_INSTRUCTIONS },
         },
         outputSchema: TELEGRAM_OUTPUT_SCHEMA,
@@ -186,18 +257,14 @@ export class LocalSessionConnector extends EventEmitter {
       if (!turnId) throw new Error('Codex turn/start returned no turn ID')
       this.#currentJob.turnId = turnId
       this.#activeTurns.add(turnId)
-      this.#send({
-        type: 'job_accepted',
-        jobId: frame.job.jobId,
+      this.#send(this.#resultFrame('job_accepted', {
         threadId: this.#threadId,
         turnId,
-      })
+      }))
     } catch (error) {
-      if (isActiveTurnError(error)) {
-        this.#send({ type: 'job_deferred', jobId: frame.job.jobId, reason: error.message })
-      } else {
-        this.#send({ type: 'job_failed', jobId: frame.job.jobId, error: error.message })
-      }
+      const type = isActiveTurnError(error) ? 'job_deferred' : 'job_failed'
+      const field = type === 'job_deferred' ? { reason: error.message } : { error: error.message }
+      this.#send(this.#resultFrame(type, field))
       this.#currentJob.awaitingRecord = true
     }
   }
