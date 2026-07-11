@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { loadConfig } from '../src/config.mjs'
+import { loadConfig, loadTransportConfig } from '../src/config.mjs'
 
 async function tokenFixture(mode = 0o600, content = '123456:secret-token\n') {
   const dir = await mkdtemp(join(tmpdir(), 'tg-bridge-config-'))
@@ -120,4 +120,34 @@ test('validates bounded numeric settings', async () => {
   env.BRIDGE_MAX_CONCURRENT_TURNS = '3'
   env.BRIDGE_POLL_TIMEOUT_SEC = '51'
   assert.throws(() => loadConfig(env), /BRIDGE_POLL_TIMEOUT_SEC must be between 1 and 50/)
+})
+
+test('loads the transport-only config without Codex app-server settings', async () => {
+  const tokenPath = await tokenFixture()
+  const env = validEnv(tokenPath)
+  env.BRIDGE_SESSION_LABEL = 'tg-engage'
+  delete env.APP_SERVER_SOCKET
+  delete env.BRIDGE_ACTION_SOCKET
+  delete env.BRIDGE_WAKE_SOCKET
+  delete env.CODEX_WORKDIR
+  delete env.CODEX_WRITABLE_ROOTS
+  delete env.CODEX_CONTRACT_PATH
+
+  const config = loadTransportConfig(env)
+
+  assert.equal(config.sessionLabel, 'tg-engage')
+  assert.equal(config.dbPath, '/var/lib/codex-tg-bridge/bridge.sqlite3')
+  assert.equal(config.pollTimeoutSec, 50)
+  assert.equal(config.updateLeaseMs, 120_000)
+  assert.equal(config.readTelegramToken(), '123456:secret-token')
+  assert.equal(Object.keys(config).includes('readTelegramToken'), false)
+})
+
+test('requires a normalized transport session label', async () => {
+  const tokenPath = await tokenFixture()
+  const env = validEnv(tokenPath)
+
+  assert.throws(() => loadTransportConfig(env), /BRIDGE_SESSION_LABEL/)
+  env.BRIDGE_SESSION_LABEL = 'contains spaces'
+  assert.throws(() => loadTransportConfig(env), /BRIDGE_SESSION_LABEL/)
 })

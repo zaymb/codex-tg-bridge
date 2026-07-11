@@ -1074,12 +1074,34 @@ export class StateStore {
     ).changes === 1
   }
 
+  releaseRelayJob({ jobId, connectorId, nowMs = Date.now() }) {
+    const transaction = this.#db.transaction(() => {
+      const released = this.#db.prepare(`
+        UPDATE relay_jobs
+        SET status = CASE WHEN expires_at_ms <= ? THEN 'expired' ELSE 'pending' END,
+            lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?
+        WHERE job_id = ? AND status = 'leased' AND lease_owner = ?
+      `).run(nowMs, nowMs, String(jobId), String(connectorId)).changes === 1
+      return released
+    })
+    return transaction()
+  }
+
   completeRelayJob({ jobId, turnId, result, nowMs = Date.now() }) {
     return this.#db.prepare(`
       UPDATE relay_jobs
       SET status = 'completed', result_json = ?, updated_at_ms = ?
       WHERE job_id = ? AND status = 'accepted' AND turn_id = ?
     `).run(stringify(result), nowMs, String(jobId), String(turnId)).changes === 1
+  }
+
+  finalizeRelayJob({ jobId, turnId, result, outboundActions = [], nowMs = Date.now() }) {
+    const transaction = this.#db.transaction(() => {
+      if (!this.completeRelayJob({ jobId, turnId, result, nowMs })) return false
+      for (const action of outboundActions) this.createOutboundAction({ ...action, nowMs })
+      return true
+    })
+    return transaction()
   }
 
   failRelayJob({ jobId, error, connectorId = null, turnId = null, nowMs = Date.now() }) {

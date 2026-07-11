@@ -1,6 +1,6 @@
 import { AppServerRpcError } from './app-server-client.mjs'
 
-const OUTPUT_SCHEMA = Object.freeze({
+export const TELEGRAM_OUTPUT_SCHEMA = Object.freeze({
   type: 'object',
   additionalProperties: false,
   required: ['action', 'text', 'reason'],
@@ -11,7 +11,7 @@ const OUTPUT_SCHEMA = Object.freeze({
   },
 })
 
-const OUTPUT_INSTRUCTIONS = [
+export const TELEGRAM_OUTPUT_INSTRUCTIONS = [
   'Return only the structured result required by outputSchema.',
   'Use action=send and put the complete Telegram-ready final answer in text.',
   'Use action=skip only when no Telegram response should be sent, with a concise reason.',
@@ -88,7 +88,7 @@ function extractFinal(items) {
   return authoritative?.text ?? ''
 }
 
-function parseStructuredOutput(text) {
+export function parseTelegramStructuredOutput(text) {
   try {
     const parsed = JSON.parse(text)
     if (parsed?.action === 'skip') {
@@ -325,9 +325,9 @@ export class CodexRunner {
           : { type: 'readOnly', networkAccess: false },
         additionalContext: {
           telegram: { kind: 'untrusted', value: JSON.stringify(telegramContext) },
-          telegram_output_contract: { kind: 'application', value: OUTPUT_INSTRUCTIONS },
+          telegram_output_contract: { kind: 'application', value: TELEGRAM_OUTPUT_INSTRUCTIONS },
         },
-        outputSchema: OUTPUT_SCHEMA,
+        outputSchema: TELEGRAM_OUTPUT_SCHEMA,
       }))
       turnId = turnResponse.turn.id
       if (!this.#state.replaceActiveTurn({
@@ -356,7 +356,7 @@ export class CodexRunner {
         const message = completion.turn.error?.message ?? 'turn did not complete successfully'
         throw new CodexTurnFailedError(thread.threadId, turnId, message, completion.turn.status)
       }
-      const output = parseStructuredOutput(extractFinal(items))
+      const output = parseTelegramStructuredOutput(extractFinal(items))
       const actionIds = [...findActionIds(items.filter(item => item?.type === 'mcpToolCall' && item.server === 'telegram'))]
       return {
         threadId: thread.threadId,

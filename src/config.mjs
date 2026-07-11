@@ -123,6 +123,32 @@ function createTokenReader(env) {
   return { tokenFile: null, read: () => token }
 }
 
+function attachTokenReader(config, read) {
+  Object.defineProperty(config, 'readTelegramToken', {
+    enumerable: false,
+    configurable: false,
+    writable: false,
+    value: read,
+  })
+  return config
+}
+
+function parseSessionLabel(value) {
+  const label = value?.trim()
+  if (!label || !ALIAS.test(label)) {
+    throw new Error('BRIDGE_SESSION_LABEL must contain only letters, numbers, underscores, or hyphens')
+  }
+  return label
+}
+
+function requireSimpleValue(value, name) {
+  const result = value?.trim()
+  if (!result || !/^[A-Za-z0-9._:@-]+$/u.test(result)) {
+    throw new Error(`${name} contains unsupported characters`)
+  }
+  return result
+}
+
 export function loadConfig(env = process.env) {
   const token = createTokenReader(env)
   const ownerUserId = parseId(env.TELEGRAM_OWNER_USER_ID, 'TELEGRAM_OWNER_USER_ID', true)
@@ -154,11 +180,56 @@ export function loadConfig(env = process.env) {
     logLevel: env.BRIDGE_LOG_LEVEL?.trim() || 'info',
   }
 
-  Object.defineProperty(config, 'readTelegramToken', {
-    enumerable: false,
-    configurable: false,
-    writable: false,
-    value: token.read,
-  })
-  return config
+  return attachTokenReader(config, token.read)
+}
+
+export function loadTransportConfig(env = process.env) {
+  const token = createTokenReader(env)
+  const ownerUserId = parseId(env.TELEGRAM_OWNER_USER_ID, 'TELEGRAM_OWNER_USER_ID', true)
+  const allowedChatIds = parseIdSet(env.TELEGRAM_ALLOWED_CHAT_IDS, 'TELEGRAM_ALLOWED_CHAT_IDS')
+  const allowedChannelIds = parseIdSet(env.TELEGRAM_ALLOWED_CHANNEL_IDS, 'TELEGRAM_ALLOWED_CHANNEL_IDS')
+  const config = {
+    ownerUserId,
+    allowedChatIds,
+    allowedChannelIds,
+    chatAliases: parseAliases(env.TELEGRAM_CHAT_ALIASES, allowedChatIds, allowedChannelIds),
+    tokenFile: token.tokenFile,
+    sessionLabel: parseSessionLabel(env.BRIDGE_SESSION_LABEL),
+    dbPath: requireAbsolutePath(env.BRIDGE_DB_PATH, 'BRIDGE_DB_PATH'),
+    pollTimeoutSec: parseInteger(env, 'BRIDGE_POLL_TIMEOUT_SEC', 50, 1, 50),
+    updateLeaseMs: parseInteger(env, 'BRIDGE_UPDATE_LEASE_MS', 120_000, 1_000, 3_600_000),
+    logLevel: env.BRIDGE_LOG_LEVEL?.trim() || 'info',
+  }
+  return attachTokenReader(config, token.read)
+}
+
+export function loadRelayConfig(env = process.env) {
+  return {
+    sessionLabel: parseSessionLabel(env.BRIDGE_SESSION_LABEL),
+    dbPath: requireAbsolutePath(env.BRIDGE_DB_PATH, 'BRIDGE_DB_PATH'),
+    frameMaxBytes: parseInteger(env, 'BRIDGE_RELAY_FRAME_MAX_BYTES', 262_144, 1_024, 1_048_576),
+    claimIntervalMs: parseInteger(env, 'BRIDGE_RELAY_CLAIM_INTERVAL_MS', 250, 50, 10_000),
+    sessionLeaseMs: parseInteger(env, 'BRIDGE_RELAY_SESSION_LEASE_MS', 20_000, 5_000, 120_000),
+    jobLeaseMs: parseInteger(env, 'BRIDGE_RELAY_JOB_LEASE_MS', 120_000, 10_000, 900_000),
+  }
+}
+
+export function loadLocalConnectorConfig(env = process.env) {
+  return {
+    sessionLabel: parseSessionLabel(env.BRIDGE_SESSION_LABEL),
+    codexSessionId: requireSimpleValue(env.CODEX_SESSION_ID, 'CODEX_SESSION_ID'),
+    threadId: requireSimpleValue(env.CODEX_THREAD_ID ?? env.CODEX_SESSION_ID, 'CODEX_THREAD_ID'),
+    appServerSocket: requireAbsolutePath(env.APP_SERVER_SOCKET, 'APP_SERVER_SOCKET'),
+    contractPath: requireAbsolutePath(env.CODEX_CONTRACT_PATH, 'CODEX_CONTRACT_PATH'),
+    sshPath: requireAbsolutePath(env.BRIDGE_SSH_PATH ?? '/usr/bin/ssh', 'BRIDGE_SSH_PATH'),
+    sshHost: requireSimpleValue(env.BRIDGE_RELAY_HOST, 'BRIDGE_RELAY_HOST'),
+    sshUser: requireSimpleValue(env.BRIDGE_RELAY_SSH_USER, 'BRIDGE_RELAY_SSH_USER'),
+    sshIdentityFile: requireAbsolutePath(env.BRIDGE_RELAY_IDENTITY_FILE, 'BRIDGE_RELAY_IDENTITY_FILE'),
+    remoteServiceUser: requireSimpleValue(env.BRIDGE_RELAY_SERVICE_USER ?? 'tgbridge', 'BRIDGE_RELAY_SERVICE_USER'),
+    remoteNodePath: requireAbsolutePath(env.BRIDGE_RELAY_NODE_PATH ?? '/usr/local/bin/node', 'BRIDGE_RELAY_NODE_PATH'),
+    remoteScriptPath: requireAbsolutePath(env.BRIDGE_RELAY_SCRIPT_PATH ?? '/opt/tg-engage/bridge/src/relay-stdio.mjs', 'BRIDGE_RELAY_SCRIPT_PATH'),
+    remoteDbPath: requireAbsolutePath(env.BRIDGE_RELAY_DB_PATH ?? '/var/lib/codex-tg-bridge/bridge.sqlite3', 'BRIDGE_RELAY_DB_PATH'),
+    frameMaxBytes: parseInteger(env, 'BRIDGE_RELAY_FRAME_MAX_BYTES', 262_144, 1_024, 1_048_576),
+    heartbeatIntervalMs: parseInteger(env, 'BRIDGE_RELAY_HEARTBEAT_INTERVAL_MS', 5_000, 1_000, 30_000),
+  }
 }
