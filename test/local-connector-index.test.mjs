@@ -12,7 +12,7 @@ test('builds a non-interactive SSH relay command without Telegram credentials', 
     remoteDbPath: '/var/lib/codex-tg-bridge/bridge.sqlite3',
     sessionLabel: 'tg-engage',
     remoteNodePath: '/usr/local/bin/node',
-    remoteScriptPath: '/opt/tg-engage/bridge/src/relay-stdio.mjs',
+    remoteScriptPath: '/opt/codex-tg-bridge/src/relay-stdio.mjs',
   })
 
   assert.deepEqual(args.slice(0, 2), ['-T', '-i'])

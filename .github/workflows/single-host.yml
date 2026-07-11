@@ -1,0 +1,21 @@
+name: Single-host staging
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  stage-user-release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate installer shell
+        run: |
+          bash -n deploy/stage-user-release.sh
+          shellcheck deploy/stage-user-release.sh
+      - name: Stage isolated Node and tested release
+        run: bash deploy/stage-user-release.sh

@@ -12,8 +12,8 @@ SupplementaryGroups=codex-tg
 WorkingDirectory=/srv/codex-workspace
 Environment=HOME=/var/lib/codexbot
 Environment=CODEX_HOME=/var/lib/codexbot/.codex
-ExecStart=/usr/local/bin/codex app-server --listen unix:///run/codex-tg/app/app.sock -c 'mcp_servers.telegram.command="/usr/local/bin/node"' -c 'mcp_servers.telegram.args=["/opt/tg-engage/bridge/src/mcp-server.mjs"]' -c 'mcp_servers.telegram.env={BRIDGE_ACTION_SOCKET="/run/codex-tg/action/action.sock"}'
-ExecStartPost=/opt/tg-engage/bridge/deploy/prepare-app-socket.sh /run/codex-tg/app/app.sock codex-tg
+ExecStart=/usr/local/bin/codex app-server --listen unix:///run/codex-tg/app/app.sock -c 'mcp_servers.telegram.command="/usr/local/bin/node"' -c 'mcp_servers.telegram.args=["/opt/codex-tg-bridge/src/mcp-server.mjs"]' -c 'mcp_servers.telegram.env={BRIDGE_ACTION_SOCKET="/run/codex-tg/action/action.sock"}'
+ExecStartPost=/opt/codex-tg-bridge/deploy/prepare-app-socket.sh /run/codex-tg/app/app.sock codex-tg
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=30

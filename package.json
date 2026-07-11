@@ -1,5 +1,5 @@
 {
-  "name": "@tg-engage/codex-telegram-bridge",
+  "name": "codex-tg-bridge",
   "version": "0.1.0",
   "private": true,
   "type": "module",

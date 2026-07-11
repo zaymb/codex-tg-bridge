@@ -14,7 +14,7 @@ test('runs a token-holding transport service without a VPS Codex dependency', as
   assert.match(bridge, /^User=tgbridge$/m)
   assert.match(bridge, /^LoadCredential=telegram-token:/m)
   assert.match(bridge, /^Environment=TELEGRAM_TOKEN_FILE=\/run\/credentials\/%n\/telegram-token$/m)
-  assert.match(bridge, /^ExecStart=\/usr\/local\/bin\/node \/opt\/tg-engage\/bridge\/src\/transport-index\.mjs$/m)
+  assert.match(bridge, /^ExecStart=\/usr\/local\/bin\/node \/opt\/codex-tg-bridge\/src\/transport-index\.mjs$/m)
   assert.doesNotMatch(bridge, /codex-tg-app|APP_SERVER_SOCKET|CODEX_HOME/)
 })
 
@@ -24,7 +24,7 @@ test('hardens the transport while keeping only its durable state writable', asyn
   assert.match(bridge, /^ProtectSystem=strict$/m)
   assert.match(bridge, /^PrivateTmp=true$/m)
   assert.match(bridge, /^NoNewPrivileges=true$/m)
-  assert.match(bridge, /^ReadOnlyPaths=\/opt\/tg-engage$/m)
+  assert.match(bridge, /^ReadOnlyPaths=\/opt\/codex-tg-bridge$/m)
   assert.match(bridge, /^ReadWritePaths=\/var\/lib\/codex-tg-bridge$/m)
 })
 

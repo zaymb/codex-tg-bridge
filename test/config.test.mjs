@@ -29,7 +29,7 @@ function validEnv(tokenPath) {
     BRIDGE_EXPORT_ROOTS: '/srv/codex-workspace/exports,/srv/codex-workspace/out',
     CODEX_WORKDIR: '/srv/codex-workspace',
     CODEX_WRITABLE_ROOTS: '/srv/codex-workspace',
-    CODEX_CONTRACT_PATH: '/opt/tg-engage/bridge/fixtures/contract.json',
+    CODEX_CONTRACT_PATH: '/opt/codex-tg-bridge/fixtures/contract.json',
   }
 }
 
@@ -167,7 +167,7 @@ test('loads explicit no-prompt permissions for the local Telegram connector', ()
     BRIDGE_SESSION_LABEL: 'tg-engage',
     CODEX_SESSION_ID: 'session-a',
     APP_SERVER_SOCKET: '/tmp/app.sock',
-    CODEX_CONTRACT_PATH: '/opt/tg-engage/contract.json',
+    CODEX_CONTRACT_PATH: '/opt/codex-tg-bridge/contract.json',
     BRIDGE_RELAY_HOST: 'relay.example',
     BRIDGE_RELAY_SSH_USER: 'ubuntu',
     BRIDGE_RELAY_IDENTITY_FILE: '/home/alta/.ssh/id_ed25519',

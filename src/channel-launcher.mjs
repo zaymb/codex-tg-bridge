@@ -85,7 +85,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
         BRIDGE_RELAY_SCRIPT_PATH: local.relayScriptPath
           ?? (local.relayMode === 'local'
             ? join(bridgeRoot, 'src', 'relay-stdio.mjs')
-            : '/opt/tg-engage/bridge/src/relay-stdio.mjs'),
+            : '/opt/codex-tg-bridge/src/relay-stdio.mjs'),
         BRIDGE_RELAY_DB_PATH: local.relayDbPath ?? '/var/lib/codex-tg-bridge/bridge.sqlite3',
         CODEX_APPROVAL_POLICY: local.approvalPolicy ?? 'on-request',
         CODEX_SANDBOX_MODE: local.sandboxMode ?? 'workspace-write',

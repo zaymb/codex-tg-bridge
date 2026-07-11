@@ -271,7 +271,7 @@ export function loadLocalConnectorConfig(env = process.env) {
     sshIdentityFile: requireAbsolutePath(env.BRIDGE_RELAY_IDENTITY_FILE, 'BRIDGE_RELAY_IDENTITY_FILE'),
     remoteServiceUser: requireSimpleValue(env.BRIDGE_RELAY_SERVICE_USER ?? 'tgbridge', 'BRIDGE_RELAY_SERVICE_USER'),
     remoteNodePath: requireAbsolutePath(env.BRIDGE_RELAY_NODE_PATH ?? '/usr/local/bin/node', 'BRIDGE_RELAY_NODE_PATH'),
-    remoteScriptPath: requireAbsolutePath(env.BRIDGE_RELAY_SCRIPT_PATH ?? '/opt/tg-engage/bridge/src/relay-stdio.mjs', 'BRIDGE_RELAY_SCRIPT_PATH'),
+    remoteScriptPath: requireAbsolutePath(env.BRIDGE_RELAY_SCRIPT_PATH ?? '/opt/codex-tg-bridge/src/relay-stdio.mjs', 'BRIDGE_RELAY_SCRIPT_PATH'),
     remoteDbPath: requireAbsolutePath(env.BRIDGE_RELAY_DB_PATH ?? '/var/lib/codex-tg-bridge/bridge.sqlite3', 'BRIDGE_RELAY_DB_PATH'),
   }
 }

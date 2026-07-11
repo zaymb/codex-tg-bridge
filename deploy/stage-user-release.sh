@@ -26,7 +26,7 @@ for command in curl sha256sum tar git; do
 done
 
 source_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-repo_root=$(cd "${source_root}/.." && pwd)
+repo_root=${source_root}
 release_id=${BRIDGE_RELEASE_ID:-$(git -C "${repo_root}" rev-parse --verify --short=12 HEAD)}
 if [[ ! ${release_id} =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
   printf 'BRIDGE_RELEASE_ID contains unsupported characters\n' >&2

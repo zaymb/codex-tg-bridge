@@ -1,18 +1,18 @@
 # Codex Telegram Channel
 
-Telegram is a transport into an already-open local Codex session. The Virginia
-VPS does not run Codex.
+Telegram is a transport into an existing Codex session. The bridge supports
+both split-host and same-host deployments.
 
 ## Runtime boundaries
 
-- VPS `tgbridge`: bot token, long polling, SQLite queue, 24-hour expiry, and
+- Transport service: bot token, long polling, SQLite queue, 24-hour expiry, and
   reliable Telegram sends.
-- Mac launcher: one Codex app-server shared by the interactive TUI and the
+- Session launcher: one Codex app-server shared by the interactive TUI and the
   Telegram connector.
 - The launcher supervises the connector, writes `.state/channel-status.json`,
   and reconnects with bounded exponential backoff while the TUI stays open.
-- SSH stdio: an outbound-only Mac connection. No listener is opened on the Mac
-  or exposed publicly on the VPS.
+- Split-host mode uses outbound-only SSH stdio. Same-host mode starts the relay
+  process directly without opening a listener.
 - App-server, connector, and SSH relay processes are detached from the TUI's
   controlling terminal. Only the Codex TUI inherits terminal stdio.
 - A Telegram job is claimed only while the target Codex thread is idle. Local
@@ -59,7 +59,7 @@ token only in `/etc/codex-tg-bridge/telegram-token`, mode `0600`, owned by
 `root`.
 
 ```bash
-sudo bridge/deploy/install.sh
+sudo deploy/install.sh
 sudo systemctl enable --now codex-tg-bridge.service
 ```
 
@@ -73,7 +73,7 @@ ssh -T relay-host \
   'sudo -n -u tgbridge env \
     BRIDGE_DB_PATH=/var/lib/codex-tg-bridge/bridge.sqlite3 \
     BRIDGE_SESSION_LABEL=tg-engage \
-    /usr/local/bin/node /opt/tg-engage/bridge/src/relay-stdio.mjs'
+    /usr/local/bin/node /opt/codex-tg-bridge/src/relay-stdio.mjs'
 ```
 
 Then send a protocol `hello` frame with `acceptingJobs=false` and confirm a
@@ -82,7 +82,7 @@ Then send a protocol `hello` frame with `acceptingJobs=false` and confirm a
 ## Local channel
 
 Local machine settings live in the ignored file
-`bridge/.state/local-channel.json`. It contains infrastructure paths and SSH
+`.state/local-channel.json`. It contains infrastructure paths and SSH
 coordinates, never the Telegram token.
 
 Start or resume a Codex session through the channel launcher:
@@ -110,9 +110,9 @@ Before changing an existing user service, stage an isolated Node 24 runtime and
 a separate tested release:
 
 ```bash
-git clone https://github.com/zaymb/tg-engage.git
-cd tg-engage
-bash bridge/deploy/stage-user-release.sh
+git clone https://github.com/zaymb/codex-tg-bridge.git
+cd codex-tg-bridge
+bash deploy/stage-user-release.sh
 ```
 
 The staging script downloads a pinned archive from `nodejs.org`, verifies it
