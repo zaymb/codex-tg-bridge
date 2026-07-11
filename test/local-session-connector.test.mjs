@@ -128,8 +128,8 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
   assert.equal(started.params.clientUserMessageId, 'batch:telegram:1:telegram:2')
   assert.equal(started.params.input.length, 1)
   assert.match(started.params.input[0].text, /^\[TG BATCH:/)
-  assert.match(started.params.input[0].text, /1\. \[TG\]\[message_id=10\] Alta: first message/)
-  assert.match(started.params.input[0].text, /2\. \[TG\]\[message_id=11\] laurie_bot \(replying to Alta\): second message/)
+  assert.match(started.params.input[0].text, /1\. \[TG\]\[conversation_key=42\]\[message_id=10\] Alta: first message/)
+  assert.match(started.params.input[0].text, /2\. \[TG\]\[conversation_key=42\]\[message_id=11\] laurie_bot \(replying to Alta\): second message/)
   assert.ok(started.params.input[0].text.indexOf('first message') < started.params.input[0].text.indexOf('second message'))
   assert.equal('cwd' in started.params, false)
   assert.equal(started.params.approvalPolicy, 'never')
@@ -311,7 +311,7 @@ test('accepts a legacy single-job frame during rolling deployment', async t => {
   const started = setup.app.calls.find(call => call.method === 'turn/start')
   assert.deepEqual(started.params.input, [{
     type: 'text',
-    text: '[TG][message_id=9][sender=unknown sender]\nlegacy Telegram message',
+    text: '[TG][conversation_key=42][message_id=9][sender=unknown sender]\nlegacy Telegram message',
   }])
   assert.deepEqual(setup.relay.frames.at(-1), {
     version: 1,

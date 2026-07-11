@@ -20,7 +20,7 @@ function fixture() {
   return { state, frames, session, setNow(value) { now = value } }
 }
 
-function enqueue(state, updateId = '1', conversationKey = '42', nowMs = 1_000) {
+function enqueue(state, updateId = '1', conversationKey = '42', nowMs = 1_000, contextOverrides = {}) {
   state.enqueueRelayJob({
     jobId: `telegram:${updateId}`,
     sourceType: 'telegram',
@@ -33,6 +33,7 @@ function enqueue(state, updateId = '1', conversationKey = '42', nowMs = 1_000) {
         chatId: conversationKey,
         conversationKey,
         messageId: String(Number(updateId) * 10),
+        ...contextOverrides,
       },
     },
     expiresAtMs: nowMs + 86_400_000,
@@ -151,6 +152,75 @@ test('records selective targeted responses to messages from the same batch', asy
   assert.equal(second.actionType, 'reply')
   assert.equal(second.payload.messageId, '20')
   assert.equal(second.payload.text, 'second targeted answer')
+})
+
+test('routes identical message IDs independently across a DM, group, and forum topic', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  enqueue(setup.state, '1', '42', 1_000, { chatId: '42', messageId: '7' })
+  enqueue(setup.state, '2', '-1001', 1_001, { chatId: '-1001', messageId: '7' })
+  enqueue(setup.state, '3', '-1001:9', 1_002, { chatId: '-1001', threadId: '9', messageId: '7' })
+  await hello(setup)
+
+  const expected = [
+    { chatId: '42', threadId: null },
+    { chatId: '-1001', threadId: null },
+    { chatId: '-1001', threadId: '9' },
+  ]
+  for (let index = 0; index < expected.length; index += 1) {
+    assert.equal(await setup.session.claimOnce(), true)
+    const { batchId } = setup.frames.at(-1).batch
+    const turnId = `turn-${index}`
+    await setup.session.handleFrame({
+      version: 1,
+      type: 'job_accepted',
+      batchId,
+      threadId: 'thread-a',
+      turnId,
+    })
+    await setup.session.handleFrame({
+      version: 1,
+      type: 'job_result',
+      batchId,
+      turnId,
+      result: { action: 'reply', text: '', responses: [{ messageId: '7', text: `answer-${index}` }] },
+    })
+    const outbound = setup.state.getOutboundAction(`relay-batch:${batchId}:0000`)
+    assert.equal(outbound.payload.chatId, expected[index].chatId)
+    assert.equal(outbound.payload.threadId, expected[index].threadId)
+    assert.equal(outbound.payload.messageId, '7')
+    if (index < expected.length - 1) {
+      await setup.session.handleFrame({ version: 1, type: 'heartbeat', acceptingJobs: true })
+    }
+  }
+})
+
+test('rejects reply context that disagrees with the durable conversation key', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  enqueue(setup.state, '1', '42', 1_000, {
+    chatId: '-1001',
+    conversationKey: '-1001',
+    messageId: '7',
+  })
+  await hello(setup)
+  await setup.session.claimOnce()
+  const { batchId } = setup.frames.at(-1).batch
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_accepted',
+    batchId,
+    threadId: 'thread-a',
+    turnId: 'turn-a',
+  })
+
+  await assert.rejects(setup.session.handleFrame({
+    version: 1,
+    type: 'job_result',
+    batchId,
+    turnId: 'turn-a',
+    result: { action: 'reply', text: 'must not cross chats' },
+  }), /does not match its conversation/)
 })
 
 test('rejects targeted responses outside the current batch and duplicate targets', async t => {

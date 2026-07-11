@@ -20,6 +20,18 @@ function outboundActions(batchId, jobs, result, nowMs) {
   if (contexts.some(context => !context?.chatId || !context?.conversationKey)) {
     throw new Error('relay batch is missing Telegram reply context')
   }
+  const jobConversationKeys = new Set(jobs.map(job => job.conversationKey))
+  if (jobConversationKeys.size !== 1) throw new Error('relay batch crosses Telegram conversations')
+  for (let index = 0; index < jobs.length; index += 1) {
+    const job = jobs[index]
+    const context = contexts[index]
+    const expectedKey = context.threadId === null || context.threadId === undefined
+      ? String(context.chatId)
+      : `${context.chatId}:${context.threadId}`
+    if (context.conversationKey !== job.conversationKey || expectedKey !== job.conversationKey) {
+      throw new Error('relay job Telegram reply context does not match its conversation')
+    }
+  }
   const byMessageId = new Map(contexts
     .filter(context => context.messageId)
     .map(context => [String(context.messageId), context]))

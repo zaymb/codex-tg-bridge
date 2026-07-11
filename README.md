@@ -19,8 +19,12 @@ VPS does not run Codex.
   TUI turns take priority.
 - One queued batch can produce one compatibility reply or multiple targeted
   replies to selected messages from that batch.
-- Every injected Telegram message is prefixed with `[TG]`; an unmarked user
-  turn came from the terminal or another local Codex client.
+- Every injected Telegram message is prefixed with `[TG]` and its automatic
+  `conversation_key`; an unmarked user turn came from the terminal or another
+  local Codex client.
+- Telegram windows are isolated by `conversation_key`: a DM or group uses its
+  `chatId`, while a forum topic uses `chatId:threadId`. Batches never cross that
+  boundary, and outbound routing is resolved from the durable inbound context.
 - Replies are bound to the channel that started the turn. If a local TUI steer
   joins a Telegram-owned turn, the connector fails closed and does not send the
   mixed final answer to Telegram.

@@ -40,15 +40,20 @@ function senderLabel(context) {
   return context.senderDisplayName || context.senderUsername || context.senderId || 'unknown sender'
 }
 
+function conversationLabel(context) {
+  return context.conversationKey || context.chatId || 'unknown'
+}
+
 function messageLine(job) {
   const context = job.payload?.telegramContext ?? {}
   const sender = senderLabel(context)
+  const conversation = conversationLabel(context)
   const replyTarget = context.replyTo?.senderDisplayName
     || context.replyTo?.senderUsername
     || context.replyTo?.senderId
   const replyNote = replyTarget ? ` (replying to ${replyTarget})` : ''
   const messageId = context.messageId ?? 'unknown'
-  return `[TG][message_id=${messageId}][sender=${sender}]${replyNote}\n${job.payload?.text || '[no text]'}`
+  return `[TG][conversation_key=${conversation}][message_id=${messageId}][sender=${sender}]${replyNote}\n${job.payload?.text || '[no text]'}`
 }
 
 function batchInput(jobs) {
@@ -62,12 +67,13 @@ function batchInput(jobs) {
   jobs.forEach((job, index) => {
     const context = job.payload?.telegramContext ?? {}
     const sender = senderLabel(context)
+    const conversation = conversationLabel(context)
     const replyTarget = context.replyTo?.senderDisplayName
       || context.replyTo?.senderUsername
       || context.replyTo?.senderId
     const replyNote = replyTarget ? ` (replying to ${replyTarget})` : ''
     const messageId = context.messageId ?? 'unknown'
-    lines.push(`${index + 1}. [TG][message_id=${messageId}] ${sender}${replyNote}: ${job.payload?.text || '[no text]'}`)
+    lines.push(`${index + 1}. [TG][conversation_key=${conversation}][message_id=${messageId}] ${sender}${replyNote}: ${job.payload?.text || '[no text]'}`)
   })
   return [{ type: 'text', text: lines.join('\n') }]
 }
