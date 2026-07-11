@@ -120,12 +120,20 @@ test('hardens both system services and pins absolute executable paths', async ()
     assert.match(unit, /^ExecStart=\//m)
     assert.doesNotMatch(unit, /<[^>]+>|^ExecStart=(?:node|codex)\b/m)
   }
+
+  const app = await file('codex-tg-app.service')
+  const bridge = await file('codex-tg-bridge.service')
+  assert.match(app, /mcp_servers\.telegram\.command="\/usr\/local\/bin\/node"/)
+  assert.match(bridge, /^ExecStart=\/usr\/local\/bin\/node /m)
+  assert.doesNotMatch(`${app}\n${bridge}`, /\/usr\/bin\/node/)
 })
 
 test('installer verifies Node, Codex, swap, and schema before enabling services', async () => {
   const install = await file('install.sh')
-  assert.match(install, /\/usr\/bin\/node --version/)
+  assert.match(install, /\/usr\/local\/bin\/node --version/)
+  assert.match(install, /\/usr\/local\/bin\/npm --version/)
   assert.match(install, /\/usr\/local\/bin\/codex --version/)
+  assert.doesNotMatch(install, /\/usr\/bin\/(?:node|npm)/)
   assert.match(
     install,
     /\/usr\/bin\/systemd-analyze verify[\s\\]+\/etc\/systemd\/system\/codex-tg-app\.service[\s\\]+\/etc\/systemd\/system\/codex-tg-bridge\.service/,

@@ -11,11 +11,11 @@ INSTALL_ROOT=/opt/tg-engage
 SCHEMA_DIR=$(mktemp -d)
 trap 'rm -rf "$SCHEMA_DIR"' EXIT
 
-/usr/bin/node --version
-/usr/bin/npm --version
+/usr/local/bin/node --version
+/usr/local/bin/npm --version
 /usr/local/bin/codex --version
 
-NODE_MAJOR=$(/usr/bin/node -p 'process.versions.node.split(".")[0]')
+NODE_MAJOR=$(/usr/local/bin/node -p 'process.versions.node.split(".")[0]')
 if [[ ${NODE_MAJOR} -ne 24 ]]; then
   printf 'Node.js 24 LTS is required; found major %s\n' "$NODE_MAJOR" >&2
   exit 1
@@ -38,7 +38,7 @@ install -d -o root -g root -m 0755 "$INSTALL_ROOT/bridge"
 cp -a "$SOURCE_ROOT/bridge/." "$INSTALL_ROOT/bridge/"
 chown -R root:root "$INSTALL_ROOT"
 cd "$INSTALL_ROOT/bridge"
-/usr/bin/npm ci --omit=dev
+/usr/local/bin/npm ci --omit=dev
 
 install -D -o root -g root -m 0644 "$SOURCE_ROOT/bridge/deploy/tmpfiles.conf" /usr/lib/tmpfiles.d/codex-tg.conf
 systemd-tmpfiles --create /usr/lib/tmpfiles.d/codex-tg.conf
@@ -53,7 +53,7 @@ CODEX_VERSION=$(/usr/local/bin/codex --version)
 runuser -u codexbot -- env HOME=/var/lib/codexbot CODEX_HOME=/var/lib/codexbot/.codex \
   /usr/local/bin/codex app-server generate-json-schema --experimental --out "$SCHEMA_DIR"
 install -d -o root -g root -m 0755 "$INSTALL_ROOT/bridge/fixtures/deployed"
-/usr/bin/node "$INSTALL_ROOT/bridge/scripts/capture-codex-contract.mjs" \
+/usr/local/bin/node "$INSTALL_ROOT/bridge/scripts/capture-codex-contract.mjs" \
   --schema-dir "$SCHEMA_DIR" \
   --codex-version "$CODEX_VERSION" \
   --out "$INSTALL_ROOT/bridge/fixtures/deployed/contract.json"

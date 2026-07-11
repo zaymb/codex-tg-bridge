@@ -72,7 +72,7 @@ The wake CLI persists a request; it does not compose Telegram content or bypass 
 
 ```bash
 sudo -u tgbridge env BRIDGE_WAKE_SOCKET=/run/codex-tg/wake/wake.sock \
-  /usr/bin/node /opt/tg-engage/bridge/src/wake-cli.mjs \
+  /usr/local/bin/node /opt/tg-engage/bridge/src/wake-cli.mjs \
   --target sandbox-topic \
   --source manual \
   --reason "Review the latest group context and decide whether to respond" \
