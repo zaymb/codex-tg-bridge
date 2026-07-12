@@ -113,6 +113,20 @@ test('stores ordinary approved group traffic and marks bot traffic as non-extend
   })
 })
 
+test('can explicitly deliver bot-authored group traffic without extending human silence', () => {
+  const policy = new EngagementPolicy(
+    { ...config(), deliverBotMessages: true },
+    { botUserId: '500', botUsername: 'bridge_bot' },
+  )
+  const bot = message({ actor: { id: '600', isBot: true, username: 'other_bot' } })
+
+  assert.deepEqual(policy.evaluate(bot), {
+    action: 'turn',
+    reason: 'configured_bot_passthrough',
+    extendsSilence: false,
+  })
+})
+
 test('lets an explicit production gate promote ordinary group traffic', () => {
   const gateCalls = []
   const groupGate = {

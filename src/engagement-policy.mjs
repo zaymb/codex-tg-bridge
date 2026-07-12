@@ -91,6 +91,9 @@ export class EngagementPolicy {
       const gate = this.#groupGate.evaluate(update)
       if (gate?.deliver) return result('turn', gate.reason || 'configured_group_gate', true)
     }
+    if (!humanAuthored && this.#config.deliverBotMessages) {
+      return result('turn', 'configured_bot_passthrough', false)
+    }
     if (!humanAuthored) return result('store', 'bot_authored_context')
     return result('store', 'ordinary_group_context', true)
   }

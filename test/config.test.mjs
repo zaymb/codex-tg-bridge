@@ -140,6 +140,7 @@ test('loads the transport-only config without Codex app-server settings', async 
   assert.equal(config.pollTimeoutSec, 50)
   assert.equal(config.updateLeaseMs, 120_000)
   assert.equal(config.deliverAllGroupMessages, false)
+  assert.equal(config.deliverBotMessages, false)
   assert.equal(config.readTelegramToken(), '123456:secret-token')
   assert.equal(Object.keys(config).includes('readTelegramToken'), false)
 })
@@ -158,8 +159,10 @@ test('can explicitly enable approved-group passthrough for transport testing', a
   const env = validEnv(tokenPath)
   env.BRIDGE_SESSION_LABEL = 'tg-engage'
   env.BRIDGE_DELIVER_ALL_GROUP_MESSAGES = 'true'
+  env.BRIDGE_DELIVER_BOT_MESSAGES = 'true'
 
   assert.equal(loadTransportConfig(env).deliverAllGroupMessages, true)
+  assert.equal(loadTransportConfig(env).deliverBotMessages, true)
 })
 
 test('loads explicit no-prompt permissions for the local Telegram connector', () => {

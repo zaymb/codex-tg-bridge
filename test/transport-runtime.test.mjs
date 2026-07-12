@@ -59,6 +59,7 @@ test('routes ordinary approved human group messages when passthrough is enabled'
     pollTimeoutSec: 50,
     updateLeaseMs: 120_000,
     deliverAllGroupMessages: true,
+    deliverBotMessages: false,
     readTelegramToken: () => '123456:test-token',
   }
   const fetchImpl = async url => {
