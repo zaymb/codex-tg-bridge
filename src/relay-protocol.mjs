@@ -64,7 +64,7 @@ function outboundActions(batchId, jobs, result, nowMs) {
         }
         const action = response.action ?? 'reply'
         if (!['reply', 'react'].includes(action)) throw new Error('job result targeted action must be reply or react')
-        return { context, text: response.text, action }
+        return { context, text: response.text, action, isBig: response.isBig === true }
       })
     : [{ context: contexts.at(-1), text: result.text, action: result.action }]
   if (selected.some(response => !response.text.trim())) {
@@ -83,7 +83,7 @@ function outboundActions(batchId, jobs, result, nowMs) {
           chatId: response.context.chatId,
           messageId: response.context.messageId,
           reaction: { type: 'emoji', emoji: response.text.trim() },
-          isBig: false,
+          isBig: response.isBig === true,
         },
         sequenceGroup: group,
         sequenceIndex: actions.length,

@@ -187,6 +187,37 @@ test('records selective targeted responses to messages from the same batch', asy
   assert.equal(second.payload.text, 'second targeted answer')
 })
 
+test('preserves the large-animation flag for a targeted reaction', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  enqueue(setup.state, '31', '42', 1_000, { messageId: '31' })
+  await hello(setup)
+  await setup.session.claimOnce()
+  const { batchId } = setup.frames.at(-1).batch
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_accepted',
+    batchId,
+    threadId: 'thread-a',
+    turnId: 'turn-a',
+  })
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_result',
+    batchId,
+    turnId: 'turn-a',
+    result: {
+      action: 'reply',
+      text: '',
+      responses: [{ messageId: '31', action: 'react', text: '🎉', isBig: true }],
+    },
+  })
+
+  const action = setup.state.getOutboundAction(`relay-batch:${batchId}:0000`)
+  assert.equal(action.actionType, 'react')
+  assert.equal(action.payload.isBig, true)
+})
+
 test('routes identical message IDs independently across a DM, group, and forum topic', async t => {
   const setup = fixture()
   t.after(() => setup.state.close())
