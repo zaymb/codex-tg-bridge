@@ -71,6 +71,7 @@ export async function main(env = process.env) {
     sandboxPolicy: config.sandboxPolicy,
     ownerUserId: config.ownerUserId,
     privateChatIds: config.privateChatIds,
+    repairChatIds: config.repairChatIds,
   })
   const controller = new AbortController()
   const shutdown = () => controller.abort()

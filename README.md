@@ -168,6 +168,10 @@ For owner DM, no group configuration is needed. Before group acceptance:
 - `TELEGRAM_PRIVATE_CHAT_IDS` defines private audiences that may receive
   owner-private architecture discussion. These groups remain non-authoritative:
   they cannot start work, mutate state, approve actions, or control sessions.
+- `TELEGRAM_REPAIR_CHAT_IDS` defines repair surfaces. An authenticated owner
+  message in one of these groups may start work and use the configured Codex
+  permissions. Messages from peer bots or other members remain non-authoritative,
+  even in the same repair group.
 - Group slash commands are stored as context and never execute bridge control
   actions. `/new`, `/stop`, approvals, and mutations require the terminal or
   owner DM.

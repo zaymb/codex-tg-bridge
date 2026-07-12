@@ -53,6 +53,30 @@ test('classifies approved private groups separately without granting instruction
   )
 })
 
+test('authorizes only owner-authored turns in an approved repair group', () => {
+  const privateGroups = new Set(['-1001'])
+  const repairGroups = new Set(['-1001'])
+  const owner = job({
+    chatId: '-1001', conversationKey: '-1001', senderId: '42', senderIsBot: false,
+  })
+  const peer = job({
+    chatId: '-1001', conversationKey: '-1001', senderId: '99', senderIsBot: true,
+  })
+
+  assert.equal(
+    classifyTelegramJobs([owner], '42', privateGroups, repairGroups),
+    TELEGRAM_TRUST.REPAIR_GROUP,
+  )
+  assert.equal(
+    classifyTelegramJobs([peer], '42', privateGroups, repairGroups),
+    TELEGRAM_TRUST.PRIVATE_GROUP,
+  )
+  assert.equal(
+    classifyTelegramJobs([owner, peer], '42', privateGroups, repairGroups),
+    TELEGRAM_TRUST.PRIVATE_GROUP,
+  )
+})
+
 test('marks every Telegram turn as an external feed with an explicit trust tier', () => {
   assert.equal(
     externalFeedTag(TELEGRAM_TRUST.UNTRUSTED_EXTERNAL),
@@ -113,4 +137,5 @@ test('private-group output preserves architecture discussion but redacts credent
     guardTelegramOutput(secret, TELEGRAM_TRUST.PRIVATE_GROUP).finalText,
     secret.finalText,
   )
+  assert.deepEqual(guardTelegramOutput(architecture, TELEGRAM_TRUST.REPAIR_GROUP), architecture)
 })

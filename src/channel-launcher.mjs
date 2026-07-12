@@ -73,6 +73,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
         BRIDGE_SESSION_LABEL: local.sessionLabel,
         TELEGRAM_OWNER_USER_ID: String(local.ownerUserId),
         TELEGRAM_PRIVATE_CHAT_IDS: (local.privateChatIds ?? []).join(','),
+        TELEGRAM_REPAIR_CHAT_IDS: (local.repairChatIds ?? []).join(','),
         CODEX_SESSION_ID: sessionId,
         CODEX_THREAD_ID: sessionId,
         APP_SERVER_SOCKET: socketPath,

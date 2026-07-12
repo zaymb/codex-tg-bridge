@@ -2,8 +2,10 @@ import { AppServerRpcError } from './app-server-client.mjs'
 import {
   TELEGRAM_TRUST,
   TELEGRAM_TRUST_POLICIES,
+  classifyTelegramContext,
   externalFeedTag,
   guardTelegramOutput,
+  isInstructionTrust,
 } from './channel-trust.mjs'
 
 export const TELEGRAM_OUTPUT_SCHEMA = Object.freeze({
@@ -383,9 +385,13 @@ export class CodexRunner {
   }) {
     const trust = ownerDm
       ? TELEGRAM_TRUST.OWNER_DM
-      : this.#config.privateChatIds?.has(String(telegramContext.chatId))
-        ? TELEGRAM_TRUST.PRIVATE_GROUP
-        : TELEGRAM_TRUST.UNTRUSTED_EXTERNAL
+      : classifyTelegramContext(
+          telegramContext,
+          this.#config.ownerUserId,
+          this.#config.privateChatIds,
+          this.#config.repairChatIds,
+        )
+    const instructionSource = isInstructionTrust(trust)
     this.#startingConversations.add(conversationKey)
     let thread
     try {
@@ -415,10 +421,10 @@ export class CodexRunner {
         model: thread.conversation?.modelOverride ?? this.#config.model,
         effort: thread.conversation?.effortOverride ?? this.#config.effort,
         cwd: this.#config.codexWorkdir,
-        approvalPolicy: ownerDm ? 'on-request' : 'never',
-        approvalsReviewer: ownerDm ? 'user' : null,
-        runtimeWorkspaceRoots: ownerDm ? this.#config.codexWritableRoots : [],
-        sandboxPolicy: ownerDm
+        approvalPolicy: instructionSource ? 'on-request' : 'never',
+        approvalsReviewer: instructionSource ? 'user' : null,
+        runtimeWorkspaceRoots: instructionSource ? this.#config.codexWritableRoots : [],
+        sandboxPolicy: instructionSource
           ? {
               type: 'workspaceWrite',
               writableRoots: this.#config.codexWritableRoots,

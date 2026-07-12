@@ -260,6 +260,56 @@ test('direct runner tags a private group without granting execution permissions'
   assert.deepEqual(turnParams.sandboxPolicy, { type: 'readOnly', networkAccess: false })
 })
 
+test('direct runner authorizes an owner turn in a configured repair group', async t => {
+  let turnParams
+  const fake = await startFakeAppServer({
+    onMessage(message, connection) {
+      if (message.method === 'thread/start') {
+        connection.send({ id: message.id, result: { thread: { id: 'thread-repair-group' } } })
+      }
+      if (message.method === 'turn/start') {
+        turnParams = message.params
+        connection.send({ id: message.id, result: { turn: { id: 'turn-repair-group', status: 'inProgress', items: [] } } })
+        sendCompletedTurn(connection, {
+          threadId: 'thread-repair-group',
+          turnId: 'turn-repair-group',
+          output: JSON.stringify({ action: 'skip', text: '', reason: 'done' }),
+        })
+      }
+    },
+  })
+  t.after(() => fake.close())
+  const client = await AppServerClient.connect({ socketPath: fake.socketPath, contract: await contract() })
+  t.after(() => client.close())
+  const store = StateStore.open(':memory:')
+  t.after(() => store.close())
+  const runner = new CodexRunner({
+    client,
+    stateStore: store,
+    config: config({
+      ownerUserId: '42',
+      privateChatIds: new Set(['-100123']),
+      repairChatIds: new Set(['-100123']),
+    }),
+  })
+
+  await runner.runTurn({
+    conversationKey: '-100123',
+    ownerDm: false,
+    text: 'Repair it.',
+    telegramContext: { chatId: '-100123', senderId: '42', senderIsBot: false },
+  })
+
+  assert.match(turnParams.input[0].text, /\[trust=repair_group\]/)
+  assert.match(turnParams.additionalContext.telegram_trust_policy.value, /authorized repair surface/)
+  assert.equal(turnParams.approvalPolicy, 'on-request')
+  assert.deepEqual(turnParams.sandboxPolicy, {
+    type: 'workspaceWrite',
+    writableRoots: ['/srv/codex-workspace'],
+    networkAccess: false,
+  })
+})
+
 test('replaces only a confirmed stale thread and reports the context break', async t => {
   const methods = []
   const fake = await startFakeAppServer({

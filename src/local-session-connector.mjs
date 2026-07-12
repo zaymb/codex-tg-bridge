@@ -16,7 +16,7 @@ import {
   classifyTelegramJobs,
   externalFeedTag,
   guardTelegramOutput,
-  isOwnerDmTrust,
+  isInstructionTrust,
 } from './channel-trust.mjs'
 import { RELAY_PROTOCOL_VERSION } from './relay-protocol.mjs'
 
@@ -111,6 +111,7 @@ export class LocalSessionConnector extends EventEmitter {
   #sandboxPolicy
   #ownerUserId
   #privateChatIds
+  #repairChatIds
   #approvalTtlMs
   #clock
   #activeTurns = new Set()
@@ -135,6 +136,7 @@ export class LocalSessionConnector extends EventEmitter {
     sandboxPolicy = null,
     ownerUserId,
     privateChatIds = new Set(),
+    repairChatIds = new Set(),
     approvalTtlMs = 10 * 60 * 1_000,
     clock = Date.now,
   }) {
@@ -151,6 +153,7 @@ export class LocalSessionConnector extends EventEmitter {
     if (!ownerUserId) throw new Error('local connector owner user ID is required')
     this.#ownerUserId = String(ownerUserId)
     this.#privateChatIds = new Set([...privateChatIds].map(String))
+    this.#repairChatIds = new Set([...repairChatIds].map(String))
     this.#approvalTtlMs = approvalTtlMs
     this.#clock = clock
   }
@@ -348,7 +351,7 @@ export class LocalSessionConnector extends EventEmitter {
     if (!SUPPORTED_APPROVAL_METHODS.has(request.method)) return
     const params = request.params ?? {}
     if (params.threadId !== this.#threadId || !params.turnId) return
-    if (this.#currentJob?.turnId === params.turnId && !isOwnerDmTrust(this.#currentJob.trust)) {
+    if (this.#currentJob?.turnId === params.turnId && !isInstructionTrust(this.#currentJob.trust)) {
       this.#app.respond(request.id, approvalResponse(request.method, params, false))
       return
     }
@@ -399,7 +402,7 @@ export class LocalSessionConnector extends EventEmitter {
     if (frame.type === 'error') throw new Error(`VPS relay error: ${frame.message}`)
     if (frame.type === 'job_recorded') {
       if (!this.#recordedMatches(frame)) return
-      const restorePermissions = !isOwnerDmTrust(this.#currentJob.trust)
+      const restorePermissions = !isInstructionTrust(this.#currentJob.trust)
       this.#currentJob = null
       if (restorePermissions) await this.#resumeWithConfiguredPolicy()
       this.#send({ type: 'heartbeat', acceptingJobs: this.#available() })
@@ -419,7 +422,12 @@ export class LocalSessionConnector extends EventEmitter {
     const clientUserMessageId = inbound.mode === 'legacy' ? inbound.jobs[0].jobId : inbound.batchId
     this.#currentJob = {
       ...inbound,
-      trust: classifyTelegramJobs(inbound.jobs, this.#ownerUserId, this.#privateChatIds),
+      trust: classifyTelegramJobs(
+        inbound.jobs,
+        this.#ownerUserId,
+        this.#privateChatIds,
+        this.#repairChatIds,
+      ),
       turnId: null,
       awaitingRecord: false,
       clientUserMessageId,
@@ -427,7 +435,7 @@ export class LocalSessionConnector extends EventEmitter {
     }
     this.#send({ type: 'heartbeat', acceptingJobs: false })
     try {
-      const trustedOwnerDm = isOwnerDmTrust(this.#currentJob.trust)
+      const instructionSource = isInstructionTrust(this.#currentJob.trust)
       const telegramMessages = inbound.jobs.map(job => job.payload?.telegramContext ?? {})
       const response = await this.#app.request('turn/start', {
         threadId: this.#threadId,
@@ -454,10 +462,10 @@ export class LocalSessionConnector extends EventEmitter {
           },
           telegram_output_contract: { kind: 'application', value: TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS },
         },
-        ...(trustedOwnerDm
+        ...(instructionSource
           ? (this.#approvalPolicy ? { approvalPolicy: this.#approvalPolicy } : {})
           : { approvalPolicy: 'never' }),
-        ...(trustedOwnerDm
+        ...(instructionSource
           ? (this.#sandboxPolicy ? { sandboxPolicy: this.#sandboxPolicy } : {})
           : { sandboxPolicy: { type: 'readOnly', networkAccess: false } }),
       })

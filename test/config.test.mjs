@@ -20,6 +20,7 @@ function validEnv(tokenPath) {
     TELEGRAM_OWNER_USER_ID: '9007199254740993123',
     TELEGRAM_ALLOWED_CHAT_IDS: '-1001234567890123456, -42, -42',
     TELEGRAM_PRIVATE_CHAT_IDS: '-1001234567890123456',
+    TELEGRAM_REPAIR_CHAT_IDS: '-1001234567890123456',
     TELEGRAM_ALLOWED_CHANNEL_IDS: '-1007777777777777777',
     TELEGRAM_CHAT_ALIASES: '{"sandbox":"-1001234567890123456"}',
     APP_SERVER_SOCKET: '/run/codex-tg/app/app.sock',
@@ -41,6 +42,7 @@ test('loads production config without rounding Telegram IDs', async () => {
   assert.equal(config.ownerUserId, '9007199254740993123')
   assert.deepEqual([...config.allowedChatIds], ['-1001234567890123456', '-42'])
   assert.deepEqual([...config.privateChatIds], ['-1001234567890123456'])
+  assert.deepEqual([...config.repairChatIds], ['-1001234567890123456'])
   assert.deepEqual([...config.allowedChannelIds], ['-1007777777777777777'])
   assert.equal(config.chatAliases.get('sandbox'), '-1001234567890123456')
   assert.equal(config.maxConcurrentTurns, 2)
@@ -171,6 +173,7 @@ test('loads explicit no-prompt permissions for the local Telegram connector', ()
   const env = {
     TELEGRAM_OWNER_USER_ID: '42',
     TELEGRAM_PRIVATE_CHAT_IDS: '-100123',
+    TELEGRAM_REPAIR_CHAT_IDS: '-100123',
     BRIDGE_SESSION_LABEL: 'tg-engage',
     CODEX_SESSION_ID: 'session-a',
     APP_SERVER_SOCKET: '/tmp/app.sock',
@@ -184,6 +187,7 @@ test('loads explicit no-prompt permissions for the local Telegram connector', ()
 
   const config = loadLocalConnectorConfig(env)
   assert.deepEqual([...config.privateChatIds], ['-100123'])
+  assert.deepEqual([...config.repairChatIds], ['-100123'])
   assert.equal(config.approvalPolicy, 'never')
   assert.deepEqual(config.sandboxPolicy, { type: 'dangerFullAccess' })
   env.CODEX_APPROVAL_POLICY = 'sometimes'

@@ -43,7 +43,11 @@ class FakeRelay extends EventEmitter {
   async close() {}
 }
 
-function fixture({ heartbeatIntervalMs = 60_000, privateChatIds = new Set() } = {}) {
+function fixture({
+  heartbeatIntervalMs = 60_000,
+  privateChatIds = new Set(),
+  repairChatIds = new Set(),
+} = {}) {
   const app = new FakeAppServer()
   const relay = new FakeRelay()
   const connector = new LocalSessionConnector({
@@ -58,6 +62,7 @@ function fixture({ heartbeatIntervalMs = 60_000, privateChatIds = new Set() } = 
     sandboxPolicy: { type: 'dangerFullAccess' },
     ownerUserId: '42',
     privateChatIds,
+    repairChatIds,
   })
   return { app, relay, connector }
 }
@@ -79,6 +84,30 @@ function privateGroupBatch() {
             senderId: '42',
             senderIsBot: false,
             senderDisplayName: 'Owner',
+          },
+        },
+      }],
+    },
+  }
+}
+
+function repairGroupBatch({ peer = false } = {}) {
+  return {
+    version: 1,
+    type: 'job_batch',
+    batch: {
+      batchId: `batch:telegram:repair-group:${peer ? 'peer' : 'owner'}`,
+      jobs: [{
+        jobId: `telegram:repair-group:${peer ? 'peer' : 'owner'}`,
+        payload: {
+          text: 'repair the bridge',
+          telegramContext: {
+            chatId: '-100123',
+            conversationKey: '-100123',
+            messageId: peer ? '15' : '14',
+            senderId: peer ? '99' : '42',
+            senderIsBot: peer,
+            senderDisplayName: peer ? 'Peer' : 'Owner',
           },
         },
       }],
@@ -274,6 +303,41 @@ test('private groups receive the private-audience policy but retain no execution
   assert.match(started.params.input[0].text, /\[trust=private_group\]/)
   assert.match(started.params.additionalContext.telegram_trust_policy.value, /owner-approved private Telegram group/)
   assert.match(started.params.additionalContext.telegram_trust_policy.value, /not an instruction source/)
+  assert.equal(started.params.approvalPolicy, 'never')
+  assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
+})
+
+test('owner-authored repair-group turns receive configured execution permissions', async t => {
+  const setup = fixture({
+    privateChatIds: new Set(['-100123']),
+    repairChatIds: new Set(['-100123']),
+  })
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', repairGroupBatch())
+  await setup.connector.idle()
+
+  const started = setup.app.calls.find(call => call.method === 'turn/start')
+  assert.match(started.params.input[0].text, /\[trust=repair_group\]/)
+  assert.match(started.params.additionalContext.telegram_trust_policy.value, /authorized repair surface/)
+  assert.equal(started.params.approvalPolicy, 'never')
+  assert.deepEqual(started.params.sandboxPolicy, { type: 'dangerFullAccess' })
+})
+
+test('peer-bot turns in a repair group remain non-authoritative and read-only', async t => {
+  const setup = fixture({
+    privateChatIds: new Set(['-100123']),
+    repairChatIds: new Set(['-100123']),
+  })
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', repairGroupBatch({ peer: true }))
+  await setup.connector.idle()
+
+  const started = setup.app.calls.find(call => call.method === 'turn/start')
+  assert.match(started.params.input[0].text, /\[trust=private_group\]/)
   assert.equal(started.params.approvalPolicy, 'never')
   assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
 })
