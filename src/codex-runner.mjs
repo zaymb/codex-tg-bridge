@@ -127,8 +127,8 @@ function extractFinal(items) {
 }
 
 export function parseTelegramStructuredOutput(text) {
-  try {
-    const parsed = JSON.parse(text)
+  const parseEnvelope = value => {
+    const parsed = JSON.parse(value)
     if (parsed?.action === 'skip') {
       return { action: 'skip', skipped: true, finalText: null, responses: [], reason: String(parsed.reason ?? '') }
     }
@@ -146,7 +146,47 @@ export function parseTelegramStructuredOutput(text) {
         reason: String(parsed.reason ?? ''),
       }
     }
+    return null
+  }
+
+  try {
+    const envelope = parseEnvelope(text)
+    if (envelope) return envelope
   } catch {}
+
+  const trimmed = text.trimStart()
+  if (trimmed.startsWith('{')) {
+    let depth = 0
+    let inString = false
+    let escaped = false
+    for (let index = 0; index < trimmed.length; index += 1) {
+      const character = trimmed[index]
+      if (inString) {
+        if (escaped) escaped = false
+        else if (character === '\\') escaped = true
+        else if (character === '"') inString = false
+        continue
+      }
+      if (character === '"') inString = true
+      else if (character === '{') depth += 1
+      else if (character === '}') {
+        depth -= 1
+        if (depth !== 0) continue
+        try {
+          const envelope = parseEnvelope(trimmed.slice(0, index + 1))
+          if (envelope) return envelope
+        } catch {}
+        break
+      }
+    }
+    return {
+      action: 'skip',
+      skipped: true,
+      finalText: null,
+      responses: [],
+      reason: 'malformed_structured_output',
+    }
+  }
   const skip = text.match(/^\s*\[SKIP\](?:\s+理由[:：]?)?\s*(.*)$/isu)
   if (skip) return { action: 'skip', skipped: true, finalText: null, responses: [], reason: skip[1].trim() }
   return { action: 'send', skipped: false, finalText: text, responses: [], reason: 'unstructured_compatibility_output' }

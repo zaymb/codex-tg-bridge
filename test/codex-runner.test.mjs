@@ -79,6 +79,25 @@ test('parses optional targeted Telegram responses without losing legacy text out
   })
 })
 
+test('fails closed instead of leaking a structured envelope with trailing garbage', () => {
+  assert.deepEqual(parseTelegramStructuredOutput(
+    '{"action":"skip","text":"","responses":[],"reason":"no reply"} trailing words',
+  ), {
+    action: 'skip',
+    skipped: true,
+    finalText: null,
+    responses: [],
+    reason: 'no reply',
+  })
+  assert.deepEqual(parseTelegramStructuredOutput('{"action":"send","text":'), {
+    action: 'skip',
+    skipped: true,
+    finalText: null,
+    responses: [],
+    reason: 'malformed_structured_output',
+  })
+})
+
 test('starts and persists an owner-DM thread, then returns only structured final output', async t => {
   let turnParams
   const fake = await startFakeAppServer({
