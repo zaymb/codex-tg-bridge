@@ -76,12 +76,9 @@ export class EngagementPolicy {
 
     const humanAuthored = actor?.isBot !== true && chat.type !== 'channel'
     if (systemCommandName(update)) {
-      if (humanAuthored && actor?.id === this.#config.ownerUserId) {
-        return result('turn', 'owner_system_command', true)
-      }
-      return result('store', 'owner_only_system_command', humanAuthored)
+      return result('store', 'system_command_requires_owner_dm', humanAuthored)
     }
-    if (isCommand(update)) return result('turn', 'command', humanAuthored)
+    if (isCommand(update)) return result('store', 'command_requires_owner_dm', humanAuthored)
     if (isDirectMention(update, this.#botUserId, this.#botUsername)) {
       return result('turn', 'direct_mention', humanAuthored)
     }

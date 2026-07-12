@@ -36,7 +36,10 @@ function commandName(update) {
 }
 
 function isOwnerStop(update, ownerUserId) {
-  return commandName(update) === 'stop' && update.actor?.id === ownerUserId
+  return commandName(update) === 'stop'
+    && update.actor?.id === ownerUserId
+    && update.chat?.type === 'private'
+    && update.chat?.id === ownerUserId
 }
 
 function isOwnerCallback(update, ownerUserId) {

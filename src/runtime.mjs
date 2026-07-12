@@ -134,6 +134,7 @@ export async function createBridgeRuntime({
       stateStore,
       dispatcher,
       attachmentStore,
+      ownerUserId: config.ownerUserId,
     })
     wakeServer = new WakeServer({
       socketPath: config.wakeSocket,

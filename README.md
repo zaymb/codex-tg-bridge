@@ -159,3 +159,19 @@ For owner DM, no group configuration is needed. Before group acceptance:
 - The current structured model path is `SEND/REACT/SKIP`; Telegram action tools,
   attachments, `/stop`, and durable remote approvals use the same outbox and
   routing boundaries.
+
+## Trust boundary
+
+- Every Telegram turn is tagged as an `EXTERNAL_FEED` with an authenticated
+  trust tier. Only the configured owner's private chat is an instruction
+  source; owner-authored group messages remain untrusted conversation data.
+- Group slash commands are stored as context and never execute bridge control
+  actions. `/new`, `/stop`, approvals, and mutations require the terminal or
+  owner DM.
+- Untrusted turns run with `readOnly`, network disabled, `approvalPolicy=never`,
+  and automatic denial of any approval request that still reaches the local
+  connector.
+- Public Telegram output passes a deterministic disclosure guard. Concrete
+  local paths, credentials, environment/config identifiers, private
+  infrastructure details, code blocks, oversized responses, and file exports
+  are blocked outside the owner DM.

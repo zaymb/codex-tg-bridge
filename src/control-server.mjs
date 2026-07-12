@@ -1,5 +1,6 @@
 import { basename } from 'node:path'
 
+import { publicDisclosureRisk } from './channel-trust.mjs'
 import { JsonLineSocketServer } from './json-line-socket.mjs'
 import { requireTelegramDiceEmoji } from './telegram-dice.mjs'
 
@@ -21,12 +22,15 @@ export class ControlServer {
   #state
   #dispatcher
   #attachmentStore
+  #ownerUserId
   #server
 
-  constructor({ socketPath, stateStore, dispatcher, attachmentStore }) {
+  constructor({ socketPath, stateStore, dispatcher, attachmentStore, ownerUserId }) {
+    if (!ownerUserId) throw new Error('control server owner user ID is required')
     this.#state = stateStore
     this.#dispatcher = dispatcher
     this.#attachmentStore = attachmentStore
+    this.#ownerUserId = String(ownerUserId)
     this.#server = new JsonLineSocketServer({
       socketPath,
       handler: request => this.#handle(request),
@@ -46,6 +50,17 @@ export class ControlServer {
     const chat = this.#state.getApprovedChatByAlias(target) ?? this.#state.getApprovedChat(target)
     if (!chat) throw new Error('unknown or unapproved Telegram target')
     return chat
+  }
+
+  #isOwnerDm(chat) {
+    return chat.kind === 'private' && chat.telegramChatId === this.#ownerUserId
+  }
+
+  #assertPublicTextSafe(chat, text) {
+    if (this.#isOwnerDm(chat) || text === null || text === undefined) return
+    if (publicDisclosureRisk(text)) {
+      throw new Error('public Telegram output was blocked by the disclosure guard')
+    }
   }
 
   async #handle(request) {
@@ -104,6 +119,7 @@ export class ControlServer {
           : requiredString(params.messageId, 'messageId', 32),
       }
     } else if (action === 'send_file') {
+      if (!this.#isOwnerDm(chat)) throw new Error('files can only be sent to the owner DM')
       const path = await this.#attachmentStore.assertExportPath(requiredString(params.path, 'path', 4096))
       actionType = 'send_file'
       payload = {
@@ -116,6 +132,8 @@ export class ControlServer {
     } else {
       throw new Error(`unsupported Telegram action: ${action}`)
     }
+
+    this.#assertPublicTextSafe(chat, payload.text ?? payload.caption ?? null)
 
     const result = await this.#dispatcher.enqueueExternalAction({
       actionId,

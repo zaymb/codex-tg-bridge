@@ -1,4 +1,10 @@
 import { AppServerRpcError } from './app-server-client.mjs'
+import {
+  TELEGRAM_TRUST,
+  TELEGRAM_TRUST_POLICIES,
+  externalFeedTag,
+  guardTelegramOutput,
+} from './channel-trust.mjs'
 
 export const TELEGRAM_OUTPUT_SCHEMA = Object.freeze({
   type: 'object',
@@ -331,8 +337,8 @@ export class CodexRunner {
     return compact({
       model: conversation?.modelOverride ?? this.#config.model,
       cwd: this.#config.codexWorkdir,
-      approvalPolicy: 'on-request',
-      approvalsReviewer: 'user',
+      approvalPolicy: ownerDm ? 'on-request' : 'never',
+      approvalsReviewer: ownerDm ? 'user' : null,
       sandbox: ownerDm ? 'workspace-write' : 'read-only',
       runtimeWorkspaceRoots: ownerDm ? this.#config.codexWritableRoots : [],
     })
@@ -375,6 +381,7 @@ export class CodexRunner {
     telegramContext = {},
     clientUserMessageId = null,
   }) {
+    const trust = ownerDm ? TELEGRAM_TRUST.OWNER_DM : TELEGRAM_TRUST.UNTRUSTED_EXTERNAL
     this.#startingConversations.add(conversationKey)
     let thread
     try {
@@ -399,13 +406,13 @@ export class CodexRunner {
       this.#startingConversations.delete(conversationKey)
       const turnResponse = await this.#client.request('turn/start', compact({
         threadId: thread.threadId,
-        input: buildInput(text, attachments),
+        input: buildInput(`${externalFeedTag(trust)}\n${text}`, attachments),
         clientUserMessageId,
         model: thread.conversation?.modelOverride ?? this.#config.model,
         effort: thread.conversation?.effortOverride ?? this.#config.effort,
         cwd: this.#config.codexWorkdir,
-        approvalPolicy: 'on-request',
-        approvalsReviewer: 'user',
+        approvalPolicy: ownerDm ? 'on-request' : 'never',
+        approvalsReviewer: ownerDm ? 'user' : null,
         runtimeWorkspaceRoots: ownerDm ? this.#config.codexWritableRoots : [],
         sandboxPolicy: ownerDm
           ? {
@@ -416,6 +423,8 @@ export class CodexRunner {
           : { type: 'readOnly', networkAccess: false },
         additionalContext: {
           telegram: { kind: 'untrusted', value: JSON.stringify(telegramContext) },
+          telegram_source: { kind: 'application', value: externalFeedTag(trust) },
+          telegram_trust_policy: { kind: 'application', value: TELEGRAM_TRUST_POLICIES[trust] },
           telegram_output_contract: { kind: 'application', value: TELEGRAM_OUTPUT_INSTRUCTIONS },
         },
         outputSchema: TELEGRAM_OUTPUT_SCHEMA,
@@ -447,7 +456,7 @@ export class CodexRunner {
         const message = completion.turn.error?.message ?? 'turn did not complete successfully'
         throw new CodexTurnFailedError(thread.threadId, turnId, message, completion.turn.status)
       }
-      const output = parseTelegramStructuredOutput(extractFinal(items))
+      const output = guardTelegramOutput(parseTelegramStructuredOutput(extractFinal(items)), trust)
       const actionIds = [...findActionIds(items.filter(item => item?.type === 'mcpToolCall' && item.server === 'telegram'))]
       return {
         threadId: thread.threadId,

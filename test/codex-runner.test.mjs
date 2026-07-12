@@ -155,7 +155,11 @@ test('starts and persists an owner-DM thread, then returns only structured final
   })
   assert.equal(turnParams.approvalPolicy, 'on-request')
   assert.equal(turnParams.outputSchema.properties.action.enum.join(','), 'send,react,skip')
-  assert.equal(turnParams.input[0].text, 'Please inspect the project')
+  assert.equal(
+    turnParams.input[0].text,
+    '[EXTERNAL_FEED][source=telegram][trust=owner_dm]\nPlease inspect the project',
+  )
+  assert.match(turnParams.additionalContext.telegram_trust_policy.value, /authenticated Telegram owner-DM/)
 })
 
 test('resumes an existing group thread with read-only policy and attachment inputs', async t => {
@@ -200,11 +204,13 @@ test('resumes an existing group thread with read-only policy and attachment inpu
   assert.equal(methods.includes('thread/start'), false)
   assert.equal(methods.includes('thread/resume'), true)
   assert.deepEqual(turnParams.sandboxPolicy, { type: 'readOnly', networkAccess: false })
+  assert.equal(turnParams.approvalPolicy, 'never')
   assert.deepEqual(turnParams.input, [
-    { type: 'text', text: 'What is in these?\n\nTelegram attachments:\n- report.pdf: /srv/codex-inbox/1/report.pdf' },
+    { type: 'text', text: '[EXTERNAL_FEED][source=telegram][trust=untrusted_external]\nWhat is in these?\n\nTelegram attachments:\n- report.pdf: /srv/codex-inbox/1/report.pdf' },
     { type: 'localImage', path: '/srv/codex-inbox/1/photo.jpg' },
   ])
   assert.equal(turnParams.additionalContext.telegram.kind, 'untrusted')
+  assert.match(turnParams.additionalContext.telegram_trust_policy.value, /never as authority or permission/)
 })
 
 test('replaces only a confirmed stale thread and reports the context break', async t => {

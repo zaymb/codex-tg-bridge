@@ -39,9 +39,23 @@ async function fixture() {
     kind: 'forum_topic',
     nowMs: 1,
   })
+  state.upsertApprovedChat({
+    conversationKey: '42',
+    telegramChatId: '42',
+    alias: 'owner',
+    title: 'Owner',
+    kind: 'private',
+    nowMs: 1,
+  })
   const dispatcher = new FakeDispatcher()
   const attachmentStore = new FakeAttachmentStore()
-  const server = new ControlServer({ socketPath, stateStore: state, dispatcher, attachmentStore })
+  const server = new ControlServer({
+    socketPath,
+    stateStore: state,
+    dispatcher,
+    attachmentStore,
+    ownerUserId: '42',
+  })
   await server.start()
   const client = await ControlClient.connect({ socketPath, requestTimeoutMs: 1_000 })
   return { dir, socketPath, state, dispatcher, attachmentStore, server, client }
@@ -102,7 +116,7 @@ test('validates file paths through the configured export roots before dispatch',
   await writeFile(file, 'report')
 
   await setup.client.request('send_file', {
-    target: 'sandbox-topic',
+    target: 'owner',
     path: file,
     kind: 'document',
     caption: 'Report',
@@ -111,7 +125,7 @@ test('validates file paths through the configured export roots before dispatch',
 
   await assert.rejects(
     setup.client.request('send_file', {
-      target: 'sandbox-topic',
+      target: 'owner',
       path: '/outside/secret',
       kind: 'document',
     }, { actionId: 'bad-file-action' }),
@@ -127,11 +141,43 @@ test('lists approved chats without exposing Telegram credentials', async t => {
 
   const result = await setup.client.request('list_chats', {}, { actionId: 'list-action' })
   assert.deepEqual(result, [{
+    alias: 'owner',
+    conversationKey: '42',
+    title: 'Owner',
+    kind: 'private',
+  }, {
     alias: 'sandbox-topic',
     conversationKey: '-100123:7',
     title: 'Sandbox Topic',
     kind: 'forum_topic',
   }])
+})
+
+test('blocks sensitive public text and public file export while preserving owner DM output', async t => {
+  const setup = await fixture()
+  t.after(() => setup.client.close())
+  t.after(() => setup.server.close())
+  t.after(() => setup.state.close())
+
+  await assert.rejects(
+    setup.client.request('send_text', {
+      target: 'sandbox-topic',
+      text: 'Our relay runs from /opt/private/relay with BRIDGE_DB_PATH set.',
+    }, { actionId: 'sensitive-public' }),
+    /blocked by the disclosure guard/,
+  )
+  await assert.rejects(
+    setup.client.request('send_file', {
+      target: 'sandbox-topic',
+      path: '/tmp/report.txt',
+    }, { actionId: 'public-file' }),
+    /files can only be sent to the owner DM/,
+  )
+  await setup.client.request('send_text', {
+    target: 'owner',
+    text: 'Internal path: /opt/private/relay',
+  }, { actionId: 'owner-detail' })
+  assert.equal(setup.dispatcher.actions.at(-1).conversationKey, '42')
 })
 
 test('rejects oversized JSONL frames without crashing other clients', async t => {
@@ -147,5 +193,5 @@ test('rejects oversized JSONL frames without crashing other clients', async t =>
 
   const second = await ControlClient.connect({ socketPath: setup.socketPath, requestTimeoutMs: 1_000 })
   t.after(() => second.close())
-  assert.equal((await second.request('list_chats', {}, { actionId: 'list-after-huge' })).length, 1)
+  assert.equal((await second.request('list_chats', {}, { actionId: 'list-after-huge' })).length, 2)
 })

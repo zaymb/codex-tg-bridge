@@ -49,7 +49,7 @@ test('always starts a turn for the owner private chat and rejects other DMs', ()
   assert.deepEqual(policy.evaluate(stranger), { action: 'reject', reason: 'unapproved_dm', extendsSilence: false })
 })
 
-test('starts approved group turns for commands, direct mentions, and replies to the bot', () => {
+test('starts approved group turns for direct mentions and replies, but filters commands', () => {
   const policy = new EngagementPolicy(config(), { botUserId: '500', botUsername: 'bridge_bot' })
   const command = message({ message: { ...message().message, text: '/status' } })
   const mention = message({
@@ -67,20 +67,24 @@ test('starts approved group turns for commands, direct mentions, and replies to 
     },
   })
 
-  assert.equal(policy.evaluate(command).reason, 'command')
+  assert.deepEqual(policy.evaluate(command), {
+    action: 'store',
+    reason: 'command_requires_owner_dm',
+    extendsSilence: true,
+  })
   assert.equal(policy.evaluate(mention).reason, 'direct_mention')
   assert.equal(policy.evaluate(reply).reason, 'reply_to_bot')
-  assert.ok([command, mention, reply].every(update => policy.evaluate(update).action === 'turn'))
+  assert.ok([mention, reply].every(update => policy.evaluate(update).action === 'turn'))
 })
 
-test('reserves /new and /stop in approved groups for the owner', () => {
+test('filters /new and /stop in approved groups even when posted by the owner', () => {
   const policy = new EngagementPolicy(config())
 
   for (const command of ['/new', '/stop@bridge_bot']) {
     const outsider = message({ message: { ...message().message, text: command } })
     assert.deepEqual(policy.evaluate(outsider), {
       action: 'store',
-      reason: 'owner_only_system_command',
+      reason: 'system_command_requires_owner_dm',
       extendsSilence: true,
     })
 
@@ -89,8 +93,8 @@ test('reserves /new and /stop in approved groups for the owner', () => {
       message: { ...message().message, text: command },
     })
     assert.deepEqual(policy.evaluate(owner), {
-      action: 'turn',
-      reason: 'owner_system_command',
+      action: 'store',
+      reason: 'system_command_requires_owner_dm',
       extendsSilence: true,
     })
   }

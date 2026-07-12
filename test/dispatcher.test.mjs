@@ -14,6 +14,7 @@ function rawMessage(updateId, {
   text = 'hello',
   threadId = null,
   photo = null,
+  entities = [],
 } = {}) {
   return {
     update_id: updateId,
@@ -24,6 +25,7 @@ function rawMessage(updateId, {
       chat: { id: chatId, type: chatType, ...(threadId === null ? {} : { is_forum: true }) },
       from: { id: senderId, is_bot: senderIsBot, first_name: senderIsBot ? 'Bot' : 'Human' },
       text,
+      entities,
       ...(photo ? { photo } : {}),
     },
   }
@@ -318,38 +320,18 @@ test('does not detach or interrupt for non-owner system commands in an approved 
   assert.equal(setup.runner.jobs.length, 0)
 })
 
-test('preempts an active turn with an owner /stop claimed by the dedicated control drain', { timeout: 1_000 }, async t => {
+test('does not treat an owner group /stop as a privileged control update', async t => {
   const state = StateStore.open(':memory:')
   t.after(() => state.close())
-  let started
-  const turnStarted = new Promise(resolve => { started = resolve })
-  let finish
-  const turnFinished = new Promise(resolve => { finish = resolve })
   const interrupts = []
   const runner = {
-    async runTurn(job) {
-      started(job.conversationKey)
-      await turnFinished
-      return { finalText: null, skipped: true, sentActionIds: [], contextBreak: false }
-    },
+    async runTurn() { throw new Error('group command must not start a turn') },
     async interrupt(key) {
       interrupts.push(key)
-      finish()
       return true
     },
   }
   const setup = fixture({ state, runner, maxConcurrentTurns: 1 })
-  const active = rawMessage(42, {
-    chatId: -100123,
-    chatType: 'supergroup',
-    senderId: 42,
-    text: '/ask',
-    threadId: 7,
-  })
-  state.storeUpdate({ updateId: '42', raw: active, normalizedType: 'message', nowMs: 1_000 })
-  const activeDrain = setup.dispatcher.drainOnce({ limit: 1 })
-  assert.equal(await turnStarted, '-100123:7')
-
   const stop = rawMessage(43, {
     chatId: -100123,
     chatType: 'supergroup',
@@ -358,13 +340,9 @@ test('preempts an active turn with an owner /stop claimed by the dedicated contr
     threadId: 7,
   })
   state.storeUpdate({ updateId: '43', raw: stop, normalizedType: 'message', nowMs: 1_000 })
-  const stopDrain = setup.dispatcher.drainControlsOnce({ limit: 8 })
-
-  const [activeResult, stopResult] = await Promise.all([activeDrain, stopDrain])
-  assert.deepEqual(interrupts, ['-100123:7'])
-  assert.equal(activeResult.processed, 1)
-  assert.equal(stopResult.processed, 1)
-  assert.equal(state.getUpdate('42').status, 'completed')
+  assert.equal((await setup.dispatcher.drainControlsOnce({ limit: 8 })).claimed, 0)
+  assert.equal((await setup.dispatcher.drainOnce({ limit: 8 })).processed, 1)
+  assert.deepEqual(interrupts, [])
   assert.equal(state.getUpdate('43').status, 'completed')
 })
 
@@ -388,23 +366,14 @@ test('dedicated control drain resolves owner approval callbacks and advances exp
   assert.equal(setup.state.getUpdate('48').status, 'completed')
 })
 
-test('preempts an active turn with an owner /stop in the same drain batch', { timeout: 1_000 }, async t => {
+test('stores owner-authored group slash commands without executing them', async t => {
   const state = StateStore.open(':memory:')
   t.after(() => state.close())
-  let finish
-  const turnFinished = new Promise(resolve => { finish = resolve })
   const interrupts = []
-  let turnStarted = false
   const runner = {
-    async runTurn() {
-      turnStarted = true
-      await turnFinished
-      return { finalText: null, skipped: true, sentActionIds: [], contextBreak: false }
-    },
+    async runTurn() { throw new Error('group command must not start a turn') },
     async interrupt(key) {
-      assert.equal(turnStarted, true)
       interrupts.push(key)
-      finish()
       return true
     },
   }
@@ -418,7 +387,7 @@ test('preempts an active turn with an owner /stop in the same drain batch', { ti
 
   const result = await setup.dispatcher.drainOnce({ limit: 2 })
 
-  assert.deepEqual(interrupts, ['-100123:7'])
+  assert.deepEqual(interrupts, [])
   assert.equal(result.processed, 2)
 })
 
@@ -556,9 +525,9 @@ test('serializes one topic while allowing different topics up to the global limi
   }
   const setup = fixture({ state, telegram, runner, maxConcurrentTurns: 2 })
   const raws = [
-    rawMessage(11, { chatId: -100123, chatType: 'supergroup', senderId: 99, text: '/ask one', threadId: 7 }),
-    rawMessage(12, { chatId: -100123, chatType: 'supergroup', senderId: 99, text: '/ask two', threadId: 7 }),
-    rawMessage(13, { chatId: -100123, chatType: 'supergroup', senderId: 99, text: '/ask other', threadId: 8 }),
+    rawMessage(11, { chatId: -100123, chatType: 'supergroup', senderId: 99, text: '@bridge_bot one', entities: [{ type: 'mention', offset: 0, length: 11 }], threadId: 7 }),
+    rawMessage(12, { chatId: -100123, chatType: 'supergroup', senderId: 99, text: '@bridge_bot two', entities: [{ type: 'mention', offset: 0, length: 11 }], threadId: 7 }),
+    rawMessage(13, { chatId: -100123, chatType: 'supergroup', senderId: 99, text: '@bridge_bot other', entities: [{ type: 'mention', offset: 0, length: 11 }], threadId: 8 }),
   ]
   for (const raw of raws) {
     state.storeUpdate({ updateId: String(raw.update_id), raw, normalizedType: 'message', nowMs: 1_000 })

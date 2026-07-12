@@ -167,6 +167,7 @@ test('can explicitly enable approved-group passthrough for transport testing', a
 
 test('loads explicit no-prompt permissions for the local Telegram connector', () => {
   const env = {
+    TELEGRAM_OWNER_USER_ID: '42',
     BRIDGE_SESSION_LABEL: 'tg-engage',
     CODEX_SESSION_ID: 'session-a',
     APP_SERVER_SOCKET: '/tmp/app.sock',
@@ -190,6 +191,7 @@ test('loads explicit no-prompt permissions for the local Telegram connector', ()
 
 test('loads a same-host relay without requiring SSH configuration', () => {
   const config = loadLocalConnectorConfig({
+    TELEGRAM_OWNER_USER_ID: '42',
     BRIDGE_SESSION_LABEL: 'tg-engage',
     CODEX_SESSION_ID: 'session-a',
     APP_SERVER_SOCKET: '/run/user/1000/codex-app.sock',

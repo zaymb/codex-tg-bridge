@@ -10,6 +10,14 @@ import {
   parseTelegramStructuredOutput,
   TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS,
 } from './codex-runner.mjs'
+import {
+  TELEGRAM_TRUST,
+  TELEGRAM_TRUST_POLICIES,
+  classifyTelegramJobs,
+  externalFeedTag,
+  guardTelegramOutput,
+  isOwnerDmTrust,
+} from './channel-trust.mjs'
 import { RELAY_PROTOCOL_VERSION } from './relay-protocol.mjs'
 
 function isActiveStatus(status) {
@@ -18,6 +26,13 @@ function isActiveStatus(status) {
 
 function isActiveTurnError(error) {
   return /(thread|turn).{0,50}(already has|active|in progress|running)/iu.test(error?.message ?? '')
+}
+
+function sandboxMode(policy) {
+  if (policy?.type === 'dangerFullAccess') return 'danger-full-access'
+  if (policy?.type === 'readOnly') return 'read-only'
+  if (policy?.type === 'workspaceWrite') return 'workspace-write'
+  return null
 }
 
 function finalText(turn, collectedItems) {
@@ -49,7 +64,7 @@ function conversationLabel(context) {
   return context.conversationKey || context.chatId || 'unknown'
 }
 
-function messageLine(job) {
+function messageLine(job, trust) {
   const context = job.payload?.telegramContext ?? {}
   const sender = senderLabel(context)
   const conversation = conversationLabel(context)
@@ -58,14 +73,15 @@ function messageLine(job) {
     || context.replyTo?.senderId
   const replyNote = replyTarget ? ` (replying to ${replyTarget})` : ''
   const messageId = context.messageId ?? 'unknown'
-  return `[TG][conversation_key=${conversation}][message_id=${messageId}][sender=${sender}]${replyNote}\n${job.payload?.text || '[no text]'}`
+  return `${externalFeedTag(trust)}\n[TG][conversation_key=${conversation}][message_id=${messageId}][sender=${sender}]${replyNote}\n${job.payload?.text || '[no text]'}`
 }
 
-function batchInput(jobs) {
+function batchInput(jobs, trust) {
   if (jobs.length === 1) {
-    return [{ type: 'text', text: messageLine(jobs[0]) }]
+    return [{ type: 'text', text: messageLine(jobs[0], trust) }]
   }
   const lines = [
+    externalFeedTag(trust),
     `[TG BATCH: ${jobs.length} messages received while the previous turn was busy]`,
     'Read them in order. You may answer once in text, or use responses to reply selectively to any listed message_id values.',
   ]
@@ -93,6 +109,7 @@ export class LocalSessionConnector extends EventEmitter {
   #heartbeatIntervalMs
   #approvalPolicy
   #sandboxPolicy
+  #ownerUserId
   #approvalTtlMs
   #clock
   #activeTurns = new Set()
@@ -115,6 +132,7 @@ export class LocalSessionConnector extends EventEmitter {
     heartbeatIntervalMs = 5_000,
     approvalPolicy = null,
     sandboxPolicy = null,
+    ownerUserId,
     approvalTtlMs = 10 * 60 * 1_000,
     clock = Date.now,
   }) {
@@ -128,6 +146,8 @@ export class LocalSessionConnector extends EventEmitter {
     this.#heartbeatIntervalMs = heartbeatIntervalMs
     this.#approvalPolicy = approvalPolicy
     this.#sandboxPolicy = sandboxPolicy
+    if (!ownerUserId) throw new Error('local connector owner user ID is required')
+    this.#ownerUserId = String(ownerUserId)
     this.#approvalTtlMs = approvalTtlMs
     this.#clock = clock
   }
@@ -157,6 +177,15 @@ export class LocalSessionConnector extends EventEmitter {
       .map(turn => turn.id))
   }
 
+  #resumeWithConfiguredPolicy() {
+    return this.#app.request('thread/resume', {
+      threadId: this.#threadId,
+      ...(this.#approvalPolicy ? { approvalPolicy: this.#approvalPolicy } : {}),
+      ...(this.#approvalPolicy && this.#approvalPolicy !== 'never' ? { approvalsReviewer: 'user' } : {}),
+      ...(sandboxMode(this.#sandboxPolicy) ? { sandbox: sandboxMode(this.#sandboxPolicy) } : {}),
+    })
+  }
+
   async #reconcileAvailability() {
     if (this.#currentJob) return
     const resumed = await this.#app.request('thread/resume', { threadId: this.#threadId })
@@ -180,7 +209,7 @@ export class LocalSessionConnector extends EventEmitter {
     this.#listen(this.#app, 'request', onApprovalRequest)
     this.#listen(this.#relay, 'frame', onRelayFrame)
 
-    const resumed = await this.#app.request('thread/resume', { threadId: this.#threadId })
+    const resumed = await this.#resumeWithConfiguredPolicy()
     if (resumed?.thread?.id !== this.#threadId) throw new Error('Codex app-server resumed a different thread')
     this.#replaceActiveTurns(resumed.thread)
     await this.#relay.connect({
@@ -268,7 +297,10 @@ export class LocalSessionConnector extends EventEmitter {
           result: { action: 'skip', reason: 'mixed_source_turn' },
         }))
       } else {
-        const output = parseTelegramStructuredOutput(finalText(turn, items))
+        const output = guardTelegramOutput(
+          parseTelegramStructuredOutput(finalText(turn, items)),
+          this.#currentJob.trust,
+        )
         this.#send(this.#resultFrame('job_result', {
           turnId: turn.id,
           result: output.skipped
@@ -313,6 +345,10 @@ export class LocalSessionConnector extends EventEmitter {
     if (!SUPPORTED_APPROVAL_METHODS.has(request.method)) return
     const params = request.params ?? {}
     if (params.threadId !== this.#threadId || !params.turnId) return
+    if (this.#currentJob?.turnId === params.turnId && !isOwnerDmTrust(this.#currentJob.trust)) {
+      this.#app.respond(request.id, approvalResponse(request.method, params, false))
+      return
+    }
     const approvalId = this.#approvalId(request)
     this.#pendingApprovals.set(approvalId, { request })
     this.#send({
@@ -360,7 +396,9 @@ export class LocalSessionConnector extends EventEmitter {
     if (frame.type === 'error') throw new Error(`VPS relay error: ${frame.message}`)
     if (frame.type === 'job_recorded') {
       if (!this.#recordedMatches(frame)) return
+      const restorePermissions = !isOwnerDmTrust(this.#currentJob.trust)
       this.#currentJob = null
+      if (restorePermissions) await this.#resumeWithConfiguredPolicy()
       this.#send({ type: 'heartbeat', acceptingJobs: this.#available() })
       return
     }
@@ -378,6 +416,7 @@ export class LocalSessionConnector extends EventEmitter {
     const clientUserMessageId = inbound.mode === 'legacy' ? inbound.jobs[0].jobId : inbound.batchId
     this.#currentJob = {
       ...inbound,
+      trust: classifyTelegramJobs(inbound.jobs, this.#ownerUserId),
       turnId: null,
       awaitingRecord: false,
       clientUserMessageId,
@@ -385,10 +424,11 @@ export class LocalSessionConnector extends EventEmitter {
     }
     this.#send({ type: 'heartbeat', acceptingJobs: false })
     try {
+      const trustedOwnerDm = isOwnerDmTrust(this.#currentJob.trust)
       const telegramMessages = inbound.jobs.map(job => job.payload?.telegramContext ?? {})
       const response = await this.#app.request('turn/start', {
         threadId: this.#threadId,
-        input: batchInput(inbound.jobs),
+        input: batchInput(inbound.jobs, this.#currentJob.trust),
         clientUserMessageId,
         additionalContext: {
           telegram: {
@@ -403,12 +443,20 @@ export class LocalSessionConnector extends EventEmitter {
           },
           telegram_source: {
             kind: 'application',
-            value: '[TG] This turn originated from Telegram. Turns without this marker originate from the terminal or another local client.',
+            value: `${externalFeedTag(this.#currentJob.trust)} This turn originated from Telegram. Turns without this marker originate from the terminal or another local client.`,
+          },
+          telegram_trust_policy: {
+            kind: 'application',
+            value: TELEGRAM_TRUST_POLICIES[this.#currentJob.trust],
           },
           telegram_output_contract: { kind: 'application', value: TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS },
         },
-        ...(this.#approvalPolicy ? { approvalPolicy: this.#approvalPolicy } : {}),
-        ...(this.#sandboxPolicy ? { sandboxPolicy: this.#sandboxPolicy } : {}),
+        ...(trustedOwnerDm
+          ? (this.#approvalPolicy ? { approvalPolicy: this.#approvalPolicy } : {})
+          : { approvalPolicy: 'never' }),
+        ...(trustedOwnerDm
+          ? (this.#sandboxPolicy ? { sandboxPolicy: this.#sandboxPolicy } : {})
+          : { sandboxPolicy: { type: 'readOnly', networkAccess: false } }),
       })
       const turnId = response?.turn?.id
       if (!turnId) throw new Error('Codex turn/start returned no turn ID')

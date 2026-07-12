@@ -236,6 +236,7 @@ export function loadLocalConnectorConfig(env = process.env) {
     'workspace-write',
   )
   const config = {
+    ownerUserId: parseId(env.TELEGRAM_OWNER_USER_ID, 'TELEGRAM_OWNER_USER_ID', true),
     sessionLabel: parseSessionLabel(env.BRIDGE_SESSION_LABEL),
     codexSessionId: requireSimpleValue(env.CODEX_SESSION_ID, 'CODEX_SESSION_ID'),
     threadId: requireSimpleValue(env.CODEX_THREAD_ID ?? env.CODEX_SESSION_ID, 'CODEX_THREAD_ID'),

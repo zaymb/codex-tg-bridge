@@ -69,6 +69,7 @@ export async function main(env = process.env) {
     heartbeatIntervalMs: config.heartbeatIntervalMs,
     approvalPolicy: config.approvalPolicy,
     sandboxPolicy: config.sandboxPolicy,
+    ownerUserId: config.ownerUserId,
   })
   const controller = new AbortController()
   const shutdown = () => controller.abort()

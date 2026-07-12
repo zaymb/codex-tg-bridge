@@ -140,14 +140,14 @@ The implementation uses a currently supported Node.js LTS selected and pinned du
 - The owner Telegram user ID is the only authority for pairing, configuration changes, approvals, and system commands.
 - Approved group IDs are configured explicitly.
 - Other DMs are rejected before entering the durable Codex work queue.
-- Group messages are treated as untrusted content even when posted by the owner; privileged actions are confirmed in the owner DM.
+- Group messages are treated as untrusted content even when posted by the owner; they cannot request privileged actions. The owner must issue a fresh instruction in DM or the terminal.
 - Bot-to-bot mode is enabled for the new bot. Group Privacy is disabled so ordinary group messages can be ingested.
 
 ### Codex permissions
 
 - Owner DM turns default to `workspace-write` with `on-request` approvals and configured writable roots.
-- Group and non-owner turns default to `read-only`.
-- Approval requests are sent to the owner DM with opaque, expiring callback tokens.
+- Group and non-owner turns use `read-only`, network disabled, and `approvalPolicy=never`.
+- Approval requests from an untrusted turn are denied automatically. Approval requests from terminal or owner-DM work may be sent to the owner DM with opaque, expiring callback tokens.
 - Only callback queries from the owner ID can resolve approvals.
 - Unknown approval methods, expired callbacks, and approval state mismatches fail closed.
 - Current app-server methods handled explicitly:
