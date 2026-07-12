@@ -47,7 +47,7 @@ async function fixture() {
   return { dir, socketPath, state, dispatcher, attachmentStore, server, client }
 }
 
-test('sends, replies, edits, deletes, and reacts only in an approved aliased chat', async t => {
+test('sends, replies, edits, deletes, reacts, and rolls dice only in an approved aliased chat', async t => {
   const setup = await fixture()
   t.after(() => setup.client.close())
   t.after(() => setup.server.close())
@@ -58,13 +58,20 @@ test('sends, replies, edits, deletes, and reacts only in an approved aliased cha
   await setup.client.request('edit_own_message', { target: 'sandbox-topic', messageId: '56', text: 'edit' }, { actionId: 'action-3' })
   await setup.client.request('delete_own_message', { target: 'sandbox-topic', messageId: '56' }, { actionId: 'action-4' })
   await setup.client.request('react', { target: 'sandbox-topic', messageId: '55', reaction: { type: 'emoji', emoji: '👍' } }, { actionId: 'action-5' })
+  await setup.client.request('send_dice', { target: 'sandbox-topic', messageId: '55', emoji: '🎯' }, { actionId: 'action-6' })
 
   assert.deepEqual(setup.dispatcher.actions.map(action => action.actionType), [
-    'send_text', 'reply', 'edit_own_message', 'delete_own_message', 'react',
+    'send_text', 'reply', 'edit_own_message', 'delete_own_message', 'react', 'send_dice',
   ])
   assert.ok(setup.dispatcher.actions.every(action => action.conversationKey === '-100123:7'))
   assert.ok(setup.dispatcher.actions.every(action => action.payload.chatId === '-100123'))
   assert.ok(setup.dispatcher.actions.every(action => action.payload.threadId === '7'))
+  assert.deepEqual(setup.dispatcher.actions.at(-1).payload, {
+    chatId: '-100123',
+    threadId: '7',
+    emoji: '🎯',
+    replyToMessageId: '55',
+  })
 })
 
 test('rejects arbitrary chat IDs and invalid action IDs', async t => {

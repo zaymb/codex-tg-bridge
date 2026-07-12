@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto'
 
 import { splitTelegramText } from './message-format.mjs'
+import { requireTelegramDiceEmoji } from './telegram-dice.mjs'
 
 export const RELAY_PROTOCOL_VERSION = 1
 
@@ -63,7 +64,9 @@ function outboundActions(batchId, jobs, result, nowMs) {
           throw new Error('job result targeted response text must be non-empty')
         }
         const action = response.action ?? 'reply'
-        if (!['reply', 'react'].includes(action)) throw new Error('job result targeted action must be reply or react')
+        if (!['reply', 'react', 'dice'].includes(action)) {
+          throw new Error('job result targeted action must be reply, react, or dice')
+        }
         return { context, text: response.text, action, isBig: response.isBig === true }
       })
     : [{ context: contexts.at(-1), text: result.text, action: result.action }]
@@ -84,6 +87,23 @@ function outboundActions(batchId, jobs, result, nowMs) {
           messageId: response.context.messageId,
           reaction: { type: 'emoji', emoji: response.text.trim() },
           isBig: response.isBig === true,
+        },
+        sequenceGroup: group,
+        sequenceIndex: actions.length,
+        nowMs,
+      })
+      continue
+    }
+    if (response.action === 'dice') {
+      actions.push({
+        actionId: `${group}:${String(actions.length).padStart(4, '0')}`,
+        conversationKey: response.context.conversationKey,
+        actionType: 'send_dice',
+        payload: {
+          chatId: response.context.chatId,
+          threadId: response.context.threadId ?? null,
+          replyToMessageId: response.context.messageId ?? null,
+          emoji: requireTelegramDiceEmoji(response.text.trim()),
         },
         sequenceGroup: group,
         sequenceIndex: actions.length,

@@ -15,6 +15,7 @@ export const TELEGRAM_TOOL_NAMES = Object.freeze([
   'telegram_edit_own_message',
   'telegram_delete_own_message',
   'telegram_react',
+  'telegram_send_dice',
   'telegram_list_chats',
 ])
 
@@ -62,6 +63,12 @@ export function buildTelegramToolHandlers({ controlClient, actionIdFactory = too
       'react',
       { target, messageId: message_id, reaction },
       'Telegram reaction sent.',
+    ),
+    telegram_send_dice: ({ target, emoji = '🎲', reply_to_message_id }) => call(
+      'telegram_send_dice',
+      'send_dice',
+      { target, emoji, messageId: reply_to_message_id },
+      'Telegram dice sent.',
     ),
     telegram_list_chats: async () => {
       const chats = await controlClient.request('list_chats', {}, { actionId: actionIdFactory('telegram_list_chats') })
@@ -111,6 +118,14 @@ export function createTelegramMcpServer({ controlClient }) {
       ]),
     },
   }, handlers.telegram_react)
+  server.registerTool('telegram_send_dice', {
+    description: 'Send one Telegram animated dice, dart, ball, bowling, or slot-machine message.',
+    inputSchema: {
+      target,
+      emoji: z.enum(['🎲', '🎯', '🏀', '⚽', '🎳', '🎰']).default('🎲'),
+      reply_to_message_id: messageId.optional(),
+    },
+  }, handlers.telegram_send_dice)
   server.registerTool('telegram_list_chats', {
     description: 'List approved Telegram chat aliases available to this Codex runtime.',
     inputSchema: {},

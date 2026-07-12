@@ -82,6 +82,21 @@ test('queues an approved Telegram update as a durable 24-hour relay job', async 
   })
 })
 
+test('delivers Telegram dice results as legible relay text', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  const raw = rawMessage(6)
+  delete raw.message.text
+  raw.message.dice = { emoji: '🎲', value: 5 }
+  const row = storeAndClaim(setup.state, raw)
+
+  assert.deepEqual(await setup.dispatcher.processClaimedUpdate(row), {
+    status: 'completed',
+    action: 'queued',
+  })
+  assert.equal(setup.state.getRelayJob('telegram:6').payload.text, 'Telegram dice result: 🎲 = 5.')
+})
+
 test('includes the replied-to message and actor identity in the relay job', async t => {
   const setup = fixture()
   t.after(() => setup.state.close())

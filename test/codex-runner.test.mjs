@@ -67,6 +67,9 @@ test('parses optional targeted Telegram responses without losing legacy text out
     action: 'send', text: 'legacy reply', reason: 'compatibility',
   })).responses, [])
   assert.equal(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.responses.maxItems, 32)
+  assert.deepEqual(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.responses.items.properties.action.enum, [
+    'send', 'react', 'dice',
+  ])
   assert.deepEqual(TELEGRAM_BATCH_OUTPUT_SCHEMA.required, ['action', 'text', 'responses', 'reason'])
   assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
     action: 'react', text: '🗿', responses: [], reason: 'acknowledge',
@@ -77,6 +80,12 @@ test('parses optional targeted Telegram responses without losing legacy text out
     responses: [],
     reason: 'acknowledge',
   })
+  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+    action: 'send',
+    text: '',
+    responses: [{ messageId: '30', action: 'dice', text: '🎲' }],
+    reason: 'let Telegram roll',
+  })).responses, [{ messageId: '30', action: 'dice', text: '🎲' }])
 })
 
 test('fails closed instead of leaking a structured envelope with trailing garbage', () => {

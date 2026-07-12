@@ -29,6 +29,7 @@ export class OutboundDrain {
   async #execute(action) {
     if (action.actionType === 'reply') return this.#telegram.reply(action.payload)
     if (action.actionType === 'send_text') return this.#telegram.sendText(action.payload)
+    if (action.actionType === 'send_dice') return this.#telegram.sendDice(action.payload)
     if (action.actionType === 'edit_own_message') return this.#telegram.editOwnMessage(action.payload)
     if (action.actionType === 'delete_own_message') return this.#telegram.deleteOwnMessage(action.payload)
     if (action.actionType === 'react') return this.#telegram.react(action.payload)

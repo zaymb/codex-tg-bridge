@@ -27,8 +27,9 @@ export const TELEGRAM_BATCH_OUTPUT_SCHEMA = Object.freeze({
         required: ['messageId', 'action', 'text'],
         properties: {
           messageId: { type: 'string', pattern: '^\\d+$' },
-          action: { type: 'string', enum: ['send', 'react'] },
+          action: { type: 'string', enum: ['send', 'react', 'dice'] },
           text: { type: 'string', minLength: 1 },
+          isBig: { type: 'boolean' },
         },
       },
     },
@@ -49,7 +50,8 @@ export const TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS = [
   'For [TG] input, return one JSON object with exactly action, text, responses, and reason.',
   'Use action=send and put one Telegram-ready answer in text.',
   'Use action=react and put exactly one Telegram reaction emoji in text when a reaction to the latest message is better than a written reply.',
-  'For an inbound batch, you may instead set text to an empty string and use responses to respond selectively to one or more listed messageId values; each response action is send or react, and omitted messages receive nothing.',
+  'For an inbound batch, you may instead set text to an empty string and use responses to respond selectively to one or more listed messageId values; each response action is send, react, or dice, and omitted messages receive nothing.',
+  'Use a targeted response with action=dice and text set to exactly one of 🎲 🎯 🏀 ⚽ 🎳 🎰 to send Telegram animated dice.',
   'Always include responses; use an empty array when no targeted responses are needed.',
   'Use action=skip only when no Telegram response should be sent, with a concise reason.',
   'If a later user input is unmarked, it came from the terminal: answer it normally in plain text without the Telegram JSON envelope.',
@@ -140,7 +142,7 @@ export function parseTelegramStructuredOutput(text) {
         responses: Array.isArray(parsed.responses)
           ? parsed.responses.map(response => ({
               ...response,
-              action: response?.action === 'react' ? 'react' : 'reply',
+              action: ['react', 'dice'].includes(response?.action) ? response.action : 'reply',
             }))
           : [],
         reason: String(parsed.reason ?? ''),

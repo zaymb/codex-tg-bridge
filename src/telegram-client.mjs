@@ -1,4 +1,5 @@
 import { redact, redactError } from './redact.mjs'
+import { requireTelegramDiceEmoji } from './telegram-dice.mjs'
 
 export const ALLOWED_UPDATES = Object.freeze([
   'message',
@@ -153,6 +154,17 @@ export class TelegramClient {
       message_thread_id: threadId === null ? null : String(threadId),
       reply_parameters: { message_id: String(messageId) },
       reply_markup: replyMarkup,
+    }, { ambiguousOnTransport: true })
+  }
+
+  sendDice({ chatId, emoji = '🎲', threadId = null, replyToMessageId = null }) {
+    return this.#request('sendDice', {
+      chat_id: String(chatId),
+      emoji: requireTelegramDiceEmoji(emoji),
+      message_thread_id: threadId === null ? null : String(threadId),
+      reply_parameters: replyToMessageId === null
+        ? null
+        : { message_id: String(replyToMessageId) },
     }, { ambiguousOnTransport: true })
   }
 

@@ -81,6 +81,22 @@ test('normalizes edited channel captions and the largest photo variant', () => {
   }])
 })
 
+test('normalizes Telegram animated dice results', () => {
+  const update = normalizeUpdate({
+    update_id: 109,
+    message: {
+      message_id: 61,
+      date: 1,
+      chat: { id: 42, type: 'private' },
+      from: { id: 42, is_bot: false, first_name: 'Alta' },
+      dice: { emoji: '🎲', value: 6 },
+    },
+  })
+
+  assert.deepEqual(update.message.dice, { emoji: '🎲', value: 6 })
+  assert.equal(update.message.text, null)
+})
+
 test('normalizes every downloadable Telegram attachment class', () => {
   const base = {
     update_id: 103,

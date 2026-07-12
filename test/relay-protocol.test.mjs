@@ -218,6 +218,42 @@ test('preserves the large-animation flag for a targeted reaction', async t => {
   assert.equal(action.payload.isBig, true)
 })
 
+test('records a targeted Telegram dice response with reply routing', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  enqueue(setup.state, '32', '42', 1_000, { messageId: '32' })
+  await hello(setup)
+  await setup.session.claimOnce()
+  const { batchId } = setup.frames.at(-1).batch
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_accepted',
+    batchId,
+    threadId: 'thread-a',
+    turnId: 'turn-a',
+  })
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_result',
+    batchId,
+    turnId: 'turn-a',
+    result: {
+      action: 'reply',
+      text: '',
+      responses: [{ messageId: '32', action: 'dice', text: '🎳' }],
+    },
+  })
+
+  const action = setup.state.getOutboundAction(`relay-batch:${batchId}:0000`)
+  assert.equal(action.actionType, 'send_dice')
+  assert.deepEqual(action.payload, {
+    chatId: '42',
+    threadId: null,
+    replyToMessageId: '32',
+    emoji: '🎳',
+  })
+})
+
 test('routes identical message IDs independently across a DM, group, and forum topic', async t => {
   const setup = fixture()
   t.after(() => setup.state.close())

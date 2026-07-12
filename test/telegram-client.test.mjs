@@ -72,6 +72,29 @@ test('sends text, reply, edit, delete, typing, and callback acknowledgement', as
   assert.equal(JSON.parse(calls[0].options.body).message_thread_id, '7')
 })
 
+test('sends Telegram animated dice with optional topic and reply routing', async () => {
+  const { client, calls } = clientWith(() => jsonResponse({
+    ok: true,
+    result: { message_id: 56, chat: { id: -100123 }, dice: { emoji: '🎰', value: 64 } },
+  }))
+
+  await client.sendDice({
+    chatId: '-100123',
+    emoji: '🎰',
+    threadId: '7',
+    replyToMessageId: '55',
+  })
+
+  assert.equal(calls[0].url.endsWith('/sendDice'), true)
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    chat_id: '-100123',
+    emoji: '🎰',
+    message_thread_id: '7',
+    reply_parameters: { message_id: '55' },
+  })
+  assert.throws(() => client.sendDice({ chatId: '-100123', emoji: '🐭' }), /dice emoji must be one of/)
+})
+
 test('classifies 409 as a duplicate poller and 429 with retry_after', async () => {
   const duplicate = clientWith(() => jsonResponse({
     ok: false,

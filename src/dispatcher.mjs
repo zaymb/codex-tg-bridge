@@ -68,6 +68,9 @@ function eventText(update) {
   if (update.message) {
     const text = update.message.text ?? update.message.caption ?? ''
     const prefix = update.type.startsWith('edited_') ? '[Telegram edited message]\n' : ''
+    if (update.message.dice) {
+      return `${prefix}Telegram dice result: ${update.message.dice.emoji} = ${update.message.dice.value}.`.trim()
+    }
     return `${prefix}${text}`.trim()
   }
   if (update.reaction) {

@@ -20,8 +20,9 @@ both split-host and same-host deployments.
 - A Telegram job is claimed only while the target Codex thread is idle. Local
   TUI turns take priority.
 - One queued batch can produce one reply or reaction, or multiple targeted
-  replies and reactions to selected messages from that batch. `reply`, `react`,
-  and `skip` are peer model outcomes; reactions do not require an MCP tool call.
+  replies, reactions, and animated dice to selected messages from that batch.
+  `reply`, `react`, and `skip` are peer model outcomes; reactions and dice do
+  not require an MCP tool call.
 - A pure Telegram batch uses a structured envelope whose `responses` field is
   always present; ordinary replies and skips use an empty array. The shared
   session does not force this with `response_format`, because a local TUI steer

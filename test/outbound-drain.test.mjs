@@ -24,6 +24,11 @@ class FakeTelegram {
     return { message_id: 902, chat: { id: payload.chatId } }
   }
 
+  async sendDice(payload) {
+    this.calls.push({ method: 'sendDice', payload })
+    return { message_id: 903, chat: { id: payload.chatId }, dice: { emoji: payload.emoji, value: 4 } }
+  }
+
   async react(payload) {
     this.calls.push({ method: 'react', payload })
     return true
@@ -100,6 +105,25 @@ test('captures a successful outbound bot reaction for side-channel consumers', a
     reaction: { type: 'emoji', emoji: '👍' },
     extendsCooldown: false,
   }])
+})
+
+test('sends and records a durable Telegram dice action', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  setup.state.createOutboundAction({
+    actionId: 'dice:1',
+    conversationKey: '-100123',
+    actionType: 'send_dice',
+    payload: { chatId: '-100123', emoji: '🎲', replyToMessageId: '55' },
+    nowMs: 1_000,
+  })
+
+  assert.equal(await setup.drain.drainOnce(), 1)
+  assert.deepEqual(setup.telegram.calls, [{
+    method: 'sendDice',
+    payload: { chatId: '-100123', emoji: '🎲', replyToMessageId: '55' },
+  }])
+  assert.equal(setup.state.getOutboundAction('dice:1').telegramMessageId, '903')
 })
 
 test('answers an approval callback through the durable outbox', async t => {

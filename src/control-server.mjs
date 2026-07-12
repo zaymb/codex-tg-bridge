@@ -1,6 +1,7 @@
 import { basename } from 'node:path'
 
 import { JsonLineSocketServer } from './json-line-socket.mjs'
+import { requireTelegramDiceEmoji } from './telegram-dice.mjs'
 
 const ACTION_ID = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$/u
 
@@ -92,6 +93,15 @@ export class ControlServer {
         ...base,
         messageId: requiredString(params.messageId, 'messageId', 32),
         reaction: params.reaction,
+      }
+    } else if (action === 'send_dice') {
+      actionType = 'send_dice'
+      payload = {
+        ...base,
+        emoji: requireTelegramDiceEmoji(params.emoji ?? '🎲'),
+        replyToMessageId: params.messageId === undefined
+          ? null
+          : requiredString(params.messageId, 'messageId', 32),
       }
     } else if (action === 'send_file') {
       const path = await this.#attachmentStore.assertExportPath(requiredString(params.path, 'path', 4096))

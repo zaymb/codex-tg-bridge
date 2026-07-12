@@ -159,6 +159,9 @@ function normalizeMessage(message) {
     entities: message.entities ?? message.caption_entities ?? [],
     replyTo: normalizeReply(message),
     quote: normalizeQuote(message.quote),
+    dice: message.dice
+      ? { emoji: message.dice.emoji, value: message.dice.value }
+      : null,
     attachments: normalizeAttachments(message),
     service: normalizeService(message),
   }
