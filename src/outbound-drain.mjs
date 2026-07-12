@@ -32,6 +32,7 @@ export class OutboundDrain {
     if (action.actionType === 'edit_own_message') return this.#telegram.editOwnMessage(action.payload)
     if (action.actionType === 'delete_own_message') return this.#telegram.deleteOwnMessage(action.payload)
     if (action.actionType === 'react') return this.#telegram.react(action.payload)
+    if (action.actionType === 'answer_callback_query') return this.#telegram.answerCallbackQuery(action.payload)
     if (action.actionType === 'send_file') {
       return this.#telegram.sendFile({
         ...action.payload,

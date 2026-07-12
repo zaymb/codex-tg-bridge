@@ -1,6 +1,12 @@
+import { createHash } from 'node:crypto'
+
 import { normalizeUpdate } from './update-normalizer.mjs'
 
 export const RELAY_JOB_TTL_MS = 86_400_000
+
+function hashToken(token) {
+  return createHash('sha256').update(token).digest('hex')
+}
 
 function eventText(update) {
   if (update.message) {
@@ -44,6 +50,7 @@ export class RelayDispatcher {
   #state
   #policy
   #sessionLabel
+  #ownerUserId
   #workerId
   #updateLeaseMs
   #clock
@@ -52,14 +59,17 @@ export class RelayDispatcher {
     stateStore,
     engagementPolicy,
     sessionLabel,
+    ownerUserId,
     workerId = `relay-dispatcher-${process.pid}`,
     updateLeaseMs = 120_000,
     clock = Date.now,
   }) {
     if (!sessionLabel) throw new Error('relay session label is required')
+    if (!ownerUserId) throw new Error('relay owner user ID is required')
     this.#state = stateStore
     this.#policy = engagementPolicy
     this.#sessionLabel = sessionLabel
+    this.#ownerUserId = String(ownerUserId)
     this.#workerId = workerId
     this.#updateLeaseMs = updateLeaseMs
     this.#clock = clock
@@ -131,10 +141,64 @@ export class RelayDispatcher {
     return true
   }
 
+  #queueCallbackAnswer(update, row, text, showAlert = false) {
+    this.#state.createOutboundAction({
+      actionId: `relay-callback:${row.updateId}`,
+      conversationKey: this.#ownerUserId,
+      actionType: 'answer_callback_query',
+      payload: {
+        callbackQueryId: update.callback.id,
+        text,
+        showAlert,
+      },
+      nowMs: this.#clock(),
+    })
+  }
+
+  #handleRelayApprovalCallback(update, row) {
+    const data = update.callback?.data ?? ''
+    const match = data.match(/^ra:([A-Za-z0-9_-]{8,48}):(approve|deny)$/u)
+    if (!match) return null
+    if (
+      update.actor?.id !== this.#ownerUserId
+      || update.chat?.type !== 'private'
+      || update.chat?.id !== this.#ownerUserId
+    ) {
+      this.#queueCallbackAnswer(update, row, 'Not authorized', true)
+      return { status: 'completed', action: 'approval_rejected', reason: 'not_authorized' }
+    }
+    const decision = match[2] === 'approve' ? 'approved' : 'denied'
+    const resolution = this.#state.resolveRelayApproval({
+      tokenHash: hashToken(match[1]),
+      ownerUserId: this.#ownerUserId,
+      decision,
+      nowMs: this.#clock(),
+    })
+    if (!resolution.resolved) {
+      const text = resolution.reason === 'expired' ? 'Approval expired' : 'Approval is no longer active'
+      this.#queueCallbackAnswer(update, row, text, true)
+      return { status: 'completed', action: 'approval_inactive', reason: resolution.reason }
+    }
+    this.#queueCallbackAnswer(update, row, decision === 'approved' ? 'Approved' : 'Denied')
+    return { status: 'completed', action: decision }
+  }
+
   async processClaimedUpdate(row) {
     try {
       const update = normalizeUpdate(row.raw)
-      const decision = this.#policy.evaluate(update)
+      if (update.type === 'callback_query') {
+        const approval = this.#handleRelayApprovalCallback(update, row)
+        if (approval) {
+          this.#state.completeUpdate({ updateId: row.updateId, workerId: this.#workerId, nowMs: this.#clock() })
+          return approval
+        }
+      }
+      let knownBotMessage = null
+      if (update.reaction) {
+        knownBotMessage = this.#state.findSentOutboundMessage(update.chat.id, update.reaction.messageId)
+        if (knownBotMessage) update.conversationKey = knownBotMessage.conversationKey
+      }
+      const decision = this.#policy.evaluate(update, { isKnownBotMessage: Boolean(knownBotMessage) })
       if (decision.action !== 'turn') {
         this.#state.completeUpdate({ updateId: row.updateId, workerId: this.#workerId, nowMs: this.#clock() })
         return { status: 'completed', action: decision.action, reason: decision.reason }

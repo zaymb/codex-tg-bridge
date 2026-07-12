@@ -49,10 +49,11 @@ function isOwnerCallback(update, ownerUserId) {
 function hasEquivalentSentAction(state, turn, conversationKey) {
   return (turn.sentActionIds ?? []).some(actionId => {
     const action = state.getOutboundAction(actionId)
-    return action?.status === 'sent'
-      && ['send_text', 'reply'].includes(action.actionType)
-      && action.conversationKey === conversationKey
-      && action.payload?.text === turn.finalText
+    if (action?.status !== 'sent' || action.conversationKey !== conversationKey) return false
+    if (turn.action === 'react') {
+      return action.actionType === 'react' && action.payload?.reaction?.emoji === turn.finalText
+    }
+    return ['send_text', 'reply'].includes(action.actionType) && action.payload?.text === turn.finalText
   })
 }
 
@@ -312,7 +313,9 @@ export class Dispatcher {
         await this.#sendContextBreakNotice(update, row.updateId, turn.replacedThreadId)
       }
       const equivalentSent = hasEquivalentSentAction(this.#state, turn, update.conversationKey)
-      if (!turn.skipped && turn.finalText && !equivalentSent) {
+      if (!turn.skipped && turn.action === 'react' && turn.finalText && !equivalentSent) {
+        await this.#queueReaction(update, row.updateId, turn.finalText)
+      } else if (!turn.skipped && turn.finalText && !equivalentSent) {
         await this.#queueFinalAnswer(update, row.updateId, turn.finalText)
       }
 
@@ -405,6 +408,27 @@ export class Dispatcher {
       const status = await this.#sendOutboundAction(actionId)
       if (status !== 'sent') break
     }
+  }
+
+  async #queueReaction(update, updateId, emoji) {
+    const messageId = messageIdForReply(update)
+    if (!messageId) throw new Error('Telegram reaction requires a message target')
+    const actionId = `reaction:update:${updateId}`
+    this.#state.createOutboundAction({
+      actionId,
+      conversationKey: update.conversationKey,
+      actionType: 'react',
+      payload: {
+        chatId: update.chat.id,
+        messageId,
+        reaction: { type: 'emoji', emoji: emoji.trim() },
+        isBig: false,
+      },
+      sequenceGroup: actionId,
+      sequenceIndex: 0,
+      nowMs: this.#clock(),
+    })
+    await this.#sendOutboundAction(actionId)
   }
 
   async #executeOutbound(action) {

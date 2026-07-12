@@ -19,8 +19,9 @@ both split-host and same-host deployments.
   controlling terminal. Only the Codex TUI inherits terminal stdio.
 - A Telegram job is claimed only while the target Codex thread is idle. Local
   TUI turns take priority.
-- One queued batch can produce one compatibility reply or multiple targeted
-  replies to selected messages from that batch.
+- One queued batch can produce one reply or reaction, or multiple targeted
+  replies and reactions to selected messages from that batch. `reply`, `react`,
+  and `skip` are peer model outcomes; reactions do not require an MCP tool call.
 - A pure Telegram batch uses a structured envelope whose `responses` field is
   always present; ordinary replies and skips use an empty array. The shared
   session does not force this with `response_format`, because a local TUI steer
@@ -35,6 +36,15 @@ both split-host and same-host deployments.
   joins a Telegram-owned turn, the connector fails closed and does not send the
   mixed final answer to Telegram.
 - Jobs older than 24 hours expire silently before acceptance.
+- Human reactions to known bot messages are requested explicitly through
+  `allowed_updates`, restored to the message's original forum topic, and
+  delivered as normal `[TG]` events. Telegram does not publish bot-authored
+  reaction updates.
+- App-server approval requests for the shared thread are relayed only to the
+  configured owner's private chat. Inline Approve/Deny callbacks are one-use,
+  expire after ten minutes, and return to the same app-server request without
+  becoming model input. This also covers terminal-originated turns because the
+  connector subscribes to the same app-server thread as the TUI.
 
 When the local connector is absent, each Telegram conversation receives this
 notice once per offline epoch:
@@ -143,6 +153,8 @@ For owner DM, no group configuration is needed. Before group acceptance:
 - Final relay result and outbound actions commit in one SQLite transaction.
 - Successful bot reactions are captured in a durable, idempotent event outbox
   for side-channel consumers and never extend engagement cooldown.
-- Attachments, Telegram action tools, remote approvals, and `/stop` are later
-  delivery phases. The current deployed path is text plus structured
-  `REPLY/SKIP`.
+- Approval callbacks are authorized only in the configured owner's DM and fail
+  closed when expired, cancelled, or detached from the active Codex session.
+- The current structured model path is `SEND/REACT/SKIP`; Telegram action tools,
+  attachments, `/stop`, and durable remote approvals use the same outbox and
+  routing boundaries.

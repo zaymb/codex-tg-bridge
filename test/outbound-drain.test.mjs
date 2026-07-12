@@ -28,6 +28,11 @@ class FakeTelegram {
     this.calls.push({ method: 'react', payload })
     return true
   }
+
+  async answerCallbackQuery(payload) {
+    this.calls.push({ method: 'answerCallbackQuery', payload })
+    return true
+  }
 }
 
 function fixture() {
@@ -94,6 +99,24 @@ test('captures a successful outbound bot reaction for side-channel consumers', a
     messageId: '55',
     reaction: { type: 'emoji', emoji: '👍' },
     extendsCooldown: false,
+  }])
+})
+
+test('answers an approval callback through the durable outbox', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  setup.state.createOutboundAction({
+    actionId: 'callback:1',
+    conversationKey: '42',
+    actionType: 'answer_callback_query',
+    payload: { callbackQueryId: 'callback-1', text: 'Approved', showAlert: false },
+    nowMs: 1_000,
+  })
+
+  assert.equal(await setup.drain.drainOnce(), 1)
+  assert.deepEqual(setup.telegram.calls, [{
+    method: 'answerCallbackQuery',
+    payload: { callbackQueryId: 'callback-1', text: 'Approved', showAlert: false },
   }])
 })
 

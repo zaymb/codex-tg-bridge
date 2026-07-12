@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import test from 'node:test'
 
 import { EngagementPolicy } from '../src/engagement-policy.mjs'
@@ -33,6 +34,7 @@ function fixture() {
     stateStore: state,
     engagementPolicy: policy(),
     sessionLabel: 'tg-engage',
+    ownerUserId: '42',
     workerId: 'relay-test',
     updateLeaseMs: 10_000,
     clock: () => now,
@@ -207,4 +209,88 @@ test('expires from durable Telegram receipt time, including the exact 24-hour bo
     limit: 10,
     nowMs: 1_000 + RELAY_JOB_TTL_MS,
   }).length, 0)
+})
+
+test('queues a human reaction to a known bot message in its original topic', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  setup.state.createOutboundAction({
+    actionId: 'answer:topic',
+    conversationKey: '-100123:7',
+    actionType: 'reply',
+    payload: { text: 'answer' },
+    nowMs: 100,
+  })
+  setup.state.markOutboundSending('answer:topic', 101)
+  setup.state.markOutboundSent('answer:topic', {
+    telegramChatId: '-100123',
+    telegramMessageId: '55',
+  }, 102)
+  const raw = {
+    update_id: 8,
+    message_reaction: {
+      chat: { id: -100123, type: 'supergroup', title: 'Sandbox' },
+      message_id: 55,
+      user: { id: 42, is_bot: false, first_name: 'Owner' },
+      date: 1,
+      old_reaction: [],
+      new_reaction: [{ type: 'emoji', emoji: '👍' }],
+    },
+  }
+  const row = storeAndClaim(setup.state, raw)
+
+  assert.deepEqual(await setup.dispatcher.processClaimedUpdate(row), {
+    status: 'completed',
+    action: 'queued',
+  })
+  const job = setup.state.getRelayJob('telegram:8')
+  assert.equal(job.conversationKey, '-100123:7')
+  assert.match(job.payload.text, /Added: 👍/u)
+  assert.equal(job.payload.telegramContext.threadId, '7')
+  assert.equal(job.payload.telegramContext.senderId, '42')
+})
+
+test('resolves a relay approval callback without starting a Codex turn', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  const token = 'approval_callback_token'
+  setup.state.createRelayApproval({
+    approvalId: 'approval-12345678',
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-a',
+    codexSessionId: 'thread-a',
+    method: 'item/commandExecution/requestApproval',
+    threadId: 'thread-a',
+    turnId: 'turn-local',
+    ownerUserId: '42',
+    detail: 'Command: git push',
+    callbackToken: token,
+    tokenHash: createHash('sha256').update(token).digest('hex'),
+    expiresAtMs: 11_000,
+    nowMs: 1_000,
+  })
+  const raw = {
+    update_id: 9,
+    callback_query: {
+      id: 'callback-9',
+      from: { id: 42, is_bot: false, first_name: 'Owner' },
+      data: `ra:${token}:approve`,
+      message: {
+        message_id: 90,
+        date: 1,
+        chat: { id: 42, type: 'private' },
+      },
+    },
+  }
+  const row = storeAndClaim(setup.state, raw)
+
+  assert.deepEqual(await setup.dispatcher.processClaimedUpdate(row), {
+    status: 'completed',
+    action: 'approved',
+  })
+  assert.equal(setup.state.getRelayApproval('approval-12345678').state, 'approved')
+  assert.equal(setup.state.getRelayJob('telegram:9'), null)
+  const answer = setup.state.getOutboundAction('relay-callback:9')
+  assert.equal(answer.actionType, 'answer_callback_query')
+  assert.equal(answer.payload.callbackQueryId, 'callback-9')
 })

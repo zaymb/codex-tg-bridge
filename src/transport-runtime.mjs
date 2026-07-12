@@ -27,6 +27,7 @@ export async function createTransportRuntime({
   let closed = false
   try {
     seedApprovedChats(stateStore, config)
+    stateStore.setSetting('telegram_owner_user_id', config.ownerUserId)
     stateStore.ensureRelaySession(config.sessionLabel)
     stateStore.expireRelayJobs()
     stateStore.recoverInterruptedOutboundActions()
@@ -55,6 +56,7 @@ export async function createTransportRuntime({
       stateStore,
       engagementPolicy,
       sessionLabel: config.sessionLabel,
+      ownerUserId: config.ownerUserId,
       updateLeaseMs: config.updateLeaseMs,
     })
     const outbound = new OutboundDrain({ stateStore, telegramClient, botIdentity: bot })

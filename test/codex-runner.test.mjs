@@ -57,9 +57,10 @@ test('parses optional targeted Telegram responses without losing legacy text out
     skipped: false,
     finalText: '',
     responses: [
-      { messageId: '10', text: 'answer the first' },
-      { messageId: '20', text: 'answer the second' },
+      { messageId: '10', action: 'reply', text: 'answer the first' },
+      { messageId: '20', action: 'reply', text: 'answer the second' },
     ],
+    action: 'send',
     reason: 'selective batch reply',
   })
   assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
@@ -67,6 +68,15 @@ test('parses optional targeted Telegram responses without losing legacy text out
   })).responses, [])
   assert.equal(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.responses.maxItems, 32)
   assert.deepEqual(TELEGRAM_BATCH_OUTPUT_SCHEMA.required, ['action', 'text', 'responses', 'reason'])
+  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+    action: 'react', text: '🗿', responses: [], reason: 'acknowledge',
+  })), {
+    action: 'react',
+    skipped: false,
+    finalText: '🗿',
+    responses: [],
+    reason: 'acknowledge',
+  })
 })
 
 test('starts and persists an owner-DM thread, then returns only structured final output', async t => {
@@ -116,7 +126,7 @@ test('starts and persists an owner-DM thread, then returns only structured final
     networkAccess: false,
   })
   assert.equal(turnParams.approvalPolicy, 'on-request')
-  assert.equal(turnParams.outputSchema.properties.action.enum.join(','), 'send,skip')
+  assert.equal(turnParams.outputSchema.properties.action.enum.join(','), 'send,react,skip')
   assert.equal(turnParams.input[0].text, 'Please inspect the project')
 })
 

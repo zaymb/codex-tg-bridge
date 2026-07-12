@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 
-const SUPPORTED_METHODS = new Set([
+export const SUPPORTED_APPROVAL_METHODS = new Set([
   'item/commandExecution/requestApproval',
   'item/fileChange/requestApproval',
   'item/permissions/requestApproval',
@@ -10,7 +10,7 @@ function hashToken(token) {
   return createHash('sha256').update(token).digest('hex')
 }
 
-function responseFor(method, params, approved) {
+export function approvalResponse(method, params, approved) {
   if (method === 'item/permissions/requestApproval') {
     return {
       permissions: approved ? params.permissions ?? {} : {},
@@ -20,7 +20,7 @@ function responseFor(method, params, approved) {
   return { decision: approved ? 'accept' : 'decline' }
 }
 
-function detailFor(method, params) {
+export function approvalDetail(method, params) {
   if (method === 'item/commandExecution/requestApproval') {
     const network = params.networkApprovalContext
       ? `Network: ${params.networkApprovalContext.protocol ?? '?'}://${params.networkApprovalContext.host ?? '?'}`
@@ -100,7 +100,7 @@ export class ApprovalRouter {
   }
 
   async handleServerRequest(request) {
-    if (!SUPPORTED_METHODS.has(request.method)) {
+    if (!SUPPORTED_APPROVAL_METHODS.has(request.method)) {
       this.#client.respond(request.id, null, {
         code: -32601,
         message: `Unsupported app-server request: ${request.method}`,
@@ -113,7 +113,7 @@ export class ApprovalRouter {
       ? this.#state.getConversationByThreadId(params.threadId)
       : null
     if (!conversation || !params.turnId) {
-      this.#client.respond(request.id, responseFor(request.method, params, false))
+      this.#client.respond(request.id, approvalResponse(request.method, params, false))
       return false
     }
 
@@ -121,7 +121,7 @@ export class ApprovalRouter {
     if (!/^[A-Za-z0-9_-]{8,48}$/u.test(token)) throw new Error('approval token factory returned an invalid token')
     const tokenHash = hashToken(token)
     const nowMs = this.#clock()
-    const responseOnDeny = responseFor(request.method, params, false)
+    const responseOnDeny = approvalResponse(request.method, params, false)
     this.#state.createApproval({
       tokenHash,
       requestId: `${this.#connectionId}:${request.id}`,
@@ -141,7 +141,7 @@ export class ApprovalRouter {
     try {
       await this.#telegram.sendText({
         chatId: this.#ownerUserId,
-        text: `${detailFor(request.method, params).slice(0, 3000)}\n\nConversation: ${conversation.conversationKey}`,
+        text: `${approvalDetail(request.method, params).slice(0, 3000)}\n\nConversation: ${conversation.conversationKey}`,
         replyMarkup: {
           inline_keyboard: [[
             { text: 'Approve', callback_data: approveData },
@@ -196,7 +196,7 @@ export class ApprovalRouter {
     const { request, conversationKey } = pending
     const params = request.params ?? {}
     const approved = match[2] === 'approve'
-    const denialResponse = responseFor(request.method, params, false)
+    const denialResponse = approvalResponse(request.method, params, false)
     const conversation = this.#state.getConversation(conversationKey)
     if (
       !conversation
@@ -216,7 +216,7 @@ export class ApprovalRouter {
       return false
     }
 
-    const appServerResponse = responseFor(request.method, params, approved)
+    const appServerResponse = approvalResponse(request.method, params, approved)
     const resolution = this.#state.resolveApproval({
       tokenHash,
       ownerUserId: this.#ownerUserId,
@@ -247,7 +247,7 @@ export class ApprovalRouter {
     for (const [tokenHash, pending] of [...this.#pending]) {
       const approval = this.#state.getApproval(tokenHash)
       if (!approval || approval.state !== 'pending' || approval.expiresAtMs > nowMs) continue
-      const denialResponse = responseFor(pending.request.method, pending.request.params ?? {}, false)
+      const denialResponse = approvalResponse(pending.request.method, pending.request.params ?? {}, false)
       this.#state.resolveApproval({
         tokenHash,
         ownerUserId: this.#ownerUserId,

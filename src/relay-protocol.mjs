@@ -1,6 +1,18 @@
+import { createHash, randomBytes } from 'node:crypto'
+
 import { splitTelegramText } from './message-format.mjs'
 
 export const RELAY_PROTOCOL_VERSION = 1
+
+const APPROVAL_METHODS = new Set([
+  'item/commandExecution/requestApproval',
+  'item/fileChange/requestApproval',
+  'item/permissions/requestApproval',
+])
+
+function hashToken(token) {
+  return createHash('sha256').update(token).digest('hex')
+}
 
 function requireText(value, name) {
   if (typeof value !== 'string' || !value) throw new Error(`${name} is required`)
@@ -13,8 +25,8 @@ function batchIdFor(jobs) {
 
 function outboundActions(batchId, jobs, result, nowMs) {
   if (result.action === 'skip') return []
-  if (result.action !== 'reply' || typeof result.text !== 'string') {
-    throw new Error('job result must be a reply or skip')
+  if (!['reply', 'react'].includes(result.action) || typeof result.text !== 'string') {
+    throw new Error('job result must be a reply, react, or skip')
   }
   const contexts = jobs.map(job => job.payload?.telegramContext)
   if (contexts.some(context => !context?.chatId || !context?.conversationKey)) {
@@ -50,15 +62,35 @@ function outboundActions(batchId, jobs, result, nowMs) {
         if (typeof response.text !== 'string' || !response.text.trim()) {
           throw new Error('job result targeted response text must be non-empty')
         }
-        return { context, text: response.text }
+        const action = response.action ?? 'reply'
+        if (!['reply', 'react'].includes(action)) throw new Error('job result targeted action must be reply or react')
+        return { context, text: response.text, action }
       })
-    : [{ context: contexts.at(-1), text: result.text }]
+    : [{ context: contexts.at(-1), text: result.text, action: result.action }]
   if (selected.some(response => !response.text.trim())) {
     throw new Error('job result must contain a non-empty reply or targeted responses')
   }
   const group = `relay-batch:${batchId}`
   const actions = []
   for (const response of selected) {
+    if (response.action === 'react') {
+      if (!response.context.messageId) throw new Error('Telegram reaction requires a message target')
+      actions.push({
+        actionId: `${group}:${String(actions.length).padStart(4, '0')}`,
+        conversationKey: response.context.conversationKey,
+        actionType: 'react',
+        payload: {
+          chatId: response.context.chatId,
+          messageId: response.context.messageId,
+          reaction: { type: 'emoji', emoji: response.text.trim() },
+          isBig: false,
+        },
+        sequenceGroup: group,
+        sequenceIndex: actions.length,
+        nowMs,
+      })
+      continue
+    }
     const chunks = splitTelegramText(response.text)
     for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
       const text = chunks[chunkIndex]
@@ -94,6 +126,7 @@ export class RelayProtocolSession {
   #connectorId = null
   #codexSessionId = null
   #inflightBatch = null
+  #inflightApprovalId = null
   #acceptingJobs = false
   #closed = false
 
@@ -146,6 +179,9 @@ export class RelayProtocolSession {
     if (frame.type === 'job_deferred') return this.#handleDeferred(frame)
     if (frame.type === 'job_result') return this.#handleResult(frame)
     if (frame.type === 'job_failed') return this.#handleFailed(frame)
+    if (frame.type === 'approval_request') return this.#handleApprovalRequest(frame)
+    if (frame.type === 'approval_recorded') return this.#handleApprovalRecorded(frame)
+    if (frame.type === 'approval_cancel') return this.#handleApprovalCancel(frame)
     throw new Error(`unsupported relay frame type: ${frame.type}`)
   }
 
@@ -170,7 +206,25 @@ export class RelayProtocolSession {
   }
 
   async claimOnce() {
-    if (!this.ready || !this.#acceptingJobs || this.#inflightBatch) return false
+    if (!this.ready) return false
+    if (!this.#inflightApprovalId) {
+      const approval = this.#state.nextRelayApprovalResponse({
+        sessionLabel: this.#sessionLabel,
+        codexSessionId: this.#codexSessionId,
+        nowMs: this.#clock(),
+      })
+      if (approval) {
+        this.#inflightApprovalId = approval.approvalId
+        this.#write({
+          type: 'approval_response',
+          approvalId: approval.approvalId,
+          decision: approval.state === 'approved' ? 'approve' : 'deny',
+          reason: approval.state,
+        })
+        return true
+      }
+    }
+    if (this.#inflightApprovalId || !this.#acceptingJobs || this.#inflightBatch) return false
     const jobs = this.#state.claimRelayJobBatch({
       sessionLabel: this.#sessionLabel,
       connectorId: this.#connectorId,
@@ -272,6 +326,92 @@ export class RelayProtocolSession {
       batchId: batch.batchId,
       jobIds: jobs.map(job => job.jobId),
     })
+  }
+
+  #handleApprovalRequest(frame) {
+    const approval = frame.approval ?? {}
+    const approvalId = requireText(approval.approvalId, 'approval.approvalId')
+    if (!/^[A-Za-z0-9:_-]{8,128}$/u.test(approvalId)) throw new Error('invalid relay approval ID')
+    const method = requireText(approval.method, 'approval.method')
+    if (!APPROVAL_METHODS.has(method)) throw new Error('unsupported relay approval method')
+    const threadId = requireText(approval.threadId, 'approval.threadId')
+    if (threadId !== this.#codexSessionId) throw new Error('relay approval thread does not match the connected session')
+    const turnId = requireText(approval.turnId, 'approval.turnId')
+    const detail = requireText(approval.detail, 'approval.detail').slice(0, 3_000)
+    const ownerUserId = this.#state.getSetting('telegram_owner_user_id')
+    if (!ownerUserId) throw new Error('Telegram owner is not configured for relay approvals')
+    const expiresAtMs = Number(approval.expiresAtMs)
+    if (!Number.isSafeInteger(expiresAtMs) || expiresAtMs <= this.#clock()) {
+      throw new Error('relay approval expiry is invalid')
+    }
+
+    let stored = this.#state.getRelayApproval(approvalId)
+    if (!stored) {
+      const callbackToken = randomBytes(24).toString('base64url')
+      stored = this.#state.createRelayApproval({
+        approvalId,
+        sessionLabel: this.#sessionLabel,
+        connectorId: this.#connectorId,
+        codexSessionId: this.#codexSessionId,
+        method,
+        threadId,
+        turnId,
+        ownerUserId,
+        detail,
+        callbackToken,
+        tokenHash: hashToken(callbackToken),
+        expiresAtMs,
+        nowMs: this.#clock(),
+      })
+    } else if (stored.connectorId !== this.#connectorId) {
+      stored = this.#state.rebindRelayApproval({
+        approvalId,
+        connectorId: this.#connectorId,
+        nowMs: this.#clock(),
+      })
+    }
+    if (
+      stored.sessionLabel !== this.#sessionLabel
+      || stored.codexSessionId !== this.#codexSessionId
+      || stored.method !== method
+      || stored.threadId !== threadId
+      || stored.turnId !== turnId
+      || stored.ownerUserId !== ownerUserId
+    ) throw new Error('relay approval ID was reused with different context')
+
+    const actionId = `relay-approval:${approvalId}`
+    this.#state.createOutboundAction({
+      actionId,
+      conversationKey: ownerUserId,
+      actionType: 'send_text',
+      payload: {
+        chatId: ownerUserId,
+        text: `${stored.detail}\n\nSession: ${this.#sessionLabel}`,
+        replyMarkup: {
+          inline_keyboard: [[
+            { text: 'Approve', callback_data: `ra:${stored.callbackToken}:approve` },
+            { text: 'Deny', callback_data: `ra:${stored.callbackToken}:deny` },
+          ]],
+        },
+      },
+      nowMs: this.#clock(),
+    })
+    this.#write({ type: 'approval_queued', approvalId })
+  }
+
+  #handleApprovalRecorded(frame) {
+    const approvalId = requireText(frame.approvalId, 'approvalId')
+    if (approvalId !== this.#inflightApprovalId) throw new Error('relay approval acknowledgement does not match inflight approval')
+    if (!this.#state.markRelayApprovalDelivered(approvalId, this.#clock())) {
+      throw new Error('relay approval response could not be recorded')
+    }
+    this.#inflightApprovalId = null
+  }
+
+  #handleApprovalCancel(frame) {
+    const approvalId = requireText(frame.approvalId, 'approvalId')
+    this.#state.cancelRelayApproval(approvalId, this.#clock())
+    if (this.#inflightApprovalId === approvalId) this.#inflightApprovalId = null
   }
 
   async close() {

@@ -77,6 +77,11 @@ class FakeTelegram {
     return { message_id: 900 + this.calls.length, chat: { id: payload.chatId } }
   }
 
+  async react(payload) {
+    this.calls.push({ method: 'react', payload })
+    return true
+  }
+
   async downloadFile(fileId) {
     this.calls.push({ method: 'downloadFile', payload: { fileId } })
     return { filePath: 'photos/file.jpg', bytes: Buffer.from('image'), metadata: { file_id: fileId } }
@@ -175,6 +180,23 @@ test('runs an owner-DM turn and records the automatic final reply once', async t
   const outbound = state.getOutboundAction('answer:update:1:0000')
   assert.equal(outbound.status, 'sent')
   assert.equal(outbound.conversationKey, '42')
+})
+
+test('sends a structured reaction without a text reply', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  setup.runner.result = {
+    ...setup.runner.result,
+    action: 'react',
+    finalText: '🗿',
+    reason: 'reaction is enough',
+  }
+
+  await setup.dispatcher.processClaimedUpdate(storeAndClaim(setup.state, rawMessage(40)))
+
+  assert.equal(setup.telegram.calls.filter(call => call.method === 'react').length, 1)
+  assert.equal(setup.telegram.calls.some(call => ['reply', 'sendText'].includes(call.method)), false)
+  assert.equal(setup.state.getOutboundAction('reaction:update:40').payload.reaction.emoji, '🗿')
 })
 
 test('does not send an automatic answer for structured SKIP or an equivalent Telegram tool action', async t => {

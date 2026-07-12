@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import test from 'node:test'
 
 import { RelayProtocolSession } from '../src/relay-protocol.mjs'
@@ -111,6 +112,38 @@ test('records one final reply for the batch using the latest Telegram message', 
   assert.equal(outbound.payload.text, 'one final answer')
   assert.equal(setup.frames.at(-1).type, 'job_recorded')
   assert.deepEqual(setup.frames.at(-1).jobIds, ['telegram:1', 'telegram:2'])
+})
+
+test('records a first-class reaction against the latest Telegram message', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  enqueue(setup.state, '1', '42', 1_000)
+  await hello(setup)
+  await setup.session.claimOnce()
+  const { batchId } = setup.frames.at(-1).batch
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_accepted',
+    batchId,
+    threadId: 'thread-a',
+    turnId: 'turn-a',
+  })
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_result',
+    batchId,
+    turnId: 'turn-a',
+    result: { action: 'react', text: '🗿' },
+  })
+
+  const outbound = setup.state.getOutboundAction(`relay-batch:${batchId}:0000`)
+  assert.equal(outbound.actionType, 'react')
+  assert.deepEqual(outbound.payload, {
+    chatId: '42',
+    messageId: '10',
+    reaction: { type: 'emoji', emoji: '🗿' },
+    isBig: false,
+  })
 })
 
 test('records selective targeted responses to messages from the same batch', async t => {
@@ -338,4 +371,51 @@ test('claims only while idle and defers the whole batch after a start race', asy
   assert.equal(setup.state.getRelayJob('telegram:1').status, 'pending')
   assert.equal(setup.state.getRelayJob('telegram:2').status, 'pending')
   assert.equal(await setup.session.claimOnce(), false)
+})
+
+test('durably routes a local app-server approval through the owner DM', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  setup.state.setSetting('telegram_owner_user_id', '42', 1_000)
+  await hello(setup, false)
+
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'approval_request',
+    approval: {
+      approvalId: 'approval-12345678',
+      method: 'item/commandExecution/requestApproval',
+      threadId: 'session-a',
+      turnId: 'turn-local',
+      detail: 'Codex requests command execution approval.\nCommand: git push',
+      expiresAtMs: 11_000,
+    },
+  })
+
+  const action = setup.state.getOutboundAction('relay-approval:approval-12345678')
+  assert.equal(action.conversationKey, '42')
+  assert.equal(action.payload.chatId, '42')
+  const callbackData = action.payload.replyMarkup.inline_keyboard[0][0].callback_data
+  const token = callbackData.match(/^ra:([^:]+):approve$/u)[1]
+  assert.equal(setup.state.resolveRelayApproval({
+    tokenHash: createHash('sha256').update(token).digest('hex'),
+    ownerUserId: '42',
+    decision: 'approved',
+    nowMs: 2_000,
+  }).resolved, true)
+
+  assert.equal(await setup.session.claimOnce(), true)
+  assert.deepEqual(setup.frames.at(-1), {
+    version: 1,
+    type: 'approval_response',
+    approvalId: 'approval-12345678',
+    decision: 'approve',
+    reason: 'approved',
+  })
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'approval_recorded',
+    approvalId: 'approval-12345678',
+  })
+  assert.equal(setup.state.getRelayApproval('approval-12345678').deliveredAtMs, 1_000)
 })

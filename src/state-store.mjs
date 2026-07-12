@@ -105,6 +105,28 @@ function mapApproval(row) {
   }
 }
 
+function mapRelayApproval(row) {
+  if (!row) return null
+  return {
+    approvalId: row.approval_id,
+    sessionLabel: row.session_label,
+    connectorId: row.connector_id,
+    codexSessionId: row.codex_session_id,
+    method: row.method,
+    threadId: row.thread_id,
+    turnId: row.turn_id,
+    ownerUserId: row.owner_user_id,
+    detail: row.detail,
+    callbackToken: row.callback_token,
+    tokenHash: row.token_hash,
+    state: row.state,
+    expiresAtMs: row.expires_at_ms,
+    deliveredAtMs: row.delivered_at_ms,
+    createdAtMs: row.created_at_ms,
+    updatedAtMs: row.updated_at_ms,
+  }
+}
+
 function mapWake(row) {
   if (!row) return null
   return {
@@ -347,6 +369,30 @@ export class StateStore {
       );
       CREATE INDEX IF NOT EXISTS approvals_pending
         ON approvals(state, expires_at_ms);
+
+      CREATE TABLE IF NOT EXISTS relay_approvals (
+        approval_id TEXT PRIMARY KEY,
+        session_label TEXT NOT NULL,
+        connector_id TEXT NOT NULL,
+        codex_session_id TEXT NOT NULL,
+        method TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        turn_id TEXT NOT NULL,
+        owner_user_id TEXT NOT NULL,
+        detail TEXT NOT NULL,
+        callback_token TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL DEFAULT 'pending',
+        expires_at_ms INTEGER NOT NULL,
+        delivered_at_ms INTEGER,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        CHECK (state IN ('pending', 'approved', 'denied', 'expired', 'cancelled'))
+      );
+      CREATE INDEX IF NOT EXISTS relay_approvals_delivery
+        ON relay_approvals(session_label, codex_session_id, delivered_at_ms, state, updated_at_ms);
+      CREATE INDEX IF NOT EXISTS relay_approvals_expiry
+        ON relay_approvals(state, expires_at_ms);
 
       CREATE TABLE IF NOT EXISTS wake_requests (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1057,6 +1103,131 @@ export class StateStore {
       return { resolved: true, approval: this.getApproval(tokenHash) }
     })
     return transaction()
+  }
+
+  createRelayApproval({
+    approvalId,
+    sessionLabel,
+    connectorId,
+    codexSessionId,
+    method,
+    threadId,
+    turnId,
+    ownerUserId,
+    detail,
+    callbackToken,
+    tokenHash,
+    expiresAtMs,
+    nowMs = Date.now(),
+  }) {
+    if (!approvalId || !sessionLabel || !connectorId || !codexSessionId || !method || !threadId || !turnId || !ownerUserId || !callbackToken || !tokenHash) {
+      throw new Error('relay approval identity fields are required')
+    }
+    if (!Number.isSafeInteger(expiresAtMs) || expiresAtMs <= nowMs) {
+      throw new Error('relay approval expiry must be after creation')
+    }
+    this.#db.prepare(`
+      INSERT OR IGNORE INTO relay_approvals(
+        approval_id, session_label, connector_id, codex_session_id, method, thread_id, turn_id,
+        owner_user_id, detail, callback_token, token_hash, state, expires_at_ms, created_at_ms, updated_at_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+    `).run(
+      approvalId,
+      sessionLabel,
+      connectorId,
+      codexSessionId,
+      method,
+      threadId,
+      turnId,
+      ownerUserId,
+      detail,
+      callbackToken,
+      tokenHash,
+      expiresAtMs,
+      nowMs,
+      nowMs,
+    )
+    return this.getRelayApproval(approvalId)
+  }
+
+  getRelayApproval(approvalId) {
+    return mapRelayApproval(this.#db.prepare(
+      'SELECT * FROM relay_approvals WHERE approval_id = ?',
+    ).get(approvalId))
+  }
+
+  rebindRelayApproval({ approvalId, connectorId, nowMs = Date.now() }) {
+    if (!approvalId || !connectorId) throw new Error('relay approval rebind identity is required')
+    this.#db.prepare(`
+      UPDATE relay_approvals
+      SET connector_id = ?,
+          delivered_at_ms = CASE
+            WHEN state IN ('approved', 'denied', 'expired') THEN NULL
+            ELSE delivered_at_ms
+          END,
+          updated_at_ms = ?
+      WHERE approval_id = ? AND connector_id != ? AND state != 'cancelled'
+    `).run(connectorId, nowMs, approvalId, connectorId)
+    return this.getRelayApproval(approvalId)
+  }
+
+  resolveRelayApproval({ tokenHash, ownerUserId, decision, nowMs = Date.now() }) {
+    if (!['approved', 'denied'].includes(decision)) throw new Error('relay approval decision must be approved or denied')
+    const transaction = this.#db.transaction(() => {
+      const approval = mapRelayApproval(this.#db.prepare(
+        'SELECT * FROM relay_approvals WHERE token_hash = ?',
+      ).get(tokenHash))
+      if (!approval) return { resolved: false, reason: 'not_found' }
+      if (approval.ownerUserId !== ownerUserId) return { resolved: false, reason: 'owner_mismatch' }
+      if (approval.state !== 'pending') return { resolved: false, reason: 'already_resolved' }
+      if (nowMs >= approval.expiresAtMs) {
+        this.#db.prepare(`
+          UPDATE relay_approvals SET state = 'expired', updated_at_ms = ?
+          WHERE approval_id = ? AND state = 'pending'
+        `).run(nowMs, approval.approvalId)
+        return { resolved: false, reason: 'expired' }
+      }
+      this.#db.prepare(`
+        UPDATE relay_approvals SET state = ?, updated_at_ms = ?
+        WHERE approval_id = ? AND state = 'pending'
+      `).run(decision, nowMs, approval.approvalId)
+      return { resolved: true, approval: this.getRelayApproval(approval.approvalId) }
+    })
+    return transaction()
+  }
+
+  cancelRelayApproval(approvalId, nowMs = Date.now()) {
+    return this.#db.prepare(`
+      UPDATE relay_approvals SET state = 'cancelled', updated_at_ms = ?
+      WHERE approval_id = ? AND delivered_at_ms IS NULL AND state != 'cancelled'
+    `).run(nowMs, approvalId).changes === 1
+  }
+
+  expireRelayApprovals(nowMs = Date.now()) {
+    return this.#db.prepare(`
+      UPDATE relay_approvals SET state = 'expired', updated_at_ms = ?
+      WHERE state = 'pending' AND expires_at_ms <= ?
+    `).run(nowMs, nowMs).changes
+  }
+
+  nextRelayApprovalResponse({ sessionLabel, codexSessionId, nowMs = Date.now() }) {
+    this.expireRelayApprovals(nowMs)
+    return mapRelayApproval(this.#db.prepare(`
+      SELECT * FROM relay_approvals
+      WHERE session_label = ? AND codex_session_id = ?
+        AND delivered_at_ms IS NULL
+        AND state IN ('approved', 'denied', 'expired')
+      ORDER BY updated_at_ms, created_at_ms
+      LIMIT 1
+    `).get(sessionLabel, codexSessionId))
+  }
+
+  markRelayApprovalDelivered(approvalId, nowMs = Date.now()) {
+    return this.#db.prepare(`
+      UPDATE relay_approvals SET delivered_at_ms = ?, updated_at_ms = ?
+      WHERE approval_id = ? AND delivered_at_ms IS NULL
+        AND state IN ('approved', 'denied', 'expired')
+    `).run(nowMs, nowMs, approvalId).changes === 1
   }
 
   enqueueRelayJob({

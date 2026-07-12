@@ -1,5 +1,11 @@
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 
+import {
+  approvalDetail,
+  approvalResponse,
+  SUPPORTED_APPROVAL_METHODS,
+} from './approval-router.mjs'
 import {
   parseTelegramStructuredOutput,
   TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS,
@@ -87,6 +93,8 @@ export class LocalSessionConnector extends EventEmitter {
   #heartbeatIntervalMs
   #approvalPolicy
   #sandboxPolicy
+  #approvalTtlMs
+  #clock
   #activeTurns = new Set()
   #items = new Map()
   #currentJob = null
@@ -95,6 +103,7 @@ export class LocalSessionConnector extends EventEmitter {
   #started = false
   #closed = false
   #listeners = []
+  #pendingApprovals = new Map()
 
   constructor({
     appServerClient,
@@ -106,6 +115,8 @@ export class LocalSessionConnector extends EventEmitter {
     heartbeatIntervalMs = 5_000,
     approvalPolicy = null,
     sandboxPolicy = null,
+    approvalTtlMs = 10 * 60 * 1_000,
+    clock = Date.now,
   }) {
     super()
     this.#app = appServerClient
@@ -117,6 +128,8 @@ export class LocalSessionConnector extends EventEmitter {
     this.#heartbeatIntervalMs = heartbeatIntervalMs
     this.#approvalPolicy = approvalPolicy
     this.#sandboxPolicy = sandboxPolicy
+    this.#approvalTtlMs = approvalTtlMs
+    this.#clock = clock
   }
 
   #available() {
@@ -158,11 +171,13 @@ export class LocalSessionConnector extends EventEmitter {
     const onItemStarted = params => this.#schedule(() => this.#handleItemStarted(params))
     const onItemCompleted = params => this.#schedule(() => this.#handleItemCompleted(params))
     const onTurnCompleted = params => this.#schedule(() => this.#handleTurnCompleted(params))
+    const onApprovalRequest = request => this.#schedule(() => this.#handleApprovalRequest(request))
     const onRelayFrame = frame => this.#schedule(() => this.#handleRelayFrame(frame))
     this.#listen(this.#app, 'notification:turn/started', onTurnStarted)
     this.#listen(this.#app, 'notification:item/started', onItemStarted)
     this.#listen(this.#app, 'notification:item/completed', onItemCompleted)
     this.#listen(this.#app, 'notification:turn/completed', onTurnCompleted)
+    this.#listen(this.#app, 'request', onApprovalRequest)
     this.#listen(this.#relay, 'frame', onRelayFrame)
 
     const resumed = await this.#app.request('thread/resume', { threadId: this.#threadId })
@@ -230,6 +245,11 @@ export class LocalSessionConnector extends EventEmitter {
   #handleTurnCompleted(params) {
     if (params.threadId !== this.#threadId || !params.turn?.id) return
     const turn = params.turn
+    for (const [approvalId, pending] of this.#pendingApprovals) {
+      if (pending.request.params?.turnId !== turn.id) continue
+      this.#pendingApprovals.delete(approvalId)
+      this.#send({ type: 'approval_cancel', approvalId })
+    }
     this.#activeTurns.delete(turn.id)
     const items = this.#items.get(turn.id) ?? []
     this.#items.delete(turn.id)
@@ -253,6 +273,13 @@ export class LocalSessionConnector extends EventEmitter {
           turnId: turn.id,
           result: output.skipped
             ? { action: 'skip', reason: output.reason }
+            : output.action === 'react'
+              ? {
+                  action: 'react',
+                  text: output.finalText,
+                  responses: output.responses,
+                  reason: output.reason,
+                }
             : {
                 action: 'reply',
                 text: output.finalText,
@@ -274,6 +301,48 @@ export class LocalSessionConnector extends EventEmitter {
       : frame.batchId === this.#currentJob.batchId
   }
 
+  #approvalId(request) {
+    const params = request.params ?? {}
+    return `approval-${createHash('sha256')
+      .update(`${request.method}\0${params.threadId ?? ''}\0${params.turnId ?? ''}\0${request.id}`)
+      .digest('hex')
+      .slice(0, 32)}`
+  }
+
+  #handleApprovalRequest(request) {
+    if (!SUPPORTED_APPROVAL_METHODS.has(request.method)) return
+    const params = request.params ?? {}
+    if (params.threadId !== this.#threadId || !params.turnId) return
+    const approvalId = this.#approvalId(request)
+    this.#pendingApprovals.set(approvalId, { request })
+    this.#send({
+      type: 'approval_request',
+      approval: {
+        approvalId,
+        method: request.method,
+        threadId: params.threadId,
+        turnId: params.turnId,
+        detail: approvalDetail(request.method, params),
+        expiresAtMs: this.#clock() + this.#approvalTtlMs,
+      },
+    })
+  }
+
+  #handleApprovalResponse(frame) {
+    const approvalId = frame.approvalId
+    const pending = this.#pendingApprovals.get(approvalId)
+    if (!pending) {
+      this.#send({ type: 'approval_recorded', approvalId })
+      return
+    }
+    const approved = frame.decision === 'approve'
+    if (!approved && frame.decision !== 'deny') throw new Error('relay approval response has an invalid decision')
+    const { request } = pending
+    this.#app.respond(request.id, approvalResponse(request.method, request.params ?? {}, approved))
+    this.#pendingApprovals.delete(approvalId)
+    this.#send({ type: 'approval_recorded', approvalId })
+  }
+
   async #handleRelayFrame(frame) {
     if (!frame || frame.version !== RELAY_PROTOCOL_VERSION) throw new Error('unsupported relay protocol version')
     if (frame.type === 'heartbeat' || frame.type === 'ready') {
@@ -281,6 +350,11 @@ export class LocalSessionConnector extends EventEmitter {
         status: 'connected',
         remoteNowMs: frame.nowMs ?? null,
       })
+      return
+    }
+    if (frame.type === 'approval_queued') return
+    if (frame.type === 'approval_response') {
+      this.#handleApprovalResponse(frame)
       return
     }
     if (frame.type === 'error') throw new Error(`VPS relay error: ${frame.message}`)
@@ -362,6 +436,10 @@ export class LocalSessionConnector extends EventEmitter {
     clearInterval(this.#heartbeatTimer)
     for (const remove of this.#listeners.splice(0)) remove()
     await this.#chain.catch(() => {})
+    for (const approvalId of this.#pendingApprovals.keys()) {
+      try { this.#send({ type: 'approval_cancel', approvalId }) } catch {}
+    }
+    this.#pendingApprovals.clear()
     await this.#relay.close()
   }
 }

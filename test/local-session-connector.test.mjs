@@ -7,6 +7,7 @@ import { LocalSessionConnector } from '../src/local-session-connector.mjs'
 
 class FakeAppServer extends EventEmitter {
   calls = []
+  responses = []
   failTurnStart = null
   resumeThreads = [{ id: 'thread-a', turns: [] }]
 
@@ -20,6 +21,10 @@ class FakeAppServer extends EventEmitter {
       return { turn: { id: 'turn-tg' } }
     }
     throw new Error(`unexpected app-server request: ${method}`)
+  }
+
+  respond(id, result, error = null) {
+    this.responses.push({ id, result, error })
   }
 }
 
@@ -163,8 +168,8 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
         action: 'send',
         text: '',
         responses: [
-          { messageId: '10', text: 'first answer' },
-          { messageId: '11', text: 'second answer' },
+          { messageId: '10', action: 'send', text: 'first answer' },
+          { messageId: '11', action: 'send', text: 'second answer' },
         ],
         reason: 'done',
       }),
@@ -185,8 +190,8 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
       action: 'reply',
       text: '',
       responses: [
-        { messageId: '10', text: 'first answer' },
-        { messageId: '11', text: 'second answer' },
+        { messageId: '10', action: 'reply', text: 'first answer' },
+        { messageId: '11', action: 'reply', text: 'second answer' },
       ],
       reason: 'done',
     },
@@ -336,4 +341,75 @@ test('emits relay status heartbeats for an external channel monitor', async t =>
   await setup.connector.idle()
 
   assert.deepEqual(statuses.at(-1), { status: 'connected', remoteNowMs: 1234 })
+})
+
+test('returns a first-class reaction result without a text reply', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+  setup.relay.emit('frame', batch())
+  await setup.connector.idle()
+
+  setup.app.emit('notification:item/completed', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: {
+      type: 'agentMessage',
+      phase: 'final_answer',
+      text: JSON.stringify({ action: 'react', text: '🗿', responses: [], reason: 'reaction is enough' }),
+    },
+  })
+  setup.app.emit('notification:turn/completed', {
+    threadId: 'thread-a',
+    turn: { id: 'turn-tg', status: 'completed' },
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(setup.relay.frames.at(-1), {
+    version: 1,
+    type: 'job_result',
+    batchId: 'batch:telegram:1:telegram:2',
+    turnId: 'turn-tg',
+    result: { action: 'react', text: '🗿', responses: [], reason: 'reaction is enough' },
+  })
+})
+
+test('forwards a subscribed terminal approval to Telegram and returns the decision', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.app.emit('request', {
+    id: 91,
+    method: 'item/commandExecution/requestApproval',
+    params: {
+      threadId: 'thread-a',
+      turnId: 'turn-local',
+      command: 'git push',
+      cwd: '/workspace',
+      reason: 'publish reviewed changes',
+    },
+  })
+  await setup.connector.idle()
+
+  const requestFrame = setup.relay.frames.find(frame => frame.type === 'approval_request')
+  assert.equal(requestFrame.approval.method, 'item/commandExecution/requestApproval')
+  assert.equal(requestFrame.approval.threadId, 'thread-a')
+  assert.match(requestFrame.approval.detail, /git push/)
+
+  setup.relay.emit('frame', {
+    version: 1,
+    type: 'approval_response',
+    approvalId: requestFrame.approval.approvalId,
+    decision: 'approve',
+    reason: 'approved',
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(setup.app.responses, [{ id: 91, result: { decision: 'accept' }, error: null }])
+  assert.deepEqual(setup.relay.frames.at(-1), {
+    version: 1,
+    type: 'approval_recorded',
+    approvalId: requestFrame.approval.approvalId,
+  })
 })

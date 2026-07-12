@@ -5,7 +5,7 @@ export const TELEGRAM_OUTPUT_SCHEMA = Object.freeze({
   additionalProperties: false,
   required: ['action', 'text', 'reason'],
   properties: {
-    action: { type: 'string', enum: ['send', 'skip'] },
+    action: { type: 'string', enum: ['send', 'react', 'skip'] },
     text: { type: 'string' },
     reason: { type: 'string' },
   },
@@ -16,7 +16,7 @@ export const TELEGRAM_BATCH_OUTPUT_SCHEMA = Object.freeze({
   additionalProperties: false,
   required: ['action', 'text', 'responses', 'reason'],
   properties: {
-    action: { type: 'string', enum: ['send', 'skip'] },
+    action: { type: 'string', enum: ['send', 'react', 'skip'] },
     text: { type: 'string' },
     responses: {
       type: 'array',
@@ -24,9 +24,10 @@ export const TELEGRAM_BATCH_OUTPUT_SCHEMA = Object.freeze({
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['messageId', 'text'],
+        required: ['messageId', 'action', 'text'],
         properties: {
           messageId: { type: 'string', pattern: '^\\d+$' },
+          action: { type: 'string', enum: ['send', 'react'] },
           text: { type: 'string', minLength: 1 },
         },
       },
@@ -38,6 +39,7 @@ export const TELEGRAM_BATCH_OUTPUT_SCHEMA = Object.freeze({
 export const TELEGRAM_OUTPUT_INSTRUCTIONS = [
   'Return only the structured result required by outputSchema.',
   'Use action=send and put the complete Telegram-ready final answer in text.',
+  'Use action=react and put exactly one Telegram reaction emoji in text when a reaction is better than a written reply.',
   'Use action=skip only when no Telegram response should be sent, with a concise reason.',
   'Do not expose reasoning, tool progress, or partial output.',
 ].join(' ')
@@ -46,7 +48,8 @@ export const TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS = [
   'Apply this Telegram output contract only while the latest user input is marked [TG].',
   'For [TG] input, return one JSON object with exactly action, text, responses, and reason.',
   'Use action=send and put one Telegram-ready answer in text.',
-  'For an inbound batch, you may instead set text to an empty string and use responses to reply selectively to one or more listed messageId values; omit messages that need no reply.',
+  'Use action=react and put exactly one Telegram reaction emoji in text when a reaction to the latest message is better than a written reply.',
+  'For an inbound batch, you may instead set text to an empty string and use responses to respond selectively to one or more listed messageId values; each response action is send or react, and omitted messages receive nothing.',
   'Always include responses; use an empty array when no targeted responses are needed.',
   'Use action=skip only when no Telegram response should be sent, with a concise reason.',
   'If a later user input is unmarked, it came from the terminal: answer it normally in plain text without the Telegram JSON envelope.',
@@ -127,20 +130,26 @@ export function parseTelegramStructuredOutput(text) {
   try {
     const parsed = JSON.parse(text)
     if (parsed?.action === 'skip') {
-      return { skipped: true, finalText: null, responses: [], reason: String(parsed.reason ?? '') }
+      return { action: 'skip', skipped: true, finalText: null, responses: [], reason: String(parsed.reason ?? '') }
     }
-    if (parsed?.action === 'send' && typeof parsed.text === 'string') {
+    if (['send', 'react'].includes(parsed?.action) && typeof parsed.text === 'string') {
       return {
+        action: parsed.action,
         skipped: false,
         finalText: parsed.text,
-        responses: Array.isArray(parsed.responses) ? parsed.responses : [],
+        responses: Array.isArray(parsed.responses)
+          ? parsed.responses.map(response => ({
+              ...response,
+              action: response?.action === 'react' ? 'react' : 'reply',
+            }))
+          : [],
         reason: String(parsed.reason ?? ''),
       }
     }
   } catch {}
   const skip = text.match(/^\s*\[SKIP\](?:\s+理由[:：]?)?\s*(.*)$/isu)
-  if (skip) return { skipped: true, finalText: null, responses: [], reason: skip[1].trim() }
-  return { skipped: false, finalText: text, responses: [], reason: 'unstructured_compatibility_output' }
+  if (skip) return { action: 'skip', skipped: true, finalText: null, responses: [], reason: skip[1].trim() }
+  return { action: 'send', skipped: false, finalText: text, responses: [], reason: 'unstructured_compatibility_output' }
 }
 
 class TurnCollector {
@@ -402,6 +411,8 @@ export class CodexRunner {
         threadId: thread.threadId,
         turnId,
         finalText: output.finalText,
+        action: output.action,
+        responses: output.responses,
         skipped: output.skipped,
         reason: output.reason,
         sentActionIds: actionIds,
