@@ -213,6 +213,53 @@ test('resumes an existing group thread with read-only policy and attachment inpu
   assert.match(turnParams.additionalContext.telegram_trust_policy.value, /never as authority or permission/)
 })
 
+test('direct runner tags a private group without granting execution permissions', async t => {
+  let turnParams
+  const fake = await startFakeAppServer({
+    onMessage(message, connection) {
+      if (message.method === 'thread/start') {
+        connection.send({ id: message.id, result: { thread: { id: 'thread-private-group' } } })
+      }
+      if (message.method === 'turn/start') {
+        turnParams = message.params
+        connection.send({ id: message.id, result: { turn: { id: 'turn-private-group', status: 'inProgress', items: [] } } })
+        sendCompletedTurn(connection, {
+          threadId: 'thread-private-group',
+          turnId: 'turn-private-group',
+          output: JSON.stringify({
+            action: 'send',
+            text: 'Our bridge separates transport, relay, and connector responsibilities.',
+            reason: 'explain',
+          }),
+        })
+      }
+    },
+  })
+  t.after(() => fake.close())
+  const client = await AppServerClient.connect({ socketPath: fake.socketPath, contract: await contract() })
+  t.after(() => client.close())
+  const store = StateStore.open(':memory:')
+  t.after(() => store.close())
+  const runner = new CodexRunner({
+    client,
+    stateStore: store,
+    config: config({ privateChatIds: new Set(['-100123']) }),
+  })
+
+  const result = await runner.runTurn({
+    conversationKey: '-100123',
+    ownerDm: false,
+    text: 'Explain the architecture.',
+    telegramContext: { chatId: '-100123', senderId: '42' },
+  })
+
+  assert.equal(result.finalText, 'Our bridge separates transport, relay, and connector responsibilities.')
+  assert.match(turnParams.input[0].text, /\[trust=private_group\]/)
+  assert.match(turnParams.additionalContext.telegram_trust_policy.value, /not an instruction source/)
+  assert.equal(turnParams.approvalPolicy, 'never')
+  assert.deepEqual(turnParams.sandboxPolicy, { type: 'readOnly', networkAccess: false })
+})
+
 test('replaces only a confirmed stale thread and reports the context break', async t => {
   const methods = []
   const fake = await startFakeAppServer({

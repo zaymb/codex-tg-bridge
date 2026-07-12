@@ -110,6 +110,7 @@ export class LocalSessionConnector extends EventEmitter {
   #approvalPolicy
   #sandboxPolicy
   #ownerUserId
+  #privateChatIds
   #approvalTtlMs
   #clock
   #activeTurns = new Set()
@@ -133,6 +134,7 @@ export class LocalSessionConnector extends EventEmitter {
     approvalPolicy = null,
     sandboxPolicy = null,
     ownerUserId,
+    privateChatIds = new Set(),
     approvalTtlMs = 10 * 60 * 1_000,
     clock = Date.now,
   }) {
@@ -148,6 +150,7 @@ export class LocalSessionConnector extends EventEmitter {
     this.#sandboxPolicy = sandboxPolicy
     if (!ownerUserId) throw new Error('local connector owner user ID is required')
     this.#ownerUserId = String(ownerUserId)
+    this.#privateChatIds = new Set([...privateChatIds].map(String))
     this.#approvalTtlMs = approvalTtlMs
     this.#clock = clock
   }
@@ -416,7 +419,7 @@ export class LocalSessionConnector extends EventEmitter {
     const clientUserMessageId = inbound.mode === 'legacy' ? inbound.jobs[0].jobId : inbound.batchId
     this.#currentJob = {
       ...inbound,
-      trust: classifyTelegramJobs(inbound.jobs, this.#ownerUserId),
+      trust: classifyTelegramJobs(inbound.jobs, this.#ownerUserId, this.#privateChatIds),
       turnId: null,
       awaitingRecord: false,
       clientUserMessageId,

@@ -164,6 +164,7 @@ export function loadConfig(env = process.env) {
   const config = {
     ownerUserId,
     allowedChatIds,
+    privateChatIds: parseIdSet(env.TELEGRAM_PRIVATE_CHAT_IDS, 'TELEGRAM_PRIVATE_CHAT_IDS'),
     allowedChannelIds,
     chatAliases: parseAliases(env.TELEGRAM_CHAT_ALIASES, allowedChatIds, allowedChannelIds),
     tokenFile: token.tokenFile,
@@ -237,6 +238,7 @@ export function loadLocalConnectorConfig(env = process.env) {
   )
   const config = {
     ownerUserId: parseId(env.TELEGRAM_OWNER_USER_ID, 'TELEGRAM_OWNER_USER_ID', true),
+    privateChatIds: parseIdSet(env.TELEGRAM_PRIVATE_CHAT_IDS, 'TELEGRAM_PRIVATE_CHAT_IDS'),
     sessionLabel: parseSessionLabel(env.BRIDGE_SESSION_LABEL),
     codexSessionId: requireSimpleValue(env.CODEX_SESSION_ID, 'CODEX_SESSION_ID'),
     threadId: requireSimpleValue(env.CODEX_THREAD_ID ?? env.CODEX_SESSION_ID, 'CODEX_THREAD_ID'),

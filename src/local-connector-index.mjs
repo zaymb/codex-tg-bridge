@@ -70,6 +70,7 @@ export async function main(env = process.env) {
     approvalPolicy: config.approvalPolicy,
     sandboxPolicy: config.sandboxPolicy,
     ownerUserId: config.ownerUserId,
+    privateChatIds: config.privateChatIds,
   })
   const controller = new AbortController()
   const shutdown = () => controller.abort()

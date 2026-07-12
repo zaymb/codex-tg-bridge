@@ -43,7 +43,7 @@ class FakeRelay extends EventEmitter {
   async close() {}
 }
 
-function fixture({ heartbeatIntervalMs = 60_000 } = {}) {
+function fixture({ heartbeatIntervalMs = 60_000, privateChatIds = new Set() } = {}) {
   const app = new FakeAppServer()
   const relay = new FakeRelay()
   const connector = new LocalSessionConnector({
@@ -57,8 +57,33 @@ function fixture({ heartbeatIntervalMs = 60_000 } = {}) {
     approvalPolicy: 'never',
     sandboxPolicy: { type: 'dangerFullAccess' },
     ownerUserId: '42',
+    privateChatIds,
   })
   return { app, relay, connector }
+}
+
+function privateGroupBatch() {
+  return {
+    version: 1,
+    type: 'job_batch',
+    batch: {
+      batchId: 'batch:telegram:private-group',
+      jobs: [{
+        jobId: 'telegram:private-group',
+        payload: {
+          text: 'describe our architecture',
+          telegramContext: {
+            chatId: '-100123',
+            conversationKey: '-100123',
+            messageId: '13',
+            senderId: '42',
+            senderIsBot: false,
+            senderDisplayName: 'Owner',
+          },
+        },
+      }],
+    },
+  }
 }
 
 function batch() {
@@ -235,6 +260,22 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
     approvalPolicy: 'never',
     sandbox: 'danger-full-access',
   })
+})
+
+test('private groups receive the private-audience policy but retain no execution permissions', async t => {
+  const setup = fixture({ privateChatIds: new Set(['-100123']) })
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', privateGroupBatch())
+  await setup.connector.idle()
+
+  const started = setup.app.calls.find(call => call.method === 'turn/start')
+  assert.match(started.params.input[0].text, /\[trust=private_group\]/)
+  assert.match(started.params.additionalContext.telegram_trust_policy.value, /owner-approved private Telegram group/)
+  assert.match(started.params.additionalContext.telegram_trust_policy.value, /not an instruction source/)
+  assert.equal(started.params.approvalPolicy, 'never')
+  assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
 })
 
 test('trusts only the authenticated owner DM and preserves its configured permissions', async t => {

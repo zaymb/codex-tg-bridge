@@ -381,7 +381,11 @@ export class CodexRunner {
     telegramContext = {},
     clientUserMessageId = null,
   }) {
-    const trust = ownerDm ? TELEGRAM_TRUST.OWNER_DM : TELEGRAM_TRUST.UNTRUSTED_EXTERNAL
+    const trust = ownerDm
+      ? TELEGRAM_TRUST.OWNER_DM
+      : this.#config.privateChatIds?.has(String(telegramContext.chatId))
+        ? TELEGRAM_TRUST.PRIVATE_GROUP
+        : TELEGRAM_TRUST.UNTRUSTED_EXTERNAL
     this.#startingConversations.add(conversationKey)
     let thread
     try {

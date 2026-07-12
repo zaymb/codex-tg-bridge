@@ -165,6 +165,9 @@ For owner DM, no group configuration is needed. Before group acceptance:
 - Every Telegram turn is tagged as an `EXTERNAL_FEED` with an authenticated
   trust tier. Only the configured owner's private chat is an instruction
   source; owner-authored group messages remain untrusted conversation data.
+- `TELEGRAM_PRIVATE_CHAT_IDS` defines private audiences that may receive
+  owner-private architecture discussion. These groups remain non-authoritative:
+  they cannot start work, mutate state, approve actions, or control sessions.
 - Group slash commands are stored as context and never execute bridge control
   actions. `/new`, `/stop`, approvals, and mutations require the terminal or
   owner DM.
@@ -175,3 +178,5 @@ For owner DM, no group configuration is needed. Before group acceptance:
   local paths, credentials, environment/config identifiers, private
   infrastructure details, code blocks, oversized responses, and file exports
   are blocked outside the owner DM.
+- Private-audience groups use a narrower guard: architecture discussion is
+  allowed, while credentials, secrets, and exact private paths remain blocked.

@@ -1,6 +1,6 @@
 import { basename } from 'node:path'
 
-import { publicDisclosureRisk } from './channel-trust.mjs'
+import { privateAudienceDisclosureRisk, publicDisclosureRisk } from './channel-trust.mjs'
 import { JsonLineSocketServer } from './json-line-socket.mjs'
 import { requireTelegramDiceEmoji } from './telegram-dice.mjs'
 
@@ -23,14 +23,16 @@ export class ControlServer {
   #dispatcher
   #attachmentStore
   #ownerUserId
+  #privateChatIds
   #server
 
-  constructor({ socketPath, stateStore, dispatcher, attachmentStore, ownerUserId }) {
+  constructor({ socketPath, stateStore, dispatcher, attachmentStore, ownerUserId, privateChatIds = new Set() }) {
     if (!ownerUserId) throw new Error('control server owner user ID is required')
     this.#state = stateStore
     this.#dispatcher = dispatcher
     this.#attachmentStore = attachmentStore
     this.#ownerUserId = String(ownerUserId)
+    this.#privateChatIds = new Set([...privateChatIds].map(String))
     this.#server = new JsonLineSocketServer({
       socketPath,
       handler: request => this.#handle(request),
@@ -58,7 +60,10 @@ export class ControlServer {
 
   #assertPublicTextSafe(chat, text) {
     if (this.#isOwnerDm(chat) || text === null || text === undefined) return
-    if (publicDisclosureRisk(text)) {
+    const risk = this.#privateChatIds.has(chat.telegramChatId)
+      ? privateAudienceDisclosureRisk(text)
+      : publicDisclosureRisk(text)
+    if (risk) {
       throw new Error('public Telegram output was blocked by the disclosure guard')
     }
   }

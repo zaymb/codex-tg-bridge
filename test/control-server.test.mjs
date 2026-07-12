@@ -27,7 +27,7 @@ class FakeAttachmentStore {
   }
 }
 
-async function fixture() {
+async function fixture({ privateChatIds = new Set() } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'tg-bridge-control-'))
   const socketPath = join(dir, 'action.sock')
   const state = StateStore.open(':memory:')
@@ -55,6 +55,7 @@ async function fixture() {
     dispatcher,
     attachmentStore,
     ownerUserId: '42',
+    privateChatIds,
   })
   await server.start()
   const client = await ControlClient.connect({ socketPath, requestTimeoutMs: 1_000 })
@@ -178,6 +179,34 @@ test('blocks sensitive public text and public file export while preserving owner
     text: 'Internal path: /opt/private/relay',
   }, { actionId: 'owner-detail' })
   assert.equal(setup.dispatcher.actions.at(-1).conversationKey, '42')
+})
+
+test('allows architecture text to a private group but still blocks paths and file export', async t => {
+  const setup = await fixture({ privateChatIds: new Set(['-100123']) })
+  t.after(() => setup.client.close())
+  t.after(() => setup.server.close())
+  t.after(() => setup.state.close())
+
+  await setup.client.request('send_text', {
+    target: 'sandbox-topic',
+    text: 'Our bridge separates transport, relay, and connector responsibilities.',
+  }, { actionId: 'private-architecture' })
+  assert.equal(setup.dispatcher.actions.at(-1).conversationKey, '-100123:7')
+
+  await assert.rejects(
+    setup.client.request('send_text', {
+      target: 'sandbox-topic',
+      text: 'The service runs from /opt/private/relay.',
+    }, { actionId: 'private-path' }),
+    /blocked by the disclosure guard/,
+  )
+  await assert.rejects(
+    setup.client.request('send_file', {
+      target: 'sandbox-topic',
+      path: '/tmp/report.txt',
+    }, { actionId: 'private-file' }),
+    /files can only be sent to the owner DM/,
+  )
 })
 
 test('rejects oversized JSONL frames without crashing other clients', async t => {
