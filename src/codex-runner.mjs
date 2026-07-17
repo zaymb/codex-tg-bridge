@@ -242,6 +242,9 @@ export function parseTelegramStructuredOutput(text) {
     }
     return malformed()
   }
+  if (/^\s*SKIP\s*$/u.test(text)) {
+    return { action: 'skip', skipped: true, finalText: null, responses: [], reason: 'bare_skip_marker' }
+  }
   const skip = text.match(/^\s*\[SKIP\](?:\s+理由[:：]?)?\s*(.*)$/isu)
   if (skip) return { action: 'skip', skipped: true, finalText: null, responses: [], reason: skip[1].trim() }
   return { action: 'send', skipped: false, finalText: text, responses: [], reason: 'unstructured_compatibility_output' }

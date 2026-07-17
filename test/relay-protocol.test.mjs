@@ -797,6 +797,32 @@ test('records batch SKIP without outbound and rejects a mismatched turn', async 
   assert.equal(setup.state.claimDueOutboundActions({ workerId: 'probe', limit: 10, nowMs: 1_000 }).length, 0)
 })
 
+test('fails closed when an older connector submits a bare SKIP reply', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  enqueue(setup.state)
+  await hello(setup)
+  await setup.session.claimOnce()
+  const { batchId } = setup.frames.at(-1).batch
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_accepted',
+    batchId,
+    threadId: 'thread-a',
+    turnId: 'turn-a',
+  })
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_result',
+    batchId,
+    turnId: 'turn-a',
+    result: { action: 'reply', text: 'SKIP' },
+  })
+
+  assert.equal(setup.state.getRelayJob('telegram:1').status, 'completed')
+  assert.equal(setup.state.claimDueOutboundActions({ workerId: 'probe', limit: 10, nowMs: 1_000 }).length, 0)
+})
+
 test('renews and releases the session lease and rejects protocol mismatches', async t => {
   const setup = fixture()
   t.after(() => setup.state.close())

@@ -40,7 +40,7 @@ function processExists(pid) {
   }
 }
 
-async function createFixture() {
+async function createFixture({ appServerShutdownGraceMs = 2_000 } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'tg-channel-launcher-'))
   const records = join(directory, 'records')
   const fakeCodexPath = join(directory, 'fake-codex.mjs')
@@ -107,7 +107,7 @@ if (command === 'app-server') {
     statusPath,
     reconnectInitialMs: 5,
     reconnectMaxMs: 10,
-    appServerShutdownGraceMs: 100,
+    appServerShutdownGraceMs,
   }, null, 2)}\n`)
 
   return { configPath, records, statusPath }
@@ -177,12 +177,14 @@ for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM']) {
   test(`${signal} stops every channel child, removes the socket, and records stopped`, async () => {
     const fixture = await createFixture()
     const launcher = startLauncher(fixture)
+    let stderr = ''
+    launcher.stderr.on('data', chunk => { stderr += chunk })
     let children = {}
     try {
       children = await readChannelChildren(fixture.records)
 
       launcher.kill(signal)
-      assert.deepEqual(await childExit(launcher), { code: 0, signal: null })
+      assert.deepEqual(await childExit(launcher), { code: 0, signal: null }, stderr)
       await waitFor(() => !processExists(children.appServer.pid) && !processExists(children.tui.pid))
 
       const status = JSON.parse(await readFile(fixture.statusPath, 'utf8'))
@@ -222,7 +224,7 @@ test('a normal TUI exit performs the same cleanup and records its reason', async
 })
 
 test('kills the detached app-server process group when its wrapper leaves a worker behind', async () => {
-  const fixture = await createFixture()
+  const fixture = await createFixture({ appServerShutdownGraceMs: 100 })
   const launcher = startLauncher(fixture, { FAKE_ORPHAN_WORKER: '1' })
   let children = {}
   try {

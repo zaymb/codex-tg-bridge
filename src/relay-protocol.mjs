@@ -40,6 +40,10 @@ function batchIdFor(jobs) {
   return `batch:${jobs[0].jobId}:${jobs.at(-1).jobId}`
 }
 
+function isInternalSkipMarker(value) {
+  return typeof value === 'string' && /^\s*(?:SKIP|\[SKIP\])\s*$/u.test(value)
+}
+
 function outboundActions(batchId, jobs, result, nowMs) {
   if (result.action === 'skip') return []
   if (!['reply', 'react'].includes(result.action) || typeof result.text !== 'string') {
@@ -73,7 +77,7 @@ function outboundActions(batchId, jobs, result, nowMs) {
     invalidResult('job result cannot combine text with targeted responses')
   }
   const seen = new Set()
-  const selected = targeted.length > 0
+  const selected = (targeted.length > 0
       ? targeted.map(response => {
         const messageId = typeof response?.messageId === 'string' ? response.messageId : ''
         const conversationKey = typeof response?.conversationKey === 'string'
@@ -99,7 +103,9 @@ function outboundActions(batchId, jobs, result, nowMs) {
         }
         return { context, text: response.text, action, isBig: response.isBig === true }
       })
-    : [{ context: contexts.at(-1), text: result.text, action: result.action }]
+    : [{ context: contexts.at(-1), text: result.text, action: result.action }])
+    .filter(response => response.action !== 'reply' || !isInternalSkipMarker(response.text))
+  if (selected.length === 0) return []
   if (selected.some(response => !response.text.trim())) {
     invalidResult('job result must contain a non-empty reply or targeted responses')
   }

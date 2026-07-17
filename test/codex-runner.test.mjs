@@ -151,6 +151,17 @@ test('fails closed instead of leaking a structured envelope with trailing garbag
   })
 })
 
+test('treats a bare SKIP final as an internal no-reply marker', () => {
+  assert.deepEqual(parseTelegramStructuredOutput('SKIP'), {
+    action: 'skip',
+    skipped: true,
+    finalText: null,
+    responses: [],
+    reason: 'bare_skip_marker',
+  })
+  assert.equal(parseTelegramStructuredOutput('SKIP this message').skipped, false)
+})
+
 test('starts and persists an owner-DM thread, then returns only structured final output', async t => {
   let turnParams
   const fake = await startFakeAppServer({
