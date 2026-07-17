@@ -8,6 +8,7 @@ import { RelayDispatcher, RELAY_JOB_TTL_MS } from './relay-dispatcher.mjs'
 import { seedApprovedChats } from './runtime.mjs'
 import { StateStore } from './state-store.mjs'
 import { TelegramClient } from './telegram-client.mjs'
+import { DisengagedError, TransportControl } from './transport-control.mjs'
 
 function idle(ms, signal) {
   return new Promise(resolve => {
@@ -59,6 +60,10 @@ export async function createTransportRuntime({
       botUsername: bot.username,
       groupGate,
     })
+    const transportControl = new TransportControl({ stateStore })
+    // Restart recovery: pending away/disengage phases are re-derived from
+    // their ack action's terminal state before any loop starts.
+    transportControl.recover({ getOutboundAction: id => stateStore.getOutboundAction(id) })
     const dispatcher = new RelayDispatcher({
       stateStore,
       engagementPolicy,
@@ -68,8 +73,15 @@ export async function createTransportRuntime({
       topicNames: config.topicNames,
       ownerUserId: config.ownerUserId,
       updateLeaseMs: config.updateLeaseMs,
+      transportControl,
+      botUsername: bot.username,
     })
-    const outbound = new OutboundDrain({ stateStore, telegramClient, botIdentity: bot })
+    const outbound = new OutboundDrain({
+      stateStore,
+      telegramClient,
+      botIdentity: bot,
+      transportControl,
+    })
     const poller = new Poller({
       telegramClient,
       stateStore,
@@ -83,25 +95,58 @@ export async function createTransportRuntime({
       outbound,
       poller,
       bot,
+      transportControl,
       async run({ signal } = {}) {
         const controller = new AbortController()
         const abort = () => controller.abort()
         signal?.addEventListener('abort', abort, { once: true })
+        // The poller gets its own controller so an active disengage can stop
+        // Telegram intake while the quiesce loop keeps draining deliveries.
+        const pollController = new AbortController()
+        const stopPolling = () => pollController.abort()
+        controller.signal.addEventListener('abort', stopPolling, { once: true })
         const worker = async () => {
           while (!controller.signal.aborted) {
+            if (transportControl.isDisengaged()) {
+              // Disengage quiesce (v2.1): the farewell is already confirmed
+              // sent (that is what promoted the phase to active). Stop
+              // polling, let in-flight relay jobs and every undelivered
+              // outbound action finish, then leave via exit-code contract 78
+              // so systemd's RestartPreventExitStatus keeps us down.
+              pollController.abort()
+              const sent = await outbound.drainOnce()
+              stateStore.expireRelayJobs()
+              const busy = sent > 0
+                || stateStore.countUndeliveredOutboundActions() > 0
+                || stateStore.countActiveRelayJobs(config.sessionLabel) > 0
+              if (!busy) throw new DisengagedError()
+              await idle(workerIdleMs, controller.signal)
+              continue
+            }
             const inbound = await dispatcher.drainOnce()
             const sent = await outbound.drainOnce()
             stateStore.expireRelayJobs()
             if (inbound.claimed === 0 && sent === 0) await idle(workerIdleMs, controller.signal)
           }
         }
-        const poll = poller.run({ signal: controller.signal })
+        const poll = transportControl.isDisengaged()
+          ? Promise.resolve()
+          : poller.run({ signal: pollController.signal })
         const work = worker()
+        // The poller ending is only fatal when nothing asked it to stop —
+        // during a disengage quiesce the worker owns the shutdown.
+        const pollWatch = poll.then(() => {
+          if (controller.signal.aborted || transportControl.isDisengaged()) {
+            return new Promise(() => {})
+          }
+        })
         try {
-          await Promise.race([poll, work])
+          await Promise.race([pollWatch, work])
         } finally {
           signal?.removeEventListener('abort', abort)
+          controller.signal.removeEventListener('abort', stopPolling)
           controller.abort()
+          pollController.abort()
           await Promise.allSettled([poll, work])
           await runtime.close()
         }

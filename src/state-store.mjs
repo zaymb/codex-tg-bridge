@@ -230,14 +230,6 @@ function mapRelaySession(row) {
   }
 }
 
-function relayJobAuthorPartition(job) {
-  const context = job.payload?.telegramContext
-  if (context?.senderId === null || context?.senderId === undefined) {
-    return 'unknown'
-  }
-  return `${String(context.senderId)}:${context.senderIsBot === true ? 'bot' : 'human'}`
-}
-
 export class StateStore {
   static open(path) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
@@ -621,6 +613,40 @@ export class StateStore {
       SET status = 'completed', lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?
       WHERE update_id = ? AND status = 'processing' AND lease_owner = ?
     `).run(nowMs, String(updateId), workerId).changes === 1
+  }
+
+  // Returns a claimed update to the queue untouched: no attempt penalty, no
+  // error, original availability. Used when a claim was only an inspection
+  // (e.g. the away release mention must flow through the normal pipeline).
+  releaseUpdate({ updateId, workerId, nowMs = Date.now() }) {
+    return this.#db.prepare(`
+      UPDATE telegram_updates
+      SET status = 'pending', attempts = MAX(attempts - 1, 0), lease_owner = NULL,
+          lease_expires_at_ms = NULL, updated_at_ms = ?
+      WHERE update_id = ? AND status = 'processing' AND lease_owner = ?
+    `).run(nowMs, String(updateId), workerId).changes === 1
+  }
+
+  countQueuedUpdates(nowMs = Date.now()) {
+    return this.#db.prepare(`
+      SELECT COUNT(*) AS count FROM telegram_updates
+      WHERE status IN ('pending', 'processing')
+    `).get().count
+  }
+
+  countActiveRelayJobs(sessionLabel, nowMs = Date.now()) {
+    return this.#db.prepare(`
+      SELECT COUNT(*) AS count FROM relay_jobs
+      WHERE session_label = ? AND status IN ('pending', 'leased') AND expires_at_ms > ?
+    `).get(String(sessionLabel), nowMs).count
+  }
+
+  countUndeliveredOutboundActions() {
+    return this.#db.prepare(`
+      SELECT COUNT(*) AS count FROM outbound_actions
+      WHERE status IN ('pending', 'sending')
+         OR (status = 'failed' AND next_attempt_at_ms IS NOT NULL)
+    `).get().count
   }
 
   failUpdate({ updateId, workerId, error, retryAtMs = Date.now(), permanent = false, nowMs = Date.now() }) {
@@ -1408,9 +1434,9 @@ export class StateStore {
         ) return []
       }
 
-      // Controls must remain latency-sensitive and isolated. Normal ready
-      // conversations can share one turn, but only through each conversation's
-      // first contiguous author partition.
+      // Controls remain latency-sensitive and isolated. Normal ready
+      // conversations contribute their complete pending backlog so messages
+      // accumulated while Codex was busy arrive in one turn.
       const conversations = bypassing
         ? [readyConversations[0]]
         : readyConversations
@@ -1432,11 +1458,7 @@ export class StateStore {
           candidates.push(control)
           continue
         }
-        const authorPartition = relayJobAuthorPartition(jobs[0])
-        for (const job of jobs) {
-          if (relayJobAuthorPartition(job) !== authorPartition) break
-          candidates.push(job)
-        }
+        candidates.push(...jobs)
       }
       candidates.sort((left, right) => (
         left.createdAtMs - right.createdAtMs

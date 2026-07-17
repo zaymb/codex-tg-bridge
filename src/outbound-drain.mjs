@@ -11,6 +11,7 @@ export class OutboundDrain {
   #workerId
   #clock
   #botIdentity
+  #control
 
   constructor({
     stateStore,
@@ -18,12 +19,14 @@ export class OutboundDrain {
     workerId = `outbound-${process.pid}`,
     clock = Date.now,
     botIdentity = null,
+    transportControl = null,
   }) {
     this.#state = stateStore
     this.#telegram = telegramClient
     this.#workerId = workerId
     this.#clock = clock
     this.#botIdentity = botIdentity
+    this.#control = transportControl
   }
 
   async #execute(action) {
@@ -60,25 +63,25 @@ export class OutboundDrain {
         result,
         botIdentity: this.#botIdentity,
       }, this.#clock())
+      this.#control?.handleAckSent(actionId, this.#clock())
       return 'sent'
     } catch (error) {
       if (error instanceof RateLimitError) {
-        this.#state.markOutboundFailed(
-          actionId,
-          error.message,
-          bestEffort ? null : this.#clock() + error.retryAfterSec * 1_000,
-          this.#clock(),
-        )
+        const retryAtMs = bestEffort ? null : this.#clock() + error.retryAfterSec * 1_000
+        this.#state.markOutboundFailed(actionId, error.message, retryAtMs, this.#clock())
+        if (retryAtMs === null) this.#control?.handleAckTerminal(actionId, 'failed', this.#clock())
         return 'failed'
       }
       if (error instanceof TelegramTransportError && error.deliveryAmbiguous) {
         this.#state.markOutboundAmbiguous(actionId, error.message, this.#clock())
+        this.#control?.handleAckTerminal(actionId, 'ambiguous', this.#clock())
         return 'ambiguous'
       }
       const retryAtMs = error instanceof TelegramTransportError && !bestEffort
         ? this.#clock() + 1_000
         : null
       this.#state.markOutboundFailed(actionId, error.message, retryAtMs, this.#clock())
+      if (retryAtMs === null) this.#control?.handleAckTerminal(actionId, 'failed', this.#clock())
       return 'failed'
     }
   }

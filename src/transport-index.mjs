@@ -29,11 +29,22 @@ if (isMainModule(import.meta.url)) {
   try {
     await main()
   } catch (error) {
-    console.error(JSON.stringify({
-      level: 'error',
-      event: 'transport_fatal',
-      error: { name: error.name, message: error.message },
-    }))
-    process.exitCode = error.name === 'DuplicatePollerError' ? 78 : 1
+    if (error.name === 'DisengagedError') {
+      // Deliberate admin disengage: exit through the existing systemd
+      // RestartPreventExitStatus=78 contract so the unit stays down until a
+      // human re-engages it. Not a fault — logged as info, not error.
+      console.log(JSON.stringify({
+        level: 'info',
+        event: 'transport_disengaged',
+      }))
+      process.exitCode = 78
+    } else {
+      console.error(JSON.stringify({
+        level: 'error',
+        event: 'transport_fatal',
+        error: { name: error.name, message: error.message },
+      }))
+      process.exitCode = error.name === 'DuplicatePollerError' ? 78 : 1
+    }
   }
 }

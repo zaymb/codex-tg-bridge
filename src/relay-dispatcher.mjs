@@ -4,6 +4,15 @@ import { classifyImageAttachment } from './image-attachment.mjs'
 import { DEFAULT_RELAY_ATTACHMENT_MAX_BYTES } from './relay-attachment-transfer.mjs'
 import { normalizeUpdate } from './update-normalizer.mjs'
 import { resolveTopicName } from './topic-map.mjs'
+import {
+  AWAY_ACK_PREFIX,
+  AWAY_INVALID_PREFIX,
+  AWAY_INVALID_REPLY,
+  DISENGAGE_ACK_PREFIX,
+  DISENGAGE_REPLY,
+  isAwayReleaseMention,
+  parseTransportCommand,
+} from './transport-control.mjs'
 
 export const RELAY_JOB_TTL_MS = 86_400_000
 
@@ -72,6 +81,8 @@ export class RelayDispatcher {
   #workerId
   #updateLeaseMs
   #clock
+  #control
+  #botUsername
 
   constructor({
     stateStore,
@@ -84,6 +95,8 @@ export class RelayDispatcher {
     workerId = `relay-dispatcher-${process.pid}`,
     updateLeaseMs = 120_000,
     clock = Date.now,
+    transportControl = null,
+    botUsername = null,
   }) {
     if (!sessionLabel) throw new Error('relay session label is required')
     if (!ownerUserId) throw new Error('relay owner user ID is required')
@@ -97,10 +110,21 @@ export class RelayDispatcher {
     this.#workerId = workerId
     this.#updateLeaseMs = updateLeaseMs
     this.#clock = clock
+    this.#control = transportControl
+    this.#botUsername = botUsername
   }
 
   async drainOnce({ limit = 16 } = {}) {
     this.#state.recoverExpiredLeases(this.#clock())
+    if (this.#control) {
+      this.#control.clearExpiredAway(this.#clock())
+      // Disengage (pending or active) stops all fresh intake; pending still
+      // lets already-enqueued relay jobs and outbound actions finish elsewhere.
+      if (this.#control.isDisengaged() || this.#control.isDisengagePending()) {
+        return { claimed: 0, processed: 0, failed: 0 }
+      }
+      if (this.#control.isAway(this.#clock())) return this.#drainAwayOnce({ limit })
+    }
     const rows = this.#state.claimUpdates({
       workerId: this.#workerId,
       limit,
@@ -109,6 +133,47 @@ export class RelayDispatcher {
     })
     const results = []
     for (const row of rows) results.push(await this.processClaimedUpdate(row))
+    return {
+      claimed: rows.length,
+      processed: results.filter(result => result.status === 'completed').length,
+      failed: results.filter(result => result.status === 'failed').length,
+    }
+  }
+
+  // Away mode: ordinary updates stay queued (durable batching in
+  // telegram_updates). Only two things are claimed: admin transport commands,
+  // and the admin's @bot mention that releases away early. The mention row is
+  // released back to the queue untouched so it flushes through the normal
+  // pipeline together with the backlog, in natural order.
+  async #drainAwayOnce({ limit = 8 } = {}) {
+    const context = { ownerUserId: this.#ownerUserId, botUsername: this.#botUsername }
+    const rows = this.#state.claimUpdatesMatching({
+      workerId: this.#workerId,
+      predicate: row => {
+        try {
+          const update = normalizeUpdate(row.raw)
+          return parseTransportCommand(update, context) !== null
+            || isAwayReleaseMention(update, context)
+        } catch {
+          return false
+        }
+      },
+      limit,
+      leaseMs: this.#updateLeaseMs,
+      nowMs: this.#clock(),
+    })
+    const results = []
+    for (const row of rows) {
+      const update = normalizeUpdate(row.raw)
+      if (parseTransportCommand(update, context) === null
+        && isAwayReleaseMention(update, context)) {
+        this.#control.releaseAway(this.#clock())
+        this.#state.releaseUpdate({ updateId: row.updateId, workerId: this.#workerId, nowMs: this.#clock() })
+        results.push({ status: 'completed', action: 'away_released' })
+        continue
+      }
+      results.push(await this.processClaimedUpdate(row))
+    }
     return {
       claimed: rows.length,
       processed: results.filter(result => result.status === 'completed').length,
@@ -238,9 +303,66 @@ export class RelayDispatcher {
     return { status: 'completed', action: decision }
   }
 
+  #queueControlReply(update, actionId, text) {
+    this.#state.createOutboundAction({
+      actionId,
+      conversationKey: update.conversationKey,
+      actionType: messageIdForReply(update) ? 'reply' : 'send_text',
+      payload: {
+        chatId: update.chat.id,
+        messageId: messageIdForReply(update),
+        threadId: topicId(update),
+        text,
+      },
+      nowMs: this.#clock(),
+    })
+  }
+
+  // Transport-level slash commands: admin-only, never reach the model. The
+  // pending phase is written in the same tick the command is claimed, so new
+  // turns are blocked before the ack is even sent (v2.1 race rule).
+  #handleTransportCommand(command, update, row) {
+    const nowMs = this.#clock()
+    if (command.kind === 'away') {
+      const ackActionId = `${AWAY_ACK_PREFIX}${row.updateId}`
+      const { accepted } = this.#control.requestAway({
+        durationMs: command.durationMs,
+        ackActionId,
+        nowMs,
+      })
+      if (accepted) {
+        this.#queueControlReply(update, ackActionId, `Will be back in ${command.minutes}m.`)
+      }
+      this.#state.completeUpdate({ updateId: row.updateId, workerId: this.#workerId, nowMs: this.#clock() })
+      return { status: 'completed', action: accepted ? 'away_pending' : 'away_dropped' }
+    }
+    if (command.kind === 'away_invalid') {
+      this.#queueControlReply(update, `${AWAY_INVALID_PREFIX}${row.updateId}`, AWAY_INVALID_REPLY)
+      this.#state.completeUpdate({ updateId: row.updateId, workerId: this.#workerId, nowMs: this.#clock() })
+      return { status: 'completed', action: 'away_invalid' }
+    }
+    if (command.kind === 'disengage') {
+      const ackActionId = `${DISENGAGE_ACK_PREFIX}${row.updateId}`
+      const { accepted } = this.#control.requestDisengage({ ackActionId, nowMs })
+      if (accepted) {
+        this.#queueControlReply(update, ackActionId, DISENGAGE_REPLY)
+      }
+      this.#state.completeUpdate({ updateId: row.updateId, workerId: this.#workerId, nowMs: this.#clock() })
+      return { status: 'completed', action: accepted ? 'disengage_pending' : 'disengage_duplicate' }
+    }
+    throw new Error(`unsupported transport command: ${command.kind}`)
+  }
+
   async processClaimedUpdate(row) {
     try {
       const update = normalizeUpdate(row.raw)
+      if (this.#control) {
+        const command = parseTransportCommand(update, {
+          ownerUserId: this.#ownerUserId,
+          botUsername: this.#botUsername,
+        })
+        if (command) return this.#handleTransportCommand(command, update, row)
+      }
       if (update.type === 'callback_query') {
         const approval = this.#handleRelayApprovalCallback(update, row)
         if (approval) {
@@ -284,6 +406,7 @@ export class RelayDispatcher {
             updateId: update.updateId,
             updateType: update.type,
             chatId: update.chat.id,
+            ...(update.chat.title ? { chatTitle: update.chat.title } : {}),
             conversationKey: update.conversationKey,
             threadId,
             ...(threadName ? { threadName } : {}),
