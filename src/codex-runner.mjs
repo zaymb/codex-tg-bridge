@@ -34,6 +34,7 @@ export const TELEGRAM_BATCH_OUTPUT_SCHEMA = Object.freeze({
         additionalProperties: false,
         required: ['messageId', 'action', 'text', 'isBig'],
         properties: {
+          conversationKey: { type: 'string', minLength: 1 },
           messageId: { type: 'string', pattern: '^\\d+$' },
           action: { type: 'string', enum: ['send', 'react', 'dice'] },
           text: { type: 'string', minLength: 1 },
@@ -61,7 +62,8 @@ export const TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS = [
   'Use action=send and put one Telegram-ready answer in text.',
   'Use action=react and put exactly one Telegram reaction emoji in text when a reaction to the latest message is better than a written reply.',
   'Choose exactly one reply form: either put one answer in text and keep responses empty, or set text to an empty string and use responses for selective replies. Never duplicate an answer into both fields.',
-  'Each selective response must contain messageId (the listed Telegram message_id rendered as a string), action (send, react, or dice), text, and isBig (a boolean). Omitted messages receive nothing.',
+  'Each selective response must contain messageId (the listed Telegram message_id rendered as a string), action (send, react, or dice), text, and isBig (a boolean). It may also contain conversationKey.',
+  'When a batch spans multiple conversations, every selective response must include the listed conversationKey so identical message IDs cannot cross chats. Omitted messages receive nothing.',
   'Use a targeted response with action=dice and text set to exactly one of 🎲 🎯 🏀 ⚽ 🎳 🎰 to send Telegram animated dice.',
   'Always include responses; use an empty array when no targeted responses are needed.',
   'Use action=skip only when no Telegram response should be sent, with a concise reason.',
@@ -160,16 +162,23 @@ export function parseTelegramStructuredOutput(text) {
       const action = response?.action === 'send' || response?.action === undefined
         ? 'reply'
         : response?.action
+      const rawConversationKey = response?.conversationKey ?? response?.conversation_key
+      const conversationKey = rawConversationKey === undefined
+        ? null
+        : String(rawConversationKey)
+      const responseKey = `${conversationKey ?? ''}\0${messageId}`
       if (
         typeof messageId !== 'string'
         || !/^\d+$/u.test(messageId)
-        || seen.has(messageId)
+        || (conversationKey !== null && !conversationKey)
+        || seen.has(responseKey)
         || !['reply', 'react', 'dice'].includes(action)
         || typeof response?.text !== 'string'
         || !response.text.trim()
       ) return null
-      seen.add(messageId)
+      seen.add(responseKey)
       responses.push({
+        ...(conversationKey === null ? {} : { conversationKey }),
         messageId,
         action,
         text: response.text,

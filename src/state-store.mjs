@@ -1370,7 +1370,7 @@ export class StateStore {
         WHERE status = 'leased' AND lease_expires_at_ms <= ? AND expires_at_ms > ?
       `).run(nowMs, nowMs, nowMs)
       const coalescingEnabled = coalesceQuietMs > 0
-      const nextConversation = this.#db.prepare(`
+      const readyConversations = this.#db.prepare(`
         SELECT * FROM (
           SELECT
             conversation_key,
@@ -1389,37 +1389,62 @@ export class StateStore {
           WHERE session_label = ? AND status = 'pending' AND expires_at_ms > ?
           GROUP BY conversation_key
         )
-        WHERE (
-          ? = 0
-          OR bypass_coalesce = 1
-          OR last_created_at_ms <= ?
-          OR first_created_at_ms <= ?
-        ) AND (? = 1 OR has_attachments = 0)
+        WHERE (? = 1 OR has_attachments = 0)
         ORDER BY bypass_coalesce DESC, first_created_at_ms, conversation_key
-        LIMIT 1
-      `).get(
+      `).all(
         String(sessionLabel),
         nowMs,
-        coalescingEnabled ? 1 : 0,
-        nowMs - coalesceQuietMs,
-        nowMs - coalesceMaxMs,
         allowAttachments ? 1 : 0,
       )
-      if (!nextConversation) return []
+      if (readyConversations.length === 0) return []
 
-      const candidates = this.#db.prepare(`
+      const bypassing = readyConversations[0].bypass_coalesce === 1
+      if (coalescingEnabled && !bypassing) {
+        const firstCreatedAtMs = Math.min(...readyConversations.map(row => row.first_created_at_ms))
+        const lastCreatedAtMs = Math.max(...readyConversations.map(row => row.last_created_at_ms))
+        if (
+          lastCreatedAtMs > nowMs - coalesceQuietMs
+          && firstCreatedAtMs > nowMs - coalesceMaxMs
+        ) return []
+      }
+
+      // Controls must remain latency-sensitive and isolated. Normal ready
+      // conversations can share one turn, but only through each conversation's
+      // first contiguous author partition.
+      const conversations = bypassing
+        ? [readyConversations[0]]
+        : readyConversations
+
+      const conversationJobs = this.#db.prepare(`
         SELECT * FROM relay_jobs
         WHERE session_label = ? AND conversation_key = ?
           AND status = 'pending' AND expires_at_ms > ?
         ORDER BY created_at_ms, job_id
-      `).all(String(sessionLabel), nextConversation.conversation_key, nowMs).map(mapRelayJob)
+      `)
+      const candidates = []
+      for (const conversation of conversations) {
+        const jobs = conversationJobs
+          .all(String(sessionLabel), conversation.conversation_key, nowMs)
+          .map(mapRelayJob)
+        if (bypassing) {
+          const control = jobs.find(job => job.payload?.dispatch?.bypassCoalesce === true)
+          if (!control) throw new Error('bypass conversation is missing its control job')
+          candidates.push(control)
+          continue
+        }
+        const authorPartition = relayJobAuthorPartition(jobs[0])
+        for (const job of jobs) {
+          if (relayJobAuthorPartition(job) !== authorPartition) break
+          candidates.push(job)
+        }
+      }
+      candidates.sort((left, right) => (
+        left.createdAtMs - right.createdAtMs
+        || left.jobId.localeCompare(right.jobId)
+      ))
       const selected = []
-      const authorPartition = relayJobAuthorPartition(candidates[0])
       let usedBytes = 2
       for (const job of candidates) {
-        // A mixed-author batch could grant a peer message the owner's repair-group
-        // permissions. Keep batches contiguous and single-author at the durable queue.
-        if (relayJobAuthorPartition(job) !== authorPartition) break
         const jobBytes = Buffer.byteLength(JSON.stringify(job)) + (selected.length === 0 ? 0 : 1)
         if (usedBytes + jobBytes > maxBatchBytes) break
         selected.push(job)

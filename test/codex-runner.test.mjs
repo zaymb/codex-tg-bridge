@@ -50,7 +50,7 @@ test('parses optional targeted Telegram responses without losing legacy text out
     text: '',
     responses: [
       { messageId: '10', text: 'answer the first' },
-      { messageId: '20', text: 'answer the second' },
+      { conversationKey: '-10020', messageId: '20', text: 'answer the second' },
     ],
     reason: 'selective batch reply',
   })), {
@@ -58,7 +58,7 @@ test('parses optional targeted Telegram responses without losing legacy text out
     finalText: '',
     responses: [
       { messageId: '10', action: 'reply', text: 'answer the first' },
-      { messageId: '20', action: 'reply', text: 'answer the second' },
+      { conversationKey: '-10020', messageId: '20', action: 'reply', text: 'answer the second' },
     ],
     action: 'send',
     reason: 'selective batch reply',
@@ -67,6 +67,7 @@ test('parses optional targeted Telegram responses without losing legacy text out
     action: 'send', text: 'legacy reply', reason: 'compatibility',
   })).responses, [])
   assert.equal(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.responses.maxItems, 32)
+  assert.equal(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.responses.items.properties.conversationKey.type, 'string')
   assert.deepEqual(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.responses.items.properties.action.enum, [
     'send', 'react', 'dice',
   ])

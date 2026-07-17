@@ -23,9 +23,10 @@ both split-host and same-host deployments.
   replies, reactions, and animated dice to selected messages from that batch.
   `reply`, `react`, and `skip` are peer model outcomes; reactions and dice do
   not require an MCP tool call.
-- Consecutive messages from one conversation and one authenticated sender are
-  coalesced after a bounded quiet interval. Owner-DM slash commands bypass the
-  wait; batches never cross authors or conversations.
+- Pending conversations share one bounded quiet interval and are delivered in
+  one source-grouped batch. Each conversation contributes only its first
+  contiguous authenticated-sender partition. Owner-DM slash commands bypass
+  the wait and remain isolated from ordinary messages.
 - Commentary can produce best-effort progress messages. A final result
   atomically cancels any undelivered progress so stale status text cannot arrive
   after the answer.
@@ -39,9 +40,11 @@ both split-host and same-host deployments.
 - Every injected Telegram message is prefixed with `[TG]` and its automatic
   `conversation_key`; an unmarked user turn came from the terminal or another
   local Codex client.
-- Telegram windows are isolated by `conversation_key`: a DM or group uses its
-  `chatId`, while a forum topic uses `chatId:threadId`. Batches never cross that
-  boundary, and outbound routing is resolved from the durable inbound context.
+- Telegram reply targets are isolated by `conversation_key`: a DM or group uses
+  its `chatId`, while a forum topic uses `chatId:threadId`. A batch may span
+  several conversations, but selective responses require both
+  `conversationKey` and `messageId`; an unqualified ambiguous target fails
+  closed. A root reply goes only to the globally latest message.
 - Replies are bound to the channel that started the turn. If a local TUI steer
   joins a Telegram-owned turn, the connector fails closed and does not send the
   mixed final answer to Telegram.
@@ -118,7 +121,10 @@ npm run channel -- <codex-session-id>
 
 The launcher starts a temporary local app-server, attaches the Telegram
 connector, and opens the normal Codex TUI on the same thread. Exiting the TUI
-closes the connector and app-server. It installs no launchd service.
+closes the connector and the app-server's detached process group. The optional
+`appServerShutdownGraceMs` setting controls the bounded TERM grace period before
+the exact group is killed; the default is 2000 ms. It installs no launchd
+service.
 
 The checked contract fixture targets local `codex-cli 0.144.1`. Regenerate and
 review it whenever Codex CLI changes; startup fails closed on a version mismatch.
@@ -185,8 +191,12 @@ For owner DM, no group configuration is needed. Before group acceptance:
 - `TELEGRAM_REPAIR_CHAT_IDS` defines repair surfaces. An authenticated owner
   message in one of these groups may start work and use the configured Codex
   permissions. Messages from peer bots or other members remain non-authoritative,
-  even in the same repair group. Relay batches never cross Telegram authors, so
-  coalescing cannot downgrade or accidentally promote a neighboring message.
+  even in the same repair group. Each conversation contributes only one
+  contiguous author partition to a relay batch, so coalescing cannot downgrade
+  or accidentally promote a neighboring message.
+- A batch spanning more than one conversation is always read-only and
+  non-authoritative, even when one partition came from the owner DM. Per-message
+  trust labels remain available for audience classification and reply routing.
 - Group slash commands are stored as context and never execute bridge control
   actions. `/new`, `/stop`, approvals, and mutations require the terminal or
   owner DM.

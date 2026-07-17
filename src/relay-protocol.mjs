@@ -49,8 +49,6 @@ function outboundActions(batchId, jobs, result, nowMs) {
   if (contexts.some(context => !context?.chatId || !context?.conversationKey)) {
     throw new Error('relay batch is missing Telegram reply context')
   }
-  const jobConversationKeys = new Set(jobs.map(job => job.conversationKey))
-  if (jobConversationKeys.size !== 1) throw new Error('relay batch crosses Telegram conversations')
   for (let index = 0; index < jobs.length; index += 1) {
     const job = jobs[index]
     const context = contexts[index]
@@ -61,9 +59,15 @@ function outboundActions(batchId, jobs, result, nowMs) {
       throw new Error('relay job Telegram reply context does not match its conversation')
     }
   }
-  const byMessageId = new Map(contexts
-    .filter(context => context.messageId)
-    .map(context => [String(context.messageId), context]))
+  const byTarget = new Map()
+  const byMessageId = new Map()
+  for (const context of contexts.filter(context => context.messageId)) {
+    const messageId = String(context.messageId)
+    byTarget.set(`${context.conversationKey}\0${messageId}`, context)
+    const matches = byMessageId.get(messageId) ?? []
+    matches.push(context)
+    byMessageId.set(messageId, matches)
+  }
   const targeted = Array.isArray(result.responses) ? result.responses : []
   if (targeted.length > 0 && result.text.trim()) {
     invalidResult('job result cannot combine text with targeted responses')
@@ -72,10 +76,20 @@ function outboundActions(batchId, jobs, result, nowMs) {
   const selected = targeted.length > 0
       ? targeted.map(response => {
         const messageId = typeof response?.messageId === 'string' ? response.messageId : ''
-        if (seen.has(messageId)) invalidResult('job result contains a duplicate response target')
-        seen.add(messageId)
-        const context = byMessageId.get(messageId)
+        const conversationKey = typeof response?.conversationKey === 'string'
+          ? response.conversationKey
+          : null
+        const matches = byMessageId.get(messageId) ?? []
+        if (!conversationKey && matches.length > 1) {
+          invalidResult('job result response conversationKey is required for an ambiguous message target')
+        }
+        const context = conversationKey
+          ? byTarget.get(`${conversationKey}\0${messageId}`)
+          : matches[0]
         if (!context) invalidResult('job result response target is not in the current batch')
+        const targetKey = `${context.conversationKey}\0${messageId}`
+        if (seen.has(targetKey)) invalidResult('job result contains a duplicate response target')
+        seen.add(targetKey)
         if (typeof response.text !== 'string' || !response.text.trim()) {
           invalidResult('job result targeted response text must be non-empty')
         }

@@ -218,6 +218,46 @@ function ownerDmBatch() {
   }
 }
 
+function mixedSourceBatch() {
+  return {
+    version: 1,
+    type: 'job_batch',
+    batch: {
+      batchId: 'batch:telegram:mixed-sources',
+      jobs: [
+        {
+          jobId: 'telegram:owner-mixed',
+          payload: {
+            text: 'owner request',
+            telegramContext: {
+              chatId: '42',
+              conversationKey: '42',
+              messageId: '7',
+              senderId: '42',
+              senderIsBot: false,
+              senderDisplayName: 'Owner',
+            },
+          },
+        },
+        {
+          jobId: 'telegram:public-mixed',
+          payload: {
+            text: 'group conversation',
+            telegramContext: {
+              chatId: '-100999',
+              conversationKey: '-100999',
+              messageId: '7',
+              senderId: '99',
+              senderIsBot: false,
+              senderDisplayName: 'Peer',
+            },
+          },
+        },
+      ],
+    },
+  }
+}
+
 async function waitFor(predicate, timeoutMs = 500) {
   const deadline = Date.now() + timeoutMs
   while (!predicate()) {
@@ -253,7 +293,10 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
     transportStatus: 'connected',
     batchId: 'batch:telegram:1:telegram:2',
     messageCount: 2,
-    messages: batch().batch.jobs.map(job => job.payload.telegramContext),
+    messages: batch().batch.jobs.map(job => ({
+      ...job.payload.telegramContext,
+      trust: 'untrusted_external',
+    })),
   })
   assert.match(started.params.additionalContext.telegram_source.value, /originated from Telegram/)
   assert.match(started.params.additionalContext.telegram_trust_policy.value, /untrusted external feed/)
@@ -458,6 +501,47 @@ test('trusts only the authenticated owner DM and preserves its configured permis
   assert.deepEqual(started.params.sandboxPolicy, { type: 'dangerFullAccess' })
   assert.equal(started.params.approvalPolicy, 'never')
   assert.match(started.params.additionalContext.telegram_trust_policy.value, /authorized instruction source/)
+})
+
+test('groups simultaneous conversations by source and forces the mixed turn read-only', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', mixedSourceBatch())
+  await setup.connector.idle()
+
+  const started = setup.app.calls.find(call => call.method === 'turn/start')
+  const prompt = started.params.input[0].text
+  assert.match(prompt, /\[TG MULTI-SOURCE BATCH: 2 messages from 2 conversations\]/u)
+  assert.match(prompt, /\[TG SOURCE: OWNER DM\]\[trust=owner_dm\]/u)
+  assert.match(prompt, /\[TG SOURCE: PUBLIC GROUP\]\[trust=untrusted_external\]/u)
+  assert.ok(prompt.indexOf('owner request') < prompt.indexOf('group conversation'))
+  assert.equal(started.params.approvalPolicy, 'never')
+  assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
+  assert.match(started.params.additionalContext.telegram_trust_policy.value, /spans multiple Telegram conversations/iu)
+  assert.match(started.params.additionalContext.telegram_trust_policy.value, /entire turn is read-only/iu)
+  const context = JSON.parse(started.params.additionalContext.telegram.value)
+  assert.deepEqual(context.messages.map(message => ({
+    conversationKey: message.conversationKey,
+    trust: message.trust,
+  })), [
+    { conversationKey: '42', trust: 'owner_dm' },
+    { conversationKey: '-100999', trust: 'untrusted_external' },
+  ])
+
+  setup.app.emit('notification:item/completed', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: {
+      id: 'mixed-progress',
+      type: 'agentMessage',
+      phase: 'commentary',
+      text: 'private progress must not choose a public destination',
+    },
+  })
+  await setup.connector.idle()
+  assert.equal(setup.relay.frames.some(frame => frame.type === 'job_progress'), false)
 })
 
 test('automatically denies approval requests originating from an untrusted group turn', async t => {

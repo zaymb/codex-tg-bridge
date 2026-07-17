@@ -714,7 +714,7 @@ test('relay jobs expire silently before acceptance and complete only the accepte
   assert.equal(store.getRelayJob('telegram:complete').result.text, 'done')
 })
 
-test('claims, accepts, and finalizes one conversation batch atomically', async t => {
+test('claims, accepts, and finalizes every ready conversation in one batch atomically', async t => {
   const { store } = await openStore()
   t.after(() => store.close())
   for (const [id, conversationKey, nowMs] of [
@@ -740,8 +740,7 @@ test('claims, accepts, and finalizes one conversation batch atomically', async t
     maxBatchBytes: 100_000,
     nowMs: 200,
   })
-  assert.deepEqual(batch.map(job => job.jobId), ['telegram:1', 'telegram:2'])
-  assert.equal(store.getRelayJob('telegram:3').status, 'pending')
+  assert.deepEqual(batch.map(job => job.jobId), ['telegram:1', 'telegram:2', 'telegram:3'])
   assert.equal(store.acceptRelayJobBatch({
     jobIds: batch.map(job => job.jobId),
     connectorId: 'connector-a',
@@ -751,7 +750,7 @@ test('claims, accepts, and finalizes one conversation batch atomically', async t
     nowMs: 210,
   }), true)
   assert.equal(store.acceptRelayJobBatch({
-    jobIds: ['telegram:1', 'telegram:3'],
+    jobIds: ['telegram:1', 'telegram:2'],
     connectorId: 'connector-a',
     codexSessionId: 'session-a',
     threadId: 'thread-a',
@@ -765,15 +764,50 @@ test('claims, accepts, and finalizes one conversation batch atomically', async t
     result: { action: 'reply', text: 'one answer' },
     outboundActions: [{
       actionId: 'batch-answer',
-      conversationKey: 'group-a',
+      conversationKey: 'group-b',
       actionType: 'reply',
-      payload: { chatId: 'group-a', messageId: '2', text: 'one answer' },
+      payload: { chatId: 'group-b', messageId: '3', text: 'one answer' },
     }],
     nowMs: 230,
   }), true)
   assert.equal(store.getRelayJob('telegram:1').status, 'completed')
   assert.equal(store.getRelayJob('telegram:2').status, 'completed')
+  assert.equal(store.getRelayJob('telegram:3').status, 'completed')
   assert.equal(store.getOutboundAction('batch-answer').status, 'pending')
+})
+
+test('takes only the first author partition from each ready conversation', async t => {
+  const { store } = await openStore()
+  t.after(() => store.close())
+  for (const [id, conversationKey, senderId, nowMs] of [
+    ['1', 'repair-group', '42', 100],
+    ['2', 'repair-group', '99', 110],
+    ['3', 'owner-dm', '42', 120],
+  ]) {
+    store.enqueueRelayJob({
+      jobId: `telegram:${id}`,
+      sourceType: 'telegram',
+      sourceId: id,
+      conversationKey,
+      sessionLabel: 'tg-engage',
+      payload: {
+        text: `message ${id}`,
+        telegramContext: { senderId, senderIsBot: false },
+      },
+      expiresAtMs: 10_000,
+      nowMs,
+    })
+  }
+
+  const batch = store.claimRelayJobBatch({
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-a',
+    maxBatchBytes: 100_000,
+    nowMs: 200,
+  })
+
+  assert.deepEqual(batch.map(job => job.jobId), ['telegram:1', 'telegram:3'])
+  assert.equal(store.getRelayJob('telegram:2').status, 'pending')
 })
 
 test('never coalesces different Telegram authors into one relay batch', async t => {
