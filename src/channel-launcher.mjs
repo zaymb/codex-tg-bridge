@@ -37,6 +37,51 @@ function childExit(child) {
   })
 }
 
+function processGroupExists(processGroupId) {
+  try {
+    process.kill(-processGroupId, 0)
+    return true
+  } catch (error) {
+    if (error.code === 'ESRCH') return false
+    throw error
+  }
+}
+
+function signalDetachedProcessGroup(child, signal) {
+  if (!child?.pid) return false
+  if (process.platform === 'win32') return child.kill(signal)
+  try {
+    process.kill(-child.pid, signal)
+    return true
+  } catch (error) {
+    if (error.code === 'ESRCH') return false
+    throw error
+  }
+}
+
+async function waitForProcessGroupExit(processGroupId, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  while (processGroupExists(processGroupId) && Date.now() < deadline) await wait(20)
+  return !processGroupExists(processGroupId)
+}
+
+async function stopDetachedProcessGroup(child, graceMs) {
+  if (!child?.pid) return
+  if (process.platform === 'win32') {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM')
+    await childExit(child)
+    return
+  }
+  signalDetachedProcessGroup(child, 'SIGTERM')
+  if (!await waitForProcessGroupExit(child.pid, graceMs)) {
+    signalDetachedProcessGroup(child, 'SIGKILL')
+    if (!await waitForProcessGroupExit(child.pid, graceMs)) {
+      throw new Error('Codex app-server process group did not exit')
+    }
+  }
+  await childExit(child)
+}
+
 export async function waitForChannelExit(tui, connectorRun) {
   const outcome = await Promise.race([
     childExit(tui).then(result => ({ source: 'tui', result })),
@@ -66,6 +111,10 @@ export async function main(
   const codexPath = local.codexPath
   const nodePath = local.nodePath ?? process.execPath
   const contractPath = resolve(bridgeRoot, local.contractPath ?? 'fixtures/codex-app-server-0.144.1/contract.json')
+  const appServerShutdownGraceMs = local.appServerShutdownGraceMs ?? 2_000
+  if (!Number.isSafeInteger(appServerShutdownGraceMs) || appServerShutdownGraceMs < 0) {
+    throw new Error('appServerShutdownGraceMs must be a non-negative integer')
+  }
   const writeChannelStatus = createChannelStatusWriter(resolve(
     bridgeRoot,
     local.statusPath ?? '.state/channel-status.json',
@@ -89,7 +138,7 @@ export async function main(
   const shutdown = () => {
     connectorController.abort()
     if (tui?.exitCode === null && tui.signalCode === null) tui.kill('SIGTERM')
-    if (appServer.exitCode === null && appServer.signalCode === null) appServer.kill('SIGTERM')
+    signalDetachedProcessGroup(appServer, 'SIGTERM')
   }
   signal?.addEventListener('abort', shutdown, { once: true })
   if (signal?.aborted) shutdown()
@@ -151,12 +200,11 @@ export async function main(
     signal?.removeEventListener('abort', shutdown)
     connectorController.abort()
     if (tui?.exitCode === null && tui.signalCode === null) tui.kill('SIGTERM')
-    if (appServer.exitCode === null) appServer.kill('SIGTERM')
     await Promise.allSettled([
       connectorRun,
       tui && childExit(tui),
-      childExit(appServer),
     ].filter(Boolean))
+    await stopDetachedProcessGroup(appServer, appServerShutdownGraceMs)
     await rm(runtimeDir, { recursive: true, force: true })
     await writeStatus({
       source: 'telegram',

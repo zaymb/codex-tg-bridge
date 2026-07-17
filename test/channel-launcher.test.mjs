@@ -47,6 +47,7 @@ async function createFixture() {
   const statusPath = join(directory, 'channel-status.json')
   const configPath = join(directory, 'local-channel.json')
   await writeFile(fakeCodexPath, `#!/usr/bin/env node
+import { spawn } from 'node:child_process'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { join } from 'node:path'
@@ -65,6 +66,12 @@ if (command === 'app-server') {
     server.listen(socketPath, resolveListen)
   })
   await writeFile(join(records, 'app-server.json'), JSON.stringify({ pid: process.pid, socketPath }))
+  if (process.env.FAKE_ORPHAN_WORKER === '1') {
+    const worker = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], {
+      stdio: 'ignore',
+    })
+    await writeFile(join(records, 'worker.json'), JSON.stringify({ pid: worker.pid }))
+  }
   const shutdown = () => server.close(() => process.exit(0))
   process.once('SIGTERM', shutdown)
   process.once('SIGINT', shutdown)
@@ -100,6 +107,7 @@ if (command === 'app-server') {
     statusPath,
     reconnectInitialMs: 5,
     reconnectMaxMs: 10,
+    appServerShutdownGraceMs: 100,
   }, null, 2)}\n`)
 
   return { configPath, records, statusPath }
@@ -132,6 +140,20 @@ async function readChannelChildren(records) {
     }
   })
   return { appServer, tui }
+}
+
+async function readRecordedProcess(records, name) {
+  let record
+  await waitFor(async () => {
+    try {
+      record = JSON.parse(await readFile(join(records, `${name}.json`), 'utf8'))
+      return true
+    } catch (error) {
+      if (error.code === 'ENOENT' || error instanceof SyntaxError) return false
+      throw error
+    }
+  })
+  return record
 }
 
 async function cleanupChildren(launcher, children = {}) {
@@ -194,6 +216,22 @@ test('a normal TUI exit performs the same cleanup and records its reason', async
     assert.equal(status.reason, 'tui_exited')
     assert.equal(status.codexSessionId, sessionId)
     await assert.rejects(stat(dirname(children.appServer.socketPath)), { code: 'ENOENT' })
+  } finally {
+    await cleanupChildren(launcher, children)
+  }
+})
+
+test('kills the detached app-server process group when its wrapper leaves a worker behind', async () => {
+  const fixture = await createFixture()
+  const launcher = startLauncher(fixture, { FAKE_ORPHAN_WORKER: '1' })
+  let children = {}
+  try {
+    children = await readChannelChildren(fixture.records)
+    children.worker = await readRecordedProcess(fixture.records, 'worker')
+
+    launcher.kill('SIGTERM')
+    assert.deepEqual(await childExit(launcher), { code: 0, signal: null })
+    await waitFor(() => !processExists(children.appServer.pid) && !processExists(children.worker.pid))
   } finally {
     await cleanupChildren(launcher, children)
   }
