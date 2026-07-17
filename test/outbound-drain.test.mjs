@@ -54,12 +54,12 @@ function fixture() {
   return { state, telegram, drain, setNow(value) { now = value } }
 }
 
-function queueReply(state, actionId = 'reply:1') {
+function queueReply(state, actionId = 'reply:1', payloadOverrides = {}) {
   state.createOutboundAction({
     actionId,
     conversationKey: '42',
     actionType: 'reply',
-    payload: { chatId: '42', messageId: '10', text: 'hello' },
+    payload: { chatId: '42', messageId: '10', text: 'hello', ...payloadOverrides },
     nowMs: 1_000,
   })
 }
@@ -167,5 +167,23 @@ test('defers rate limits and does not retry ambiguous deliveries', async t => {
   })
   assert.equal(await setup.drain.drainOnce(), 1)
   assert.equal(setup.state.getOutboundAction('ambiguous').status, 'ambiguous')
+  assert.equal(await setup.drain.drainOnce(), 0)
+})
+
+test('does not retry a rate-limited progress update after the final can exist', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  queueReply(setup.state, 'progress:1', { deliveryClass: 'progress' })
+  setup.telegram.failure = new RateLimitError('limited', {
+    method: 'sendMessage',
+    code: 429,
+    parameters: { retry_after: 3 },
+  })
+
+  assert.equal(await setup.drain.drainOnce(), 1)
+  const action = setup.state.getOutboundAction('progress:1')
+  assert.equal(action.status, 'failed')
+  assert.equal(action.nextAttemptAtMs, null)
+  setup.setNow(4_000)
   assert.equal(await setup.drain.drainOnce(), 0)
 })

@@ -80,7 +80,7 @@ export function buildTelegramToolHandlers({ controlClient, actionIdFactory = too
 export function createTelegramMcpServer({ controlClient }) {
   const server = new McpServer({ name: 'tg-engage-telegram-actions', version: '0.1.0' })
   const handlers = buildTelegramToolHandlers({ controlClient })
-  const target = z.string().min(1).max(128).describe('Approved Telegram chat alias or conversation key')
+  const target = z.string().min(1).max(128).describe('Approved Telegram chat alias, conversation key, or unique known topic name')
   const messageId = z.string().regex(/^\d+$/u)
   server.registerTool('telegram_send_text', {
     description: 'Send one final text message to an approved Telegram chat.',

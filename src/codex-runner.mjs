@@ -32,7 +32,7 @@ export const TELEGRAM_BATCH_OUTPUT_SCHEMA = Object.freeze({
       items: {
         type: 'object',
         additionalProperties: false,
-        required: ['messageId', 'action', 'text'],
+        required: ['messageId', 'action', 'text', 'isBig'],
         properties: {
           messageId: { type: 'string', pattern: '^\\d+$' },
           action: { type: 'string', enum: ['send', 'react', 'dice'] },
@@ -55,15 +55,18 @@ export const TELEGRAM_OUTPUT_INSTRUCTIONS = [
 
 export const TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS = [
   'Apply this Telegram output contract only while the latest user input is marked [TG].',
+  'Plain-text commentary is delivered immediately to Telegram as a progress update; keep it concise and user-facing, and never wrap commentary in JSON.',
+  'Only final_answer may contain the Telegram JSON envelope.',
   'For [TG] input, return one JSON object with exactly action, text, responses, and reason.',
   'Use action=send and put one Telegram-ready answer in text.',
   'Use action=react and put exactly one Telegram reaction emoji in text when a reaction to the latest message is better than a written reply.',
-  'For an inbound batch, you may instead set text to an empty string and use responses to respond selectively to one or more listed messageId values; each response action is send, react, or dice, and omitted messages receive nothing.',
+  'Choose exactly one reply form: either put one answer in text and keep responses empty, or set text to an empty string and use responses for selective replies. Never duplicate an answer into both fields.',
+  'Each selective response must contain messageId (the listed Telegram message_id rendered as a string), action (send, react, or dice), text, and isBig (a boolean). Omitted messages receive nothing.',
   'Use a targeted response with action=dice and text set to exactly one of 🎲 🎯 🏀 ⚽ 🎳 🎰 to send Telegram animated dice.',
   'Always include responses; use an empty array when no targeted responses are needed.',
   'Use action=skip only when no Telegram response should be sent, with a concise reason.',
   'If a later user input is unmarked, it came from the terminal: answer it normally in plain text without the Telegram JSON envelope.',
-  'Do not expose reasoning, tool progress, or partial output in a Telegram response.',
+  'Do not expose hidden reasoning or raw tool output. Use commentary only for brief progress and final_answer for the final response.',
 ].join(' ')
 
 export class CodexTurnTimeoutError extends Error {
@@ -137,22 +140,61 @@ function extractFinal(items) {
 }
 
 export function parseTelegramStructuredOutput(text) {
+  const malformed = () => ({
+    action: 'skip',
+    skipped: true,
+    finalText: null,
+    responses: [],
+    reason: 'malformed_structured_output',
+  })
+
+  const normalizeResponses = value => {
+    if (!Array.isArray(value) || value.length === 0 || value.length > 32) return null
+    const seen = new Set()
+    const responses = []
+    for (const response of value) {
+      const rawMessageId = response?.messageId ?? response?.message_id
+      const messageId = typeof rawMessageId === 'number'
+        ? String(rawMessageId)
+        : rawMessageId
+      const action = response?.action === 'send' || response?.action === undefined
+        ? 'reply'
+        : response?.action
+      if (
+        typeof messageId !== 'string'
+        || !/^\d+$/u.test(messageId)
+        || seen.has(messageId)
+        || !['reply', 'react', 'dice'].includes(action)
+        || typeof response?.text !== 'string'
+        || !response.text.trim()
+      ) return null
+      seen.add(messageId)
+      responses.push({
+        messageId,
+        action,
+        text: response.text,
+        ...(typeof response.isBig === 'boolean' ? { isBig: response.isBig } : {}),
+      })
+    }
+    return responses
+  }
+
   const parseEnvelope = value => {
     const parsed = JSON.parse(value)
     if (parsed?.action === 'skip') {
       return { action: 'skip', skipped: true, finalText: null, responses: [], reason: String(parsed.reason ?? '') }
     }
     if (['send', 'react'].includes(parsed?.action) && typeof parsed.text === 'string') {
+      const hasRootText = Boolean(parsed.text.trim())
+      const responses = hasRootText
+        ? []
+        : normalizeResponses(parsed.responses)
+      if (!hasRootText && (parsed.action === 'react' || responses === null)) return null
       return {
         action: parsed.action,
         skipped: false,
         finalText: parsed.text,
-        responses: Array.isArray(parsed.responses)
-          ? parsed.responses.map(response => ({
-              ...response,
-              action: ['react', 'dice'].includes(response?.action) ? response.action : 'reply',
-            }))
-          : [],
+        responses,
         reason: String(parsed.reason ?? ''),
       }
     }
@@ -189,13 +231,7 @@ export function parseTelegramStructuredOutput(text) {
         break
       }
     }
-    return {
-      action: 'skip',
-      skipped: true,
-      finalText: null,
-      responses: [],
-      reason: 'malformed_structured_output',
-    }
+    return malformed()
   }
   const skip = text.match(/^\s*\[SKIP\](?:\s+理由[:：]?)?\s*(.*)$/isu)
   if (skip) return { action: 'skip', skipped: true, finalText: null, responses: [], reason: skip[1].trim() }

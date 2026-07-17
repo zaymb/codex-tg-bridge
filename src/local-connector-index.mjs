@@ -5,9 +5,11 @@ import { readFile } from 'node:fs/promises'
 import { pathToFileURL } from 'node:url'
 
 import { AppServerClient } from './app-server-client.mjs'
+import { AttachmentStore } from './attachment-store.mjs'
 import { loadLocalConnectorConfig } from './config.mjs'
 import { LocalSessionConnector } from './local-session-connector.mjs'
 import { ProcessRelayClient } from './process-relay-client.mjs'
+import { RELAY_JOB_TTL_MS } from './relay-dispatcher.mjs'
 
 export function buildRelaySshArgs(config) {
   return [
@@ -22,7 +24,11 @@ export function buildRelaySshArgs(config) {
     'sudo', '-n', '-u', config.remoteServiceUser,
     'env',
     `BRIDGE_DB_PATH=${config.remoteDbPath}`,
+    `BRIDGE_ATTACHMENT_ROOT=${config.relayAttachmentRoot}`,
     `BRIDGE_SESSION_LABEL=${config.sessionLabel}`,
+    `BRIDGE_RELAY_FRAME_MAX_BYTES=${config.frameMaxBytes}`,
+    `BRIDGE_RELAY_COALESCE_QUIET_MS=${config.coalesceQuietMs}`,
+    `BRIDGE_RELAY_COALESCE_MAX_MS=${config.coalesceMaxMs}`,
     config.remoteNodePath,
     config.remoteScriptPath,
   ]
@@ -36,7 +42,11 @@ export function buildRelayProcessSpec(config, env = process.env) {
       env: {
         ...env,
         BRIDGE_DB_PATH: config.localDbPath,
+        BRIDGE_ATTACHMENT_ROOT: config.relayAttachmentRoot,
         BRIDGE_SESSION_LABEL: config.sessionLabel,
+        BRIDGE_RELAY_FRAME_MAX_BYTES: String(config.frameMaxBytes),
+        BRIDGE_RELAY_COALESCE_QUIET_MS: String(config.coalesceQuietMs),
+        BRIDGE_RELAY_COALESCE_MAX_MS: String(config.coalesceMaxMs),
       },
     }
   }
@@ -59,6 +69,8 @@ export async function main(env = process.env) {
     ...relayProcess,
     frameMaxBytes: config.frameMaxBytes,
   })
+  const attachmentStore = await AttachmentStore.open({ root: config.localAttachmentRoot })
+  await attachmentStore.pruneOlderThan(Date.now() - RELAY_JOB_TTL_MS)
   const connector = new LocalSessionConnector({
     appServerClient,
     relayClient,
@@ -72,6 +84,7 @@ export async function main(env = process.env) {
     ownerUserId: config.ownerUserId,
     privateChatIds: config.privateChatIds,
     repairChatIds: config.repairChatIds,
+    attachmentStore,
   })
   const controller = new AbortController()
   const shutdown = () => controller.abort()

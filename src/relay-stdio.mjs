@@ -1,16 +1,25 @@
 #!/usr/bin/env node
 
+import { once } from 'node:events'
 import { createInterface } from 'node:readline'
 import { pathToFileURL } from 'node:url'
 
+import { AttachmentStore } from './attachment-store.mjs'
 import { loadRelayConfig } from './config.mjs'
 import { RelayProtocolSession, RELAY_PROTOCOL_VERSION } from './relay-protocol.mjs'
 import { StateStore } from './state-store.mjs'
 
+export function createFrameWriter(output) {
+  return async frame => {
+    if (!output.write(`${JSON.stringify(frame)}\n`)) await once(output, 'drain')
+  }
+}
+
 export async function main(env = process.env, input = process.stdin, output = process.stdout) {
   const config = loadRelayConfig(env)
   const stateStore = StateStore.open(config.dbPath)
-  const writeFrame = frame => output.write(`${JSON.stringify(frame)}\n`)
+  const attachmentStore = await AttachmentStore.open({ root: config.attachmentRoot })
+  const writeFrame = createFrameWriter(output)
   const session = new RelayProtocolSession({
     stateStore,
     sessionLabel: config.sessionLabel,
@@ -18,6 +27,9 @@ export async function main(env = process.env, input = process.stdin, output = pr
     leaseMs: config.sessionLeaseMs,
     jobLeaseMs: config.jobLeaseMs,
     frameMaxBytes: config.frameMaxBytes,
+    coalesceQuietMs: config.coalesceQuietMs,
+    coalesceMaxMs: config.coalesceMaxMs,
+    removeAttachment: path => attachmentStore.remove(path),
   })
   const lines = createInterface({ input, crlfDelay: Infinity })
   let chain = Promise.resolve()
@@ -41,7 +53,7 @@ export async function main(env = process.env, input = process.stdin, output = pr
     await chain
     if (fatalError) throw fatalError
   } catch (error) {
-    writeFrame({ version: RELAY_PROTOCOL_VERSION, type: 'error', message: error.message })
+    await writeFrame({ version: RELAY_PROTOCOL_VERSION, type: 'error', message: error.message })
     throw error
   } finally {
     clearInterval(claimTimer)

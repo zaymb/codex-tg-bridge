@@ -220,3 +220,20 @@ test('gets Telegram file metadata and downloads bytes without leaking the token 
     return true
   })
 })
+
+test('enforces Telegram file limits before and during download', async () => {
+  const declared = clientWith((url) => {
+    if (url.endsWith('/getFile')) {
+      return jsonResponse({ ok: true, result: { file_path: 'docs/a.bin', file_size: 9 } })
+    }
+    throw new Error('download must not start')
+  })
+  await assert.rejects(declared.client.downloadFile('f', { maxBytes: 8 }), /declared size exceeds/u)
+  assert.equal(declared.calls.length, 1)
+
+  const streamed = clientWith((url) => {
+    if (url.endsWith('/getFile')) return jsonResponse({ ok: true, result: { file_path: 'docs/a.bin' } })
+    return new Response(Buffer.from('123456789'), { status: 200 })
+  })
+  await assert.rejects(streamed.client.downloadFile('f', { maxBytes: 8 }), /download exceeds/u)
+})

@@ -230,6 +230,14 @@ function mapRelaySession(row) {
   }
 }
 
+function relayJobAuthorPartition(job) {
+  const context = job.payload?.telegramContext
+  if (context?.senderId === null || context?.senderId === undefined) {
+    return 'unknown'
+  }
+  return `${String(context.senderId)}:${context.senderIsBot === true ? 'bot' : 'human'}`
+}
+
 export class StateStore {
   static open(path) {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
@@ -957,6 +965,22 @@ export class StateStore {
     `).run(retryAtMs, String(error), nowMs, actionId).changes === 1
   }
 
+  supersedeOutboundActions({ actionIds, reason, nowMs = Date.now() }) {
+    if (!Array.isArray(actionIds) || new Set(actionIds).size !== actionIds.length) {
+      throw new Error('superseded outbound actions require unique action IDs')
+    }
+    const update = this.#db.prepare(`
+      UPDATE outbound_actions
+      SET status = 'failed', next_attempt_at_ms = NULL, last_error = ?, updated_at_ms = ?
+      WHERE action_id = ? AND status IN ('pending', 'failed')
+    `)
+    const transaction = this.#db.transaction(() => actionIds.reduce(
+      (count, actionId) => count + update.run(String(reason), nowMs, String(actionId)).changes,
+      0,
+    ))
+    return transaction()
+  }
+
   recoverInterruptedOutboundActions(nowMs = Date.now()) {
     return this.#db.prepare(`
       UPDATE outbound_actions
@@ -1324,10 +1348,19 @@ export class StateStore {
     maxBatchBytes,
     leaseMs = 120_000,
     nowMs = Date.now(),
+    coalesceQuietMs = 0,
+    coalesceMaxMs = 0,
+    allowAttachments = true,
   }) {
     if (!sessionLabel || !connectorId) throw new Error('relay sessionLabel and connectorId are required')
     if (!Number.isSafeInteger(maxBatchBytes) || maxBatchBytes <= 0) {
       throw new Error('relay maxBatchBytes must be a positive integer')
+    }
+    if (!Number.isSafeInteger(coalesceQuietMs) || coalesceQuietMs < 0) {
+      throw new Error('relay coalesceQuietMs must be a non-negative integer')
+    }
+    if (!Number.isSafeInteger(coalesceMaxMs) || coalesceMaxMs < coalesceQuietMs) {
+      throw new Error('relay coalesceMaxMs must be an integer at least coalesceQuietMs')
     }
     const transaction = this.#db.transaction(() => {
       this.expireRelayJobs(nowMs)
@@ -1336,22 +1369,57 @@ export class StateStore {
         SET status = 'pending', lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?
         WHERE status = 'leased' AND lease_expires_at_ms <= ? AND expires_at_ms > ?
       `).run(nowMs, nowMs, nowMs)
-      const oldest = this.#db.prepare(`
-        SELECT conversation_key FROM relay_jobs
-        WHERE session_label = ? AND status = 'pending' AND expires_at_ms > ?
-        ORDER BY created_at_ms, job_id LIMIT 1
-      `).get(String(sessionLabel), nowMs)
-      if (!oldest) return []
+      const coalescingEnabled = coalesceQuietMs > 0
+      const nextConversation = this.#db.prepare(`
+        SELECT * FROM (
+          SELECT
+            conversation_key,
+            MIN(created_at_ms) AS first_created_at_ms,
+            MAX(created_at_ms) AS last_created_at_ms,
+            MAX(CASE
+              WHEN json_extract(payload_json, '$.dispatch.bypassCoalesce') = 1 THEN 1
+              ELSE 0
+            END) AS bypass_coalesce,
+            MAX(CASE
+              WHEN json_type(payload_json, '$.attachments') = 'array'
+                AND json_array_length(payload_json, '$.attachments') > 0 THEN 1
+              ELSE 0
+            END) AS has_attachments
+          FROM relay_jobs
+          WHERE session_label = ? AND status = 'pending' AND expires_at_ms > ?
+          GROUP BY conversation_key
+        )
+        WHERE (
+          ? = 0
+          OR bypass_coalesce = 1
+          OR last_created_at_ms <= ?
+          OR first_created_at_ms <= ?
+        ) AND (? = 1 OR has_attachments = 0)
+        ORDER BY bypass_coalesce DESC, first_created_at_ms, conversation_key
+        LIMIT 1
+      `).get(
+        String(sessionLabel),
+        nowMs,
+        coalescingEnabled ? 1 : 0,
+        nowMs - coalesceQuietMs,
+        nowMs - coalesceMaxMs,
+        allowAttachments ? 1 : 0,
+      )
+      if (!nextConversation) return []
 
       const candidates = this.#db.prepare(`
         SELECT * FROM relay_jobs
         WHERE session_label = ? AND conversation_key = ?
           AND status = 'pending' AND expires_at_ms > ?
         ORDER BY created_at_ms, job_id
-      `).all(String(sessionLabel), oldest.conversation_key, nowMs).map(mapRelayJob)
+      `).all(String(sessionLabel), nextConversation.conversation_key, nowMs).map(mapRelayJob)
       const selected = []
+      const authorPartition = relayJobAuthorPartition(candidates[0])
       let usedBytes = 2
       for (const job of candidates) {
+        // A mixed-author batch could grant a peer message the owner's repair-group
+        // permissions. Keep batches contiguous and single-author at the durable queue.
+        if (relayJobAuthorPartition(job) !== authorPartition) break
         const jobBytes = Buffer.byteLength(JSON.stringify(job)) + (selected.length === 0 ? 0 : 1)
         if (usedBytes + jobBytes > maxBatchBytes) break
         selected.push(job)
@@ -1492,7 +1560,14 @@ export class StateStore {
     return transaction()
   }
 
-  finalizeRelayJobBatch({ jobIds, turnId, result, outboundActions = [], nowMs = Date.now() }) {
+  finalizeRelayJobBatch({
+    jobIds,
+    turnId,
+    result,
+    outboundActions = [],
+    supersedeActionIds = [],
+    nowMs = Date.now(),
+  }) {
     if (!Array.isArray(jobIds) || jobIds.length === 0 || new Set(jobIds).size !== jobIds.length) {
       throw new Error('finalized relay batch requires unique job IDs')
     }
@@ -1502,6 +1577,11 @@ export class StateStore {
           throw new Error('relay batch could not be finalized atomically')
         }
       }
+      this.supersedeOutboundActions({
+        actionIds: supersedeActionIds,
+        reason: 'superseded by final relay result',
+        nowMs,
+      })
       for (const action of outboundActions) this.createOutboundAction({ ...action, nowMs })
       return true
     })

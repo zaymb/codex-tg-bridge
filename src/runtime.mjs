@@ -1,3 +1,5 @@
+import { listKnownTopics, resolveTopicName } from './topic-map.mjs'
+
 function aliasByTarget(config) {
   const result = new Map()
   for (const [alias, target] of config.chatAliases) {
@@ -36,14 +38,30 @@ export function seedApprovedChats(stateStore, config, nowMs = Date.now()) {
   }
   for (const [alias, target] of config.chatAliases) {
     if (!target.includes(':')) continue
-    const [chatId] = target.split(':')
+    const [chatId, threadId] = target.split(':')
     chats.push({
       conversationKey: target,
       telegramChatId: chatId,
       alias,
-      title: null,
+      title: resolveTopicName(config.topicNames, chatId, threadId) ?? null,
       kind: 'forum_topic',
     })
+  }
+  const seededKeys = new Set(chats.map(chat => chat.conversationKey))
+  for (const chatId of config.allowedChatIds) {
+    for (const topic of listKnownTopics(config.topicNames, chatId)) {
+      if (topic.threadId === null) continue
+      const key = `${chatId}:${topic.threadId}`
+      if (seededKeys.has(key)) continue
+      chats.push({
+        conversationKey: key,
+        telegramChatId: chatId,
+        alias: null,
+        title: topic.name,
+        kind: 'forum_topic',
+      })
+      seededKeys.add(key)
+    }
   }
   stateStore.replaceApprovedChats(chats, nowMs)
 }

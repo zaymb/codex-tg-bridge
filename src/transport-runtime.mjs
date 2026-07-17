@@ -1,7 +1,10 @@
+import { dirname, join } from 'node:path'
+
+import { AttachmentStore } from './attachment-store.mjs'
 import { EngagementPolicy } from './engagement-policy.mjs'
 import { OutboundDrain } from './outbound-drain.mjs'
 import { Poller } from './poller.mjs'
-import { RelayDispatcher } from './relay-dispatcher.mjs'
+import { RelayDispatcher, RELAY_JOB_TTL_MS } from './relay-dispatcher.mjs'
 import { seedApprovedChats } from './runtime.mjs'
 import { StateStore } from './state-store.mjs'
 import { TelegramClient } from './telegram-client.mjs'
@@ -36,6 +39,10 @@ export async function createTransportRuntime({
       tokenReader: config.readTelegramToken,
       fetchImpl,
     })
+    const attachmentStore = await AttachmentStore.open({
+      root: config.attachmentRoot ?? join(dirname(config.dbPath), 'attachments'),
+    })
+    await attachmentStore.pruneOlderThan(Date.now() - RELAY_JOB_TTL_MS)
     const [bot, webhook] = await Promise.all([
       telegramClient.getMe(),
       telegramClient.getWebhookInfo(),
@@ -56,6 +63,9 @@ export async function createTransportRuntime({
       stateStore,
       engagementPolicy,
       sessionLabel: config.sessionLabel,
+      telegramClient,
+      attachmentStore,
+      topicNames: config.topicNames,
       ownerUserId: config.ownerUserId,
       updateLeaseMs: config.updateLeaseMs,
     })

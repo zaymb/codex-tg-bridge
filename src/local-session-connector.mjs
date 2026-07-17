@@ -18,7 +18,8 @@ import {
   guardTelegramOutput,
   isInstructionTrust,
 } from './channel-trust.mjs'
-import { RELAY_PROTOCOL_VERSION } from './relay-protocol.mjs'
+import { RELAY_ATTACHMENT_CAPABILITY, RELAY_PROTOCOL_VERSION } from './relay-protocol.mjs'
+import { RelayAttachmentReceiver } from './relay-attachment-transfer.mjs'
 
 function isActiveStatus(status) {
   return ['inProgress', 'in_progress', 'running', 'started'].includes(status)
@@ -39,7 +40,7 @@ function finalText(turn, collectedItems) {
   const items = Array.isArray(turn?.items) && turn.items.length > 0 ? turn.items : collectedItems
   const messages = items.filter(item => item?.type === 'agentMessage' && typeof item.text === 'string')
   const finals = messages.filter(item => item.phase === 'final_answer')
-  return (finals.length > 0 ? finals : messages).at(-1)?.text ?? ''
+  return finals.at(-1)?.text ?? null
 }
 
 function normalizeInbound(frame) {
@@ -64,6 +65,22 @@ function conversationLabel(context) {
   return context.conversationKey || context.chatId || 'unknown'
 }
 
+function topicLabel(context) {
+  return context.threadName ? `[topic=${context.threadName}]` : ''
+}
+
+function messageBody(job) {
+  const attachments = job.payload?.attachments ?? []
+  const files = attachments
+    .filter(attachment => attachment.codexInput !== 'localImage')
+    .map(attachment => `- ${attachment.fileName || attachment.kind}: ${attachment.localPath}`)
+  const suffix = files.length > 0 ? `\n\nTelegram attachments:\n${files.join('\n')}` : ''
+  const imagePrompt = attachments.some(attachment => attachment.codexInput === 'localImage')
+    ? '请查看附图并回应。'
+    : '[no text]'
+  return `${job.payload?.text || imagePrompt}${suffix}`
+}
+
 function messageLine(job, trust) {
   const context = job.payload?.telegramContext ?? {}
   const sender = senderLabel(context)
@@ -73,12 +90,18 @@ function messageLine(job, trust) {
     || context.replyTo?.senderId
   const replyNote = replyTarget ? ` (replying to ${replyTarget})` : ''
   const messageId = context.messageId ?? 'unknown'
-  return `${externalFeedTag(trust)}\n[TG][conversation_key=${conversation}][message_id=${messageId}][sender=${sender}]${replyNote}\n${job.payload?.text || '[no text]'}`
+  return `${externalFeedTag(trust)}\n[TG][conversation_key=${conversation}]${topicLabel(context)}[message_id=${messageId}][sender=${sender}]${replyNote}\n${messageBody(job)}`
+}
+
+function localImages(jobs) {
+  return jobs.flatMap(job => (job.payload?.attachments ?? [])
+    .filter(attachment => attachment.codexInput === 'localImage')
+    .map(attachment => ({ type: 'localImage', path: attachment.localPath })))
 }
 
 function batchInput(jobs, trust) {
   if (jobs.length === 1) {
-    return [{ type: 'text', text: messageLine(jobs[0], trust) }]
+    return [{ type: 'text', text: messageLine(jobs[0], trust) }, ...localImages(jobs)]
   }
   const lines = [
     externalFeedTag(trust),
@@ -94,9 +117,9 @@ function batchInput(jobs, trust) {
       || context.replyTo?.senderId
     const replyNote = replyTarget ? ` (replying to ${replyTarget})` : ''
     const messageId = context.messageId ?? 'unknown'
-    lines.push(`${index + 1}. [TG][conversation_key=${conversation}][message_id=${messageId}] ${sender}${replyNote}: ${job.payload?.text || '[no text]'}`)
+    lines.push(`${index + 1}. [TG][conversation_key=${conversation}]${topicLabel(context)}[message_id=${messageId}] ${sender}${replyNote}: ${messageBody(job)}`)
   })
-  return [{ type: 'text', text: lines.join('\n') }]
+  return [{ type: 'text', text: lines.join('\n') }, ...localImages(jobs)]
 }
 
 export class LocalSessionConnector extends EventEmitter {
@@ -123,6 +146,8 @@ export class LocalSessionConnector extends EventEmitter {
   #closed = false
   #listeners = []
   #pendingApprovals = new Map()
+  #attachmentReceiver = null
+  #attachmentStore = null
 
   constructor({
     appServerClient,
@@ -139,6 +164,7 @@ export class LocalSessionConnector extends EventEmitter {
     repairChatIds = new Set(),
     approvalTtlMs = 10 * 60 * 1_000,
     clock = Date.now,
+    attachmentStore = null,
   }) {
     super()
     this.#app = appServerClient
@@ -156,6 +182,10 @@ export class LocalSessionConnector extends EventEmitter {
     this.#repairChatIds = new Set([...repairChatIds].map(String))
     this.#approvalTtlMs = approvalTtlMs
     this.#clock = clock
+    if (attachmentStore) {
+      this.#attachmentStore = attachmentStore
+      this.#attachmentReceiver = new RelayAttachmentReceiver({ attachmentStore })
+    }
   }
 
   #available() {
@@ -225,6 +255,7 @@ export class LocalSessionConnector extends EventEmitter {
       connectorId: this.#connectorId,
       codexSessionId: this.#codexSessionId,
       acceptingJobs: this.#available(),
+      capabilities: this.#attachmentReceiver ? [RELAY_ATTACHMENT_CAPABILITY] : [],
     })
     this.#heartbeatTimer = setInterval(() => {
       if (this.#closed) return
@@ -268,6 +299,31 @@ export class LocalSessionConnector extends EventEmitter {
     const items = this.#items.get(params.turnId) ?? []
     items.push(params.item)
     this.#items.set(params.turnId, items)
+
+    if (
+      params.turnId !== this.#currentJob?.turnId
+      || this.#currentJob.mixedSource
+      || this.#currentJob.awaitingRecord
+      || params.item?.type !== 'agentMessage'
+      || params.item.phase !== 'commentary'
+      || typeof params.item.text !== 'string'
+      || !params.item.text.trim()
+    ) return
+
+    const output = guardTelegramOutput(
+      parseTelegramStructuredOutput(params.item.text),
+      this.#currentJob.trust,
+    )
+    if (output.skipped || output.action !== 'send' || !output.finalText?.trim()) return
+    const progressId = params.item.id ?? `progress-${createHash('sha256')
+      .update(`${params.turnId}\0${params.item.text}`)
+      .digest('hex')
+      .slice(0, 32)}`
+    this.#send(this.#resultFrame('job_progress', {
+      turnId: params.turnId,
+      progressId,
+      text: output.finalText,
+    }))
   }
 
   #resultFrame(type, fields = {}) {
@@ -303,28 +359,36 @@ export class LocalSessionConnector extends EventEmitter {
           result: { action: 'skip', reason: 'mixed_source_turn' },
         }))
       } else {
-        const output = guardTelegramOutput(
-          parseTelegramStructuredOutput(finalText(turn, items)),
-          this.#currentJob.trust,
-        )
-        this.#send(this.#resultFrame('job_result', {
-          turnId: turn.id,
-          result: output.skipped
-            ? { action: 'skip', reason: output.reason }
-            : output.action === 'react'
-              ? {
-                  action: 'react',
+        const text = finalText(turn, items)
+        if (text === null) {
+          this.#send(this.#resultFrame('job_result', {
+            turnId: turn.id,
+            result: { action: 'skip', reason: 'missing_final_answer' },
+          }))
+        } else {
+          const output = guardTelegramOutput(
+            parseTelegramStructuredOutput(text),
+            this.#currentJob.trust,
+          )
+          this.#send(this.#resultFrame('job_result', {
+            turnId: turn.id,
+            result: output.skipped
+              ? { action: 'skip', reason: output.reason }
+              : output.action === 'react'
+                ? {
+                    action: 'react',
+                    text: output.finalText,
+                    responses: output.responses,
+                    reason: output.reason,
+                  }
+              : {
+                  action: 'reply',
                   text: output.finalText,
                   responses: output.responses,
                   reason: output.reason,
-                }
-            : {
-                action: 'reply',
-                text: output.finalText,
-                responses: output.responses,
-                reason: output.reason,
-              },
-        }))
+                },
+          }))
+        }
       }
       this.#currentJob.awaitingRecord = true
       return
@@ -387,6 +451,11 @@ export class LocalSessionConnector extends EventEmitter {
 
   async #handleRelayFrame(frame) {
     if (!frame || frame.version !== RELAY_PROTOCOL_VERSION) throw new Error('unsupported relay protocol version')
+    if (frame.type === 'attachment_manifest' || frame.type === 'attachment_chunk') {
+      if (!this.#attachmentReceiver) throw new Error('relay attachment store is not configured')
+      await this.#attachmentReceiver.handleFrame(frame)
+      return
+    }
     if (frame.type === 'heartbeat' || frame.type === 'ready') {
       this.emit('relayStatus', {
         status: 'connected',
@@ -403,13 +472,22 @@ export class LocalSessionConnector extends EventEmitter {
     if (frame.type === 'job_recorded') {
       if (!this.#recordedMatches(frame)) return
       const restorePermissions = !isInstructionTrust(this.#currentJob.trust)
+      const paths = this.#currentJob.jobs.flatMap(job => (job.payload?.attachments ?? [])
+        .map(attachment => attachment.localPath)
+        .filter(Boolean))
+      if (this.#attachmentStore?.remove) {
+        await Promise.allSettled(paths.map(path => this.#attachmentStore.remove(path)))
+      }
       this.#currentJob = null
       if (restorePermissions) await this.#resumeWithConfiguredPolicy()
       this.#send({ type: 'heartbeat', acceptingJobs: this.#available() })
       return
     }
 
-    const inbound = normalizeInbound(frame)
+    const materializedFrame = frame.type === 'job_batch' && this.#attachmentReceiver
+      ? { ...frame, batch: this.#attachmentReceiver.materializeBatch(frame.batch) }
+      : frame
+    const inbound = normalizeInbound(materializedFrame)
     if (!inbound) throw new Error(`unsupported relay frame type: ${frame.type}`)
     if (this.#currentJob || !this.#available()) {
       const deferred = inbound.mode === 'legacy'
@@ -499,6 +577,7 @@ export class LocalSessionConnector extends EventEmitter {
       try { this.#send({ type: 'approval_cancel', approvalId }) } catch {}
     }
     this.#pendingApprovals.clear()
+    this.#attachmentReceiver?.clear()
     await this.#relay.close()
   }
 }

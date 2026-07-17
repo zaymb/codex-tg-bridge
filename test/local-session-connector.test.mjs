@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import test from 'node:test'
 
@@ -47,6 +48,7 @@ function fixture({
   heartbeatIntervalMs = 60_000,
   privateChatIds = new Set(),
   repairChatIds = new Set(),
+  attachmentStore = null,
 } = {}) {
   const app = new FakeAppServer()
   const relay = new FakeRelay()
@@ -63,6 +65,7 @@ function fixture({
     ownerUserId: '42',
     privateChatIds,
     repairChatIds,
+    attachmentStore,
   })
   return { app, relay, connector }
 }
@@ -152,6 +155,31 @@ function batch() {
   }
 }
 
+function topicBatch() {
+  return {
+    version: 1,
+    type: 'job_batch',
+    batch: {
+      batchId: 'batch:telegram:topic',
+      jobs: [{
+        jobId: 'telegram:topic',
+        payload: {
+          text: 'topic message',
+          telegramContext: {
+            chatId: '-100456',
+            conversationKey: '-100456:9',
+            threadId: '9',
+            threadName: 'Planning',
+            messageId: '12',
+            senderId: '101',
+            senderDisplayName: 'Owner',
+          },
+        },
+      }],
+    },
+  }
+}
+
 function legacyJob() {
   return {
     version: 1,
@@ -202,6 +230,7 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
   const setup = fixture()
   t.after(() => setup.connector.close())
   await setup.connector.start()
+  assert.deepEqual(setup.relay.hello.capabilities, [])
 
   assert.equal(setup.relay.hello.acceptingJobs, true)
   setup.relay.emit('frame', batch())
@@ -230,12 +259,28 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
   assert.match(started.params.additionalContext.telegram_trust_policy.value, /untrusted external feed/)
   assert.match(started.params.additionalContext.telegram_output_contract.value, /latest user input is marked \[TG\]/)
   assert.match(started.params.additionalContext.telegram_output_contract.value, /answer it normally in plain text/)
+  assert.match(started.params.additionalContext.telegram_output_contract.value, /Plain-text commentary is delivered immediately to Telegram/)
   assert.deepEqual(setup.relay.frames.at(-1), {
     version: 1,
     type: 'job_accepted',
     batchId: 'batch:telegram:1:telegram:2',
     threadId: 'thread-a',
     turnId: 'turn-tg',
+  })
+
+  setup.app.emit('notification:item/completed', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: {
+      type: 'agentMessage',
+      phase: 'commentary',
+      text: JSON.stringify({
+        action: 'send',
+        text: 'status update must not escape',
+        responses: [],
+        reason: 'working',
+      }),
+    },
   })
 
   setup.app.emit('notification:item/completed', {
@@ -288,6 +333,64 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
     threadId: 'thread-a',
     approvalPolicy: 'never',
     sandbox: 'danger-full-access',
+  })
+})
+
+test('shows the stable topic name beside its conversation key', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', topicBatch())
+  await setup.connector.idle()
+
+  const started = setup.app.calls.find(call => call.method === 'turn/start')
+  assert.match(
+    started.params.input[0].text,
+    /\[conversation_key=-100456:9\]\[topic=Planning\]\[message_id=12\]/u,
+  )
+})
+
+test('forwards plain commentary immediately without treating it as the final answer', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', batch())
+  await setup.connector.idle()
+  setup.app.emit('notification:item/completed', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: {
+      id: 'commentary-envelope',
+      type: 'agentMessage',
+      phase: 'commentary',
+      text: 'work is in progress',
+    },
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(setup.relay.frames.at(-1), {
+    version: 1,
+    type: 'job_progress',
+    batchId: 'batch:telegram:1:telegram:2',
+    turnId: 'turn-tg',
+    progressId: 'commentary-envelope',
+    text: 'work is in progress',
+  })
+
+  setup.app.emit('notification:turn/completed', {
+    threadId: 'thread-a',
+    turn: { id: 'turn-tg', status: 'completed' },
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(setup.relay.frames.at(-1), {
+    version: 1,
+    type: 'job_result',
+    batchId: 'batch:telegram:1:telegram:2',
+    turnId: 'turn-tg',
+    result: { action: 'skip', reason: 'missing_final_answer' },
   })
 })
 
@@ -511,6 +614,116 @@ test('accepts a legacy single-job frame during rolling deployment', async t => {
     threadId: 'thread-a',
     turnId: 'turn-tg',
   })
+})
+
+test('materializes relayed photos before starting Codex and keeps base64 out of model input', async t => {
+  const saved = []
+  const removed = []
+  const setup = fixture({
+    attachmentStore: {
+      async save({ updateId, attachment, bytes }) {
+        saved.push({ updateId, attachment, bytes })
+        return {
+          localPath: '/local/inbox/photo.jpg',
+          byteSize: bytes.length,
+          sha256: createHash('sha256').update(bytes).digest('hex'),
+        }
+      },
+      async remove(path) { removed.push(path) },
+    },
+  })
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+  assert.deepEqual(setup.relay.hello.capabilities, ['attachment_transfer_v1'])
+  const bytes = Buffer.from('photo-binary')
+  const digest = createHash('sha256').update(bytes).digest('hex')
+  setup.relay.emit('frame', {
+    version: 1,
+    type: 'attachment_manifest',
+    batchId: 'batch:telegram:image:telegram:image',
+    jobId: 'telegram:image',
+    transferId: 'attachment-image123',
+    updateId: '77',
+    attachment: {
+      kind: 'photo',
+      fileId: 'photo-id',
+      fileName: null,
+      mimeType: 'image/jpeg',
+      codexInput: 'localImage',
+      detectedMimeType: 'image/jpeg',
+      byteSize: bytes.length,
+      sha256: digest,
+    },
+    chunkCount: 1,
+  })
+  setup.relay.emit('frame', {
+    version: 1,
+    type: 'attachment_chunk',
+    batchId: 'batch:telegram:image:telegram:image',
+    transferId: 'attachment-image123',
+    index: 0,
+    data: bytes.toString('base64'),
+  })
+  setup.relay.emit('frame', {
+    version: 1,
+    type: 'job_batch',
+    batch: {
+      batchId: 'batch:telegram:image:telegram:image',
+      jobs: [{
+        jobId: 'telegram:image',
+        payload: {
+          text: '',
+          telegramContext: {
+            updateId: '77',
+            chatId: '42',
+            conversationKey: '42',
+            messageId: '770',
+            senderId: '42',
+            senderDisplayName: 'Owner',
+          },
+          attachments: [{
+            kind: 'photo',
+            fileId: 'photo-id',
+            fileName: null,
+            mimeType: 'image/jpeg',
+            codexInput: 'localImage',
+            detectedMimeType: 'image/jpeg',
+            byteSize: bytes.length,
+            sha256: digest,
+            transferId: 'attachment-image123',
+          }],
+        },
+      }],
+    },
+  })
+  await setup.connector.idle()
+
+  assert.equal(saved.length, 1)
+  assert.deepEqual(saved[0].bytes, bytes)
+  const started = setup.app.calls.find(call => call.method === 'turn/start')
+  assert.match(started.params.input[0].text, /请查看附图并回应/u)
+  assert.deepEqual(started.params.input.at(-1), {
+    type: 'localImage',
+    path: '/local/inbox/photo.jpg',
+  })
+  assert.equal(JSON.stringify(started.params.input).includes(bytes.toString('base64')), false)
+
+  setup.app.emit('notification:turn/completed', {
+    threadId: 'thread-a',
+    turn: {
+      id: 'turn-tg',
+      status: 'completed',
+      items: [{ type: 'agentMessage', phase: 'final_answer', text: '{"action":"send","text":"done","responses":[]}' }],
+    },
+  })
+  await setup.connector.idle()
+  setup.relay.emit('frame', {
+    version: 1,
+    type: 'job_recorded',
+    batchId: 'batch:telegram:image:telegram:image',
+  })
+  await setup.connector.idle()
+  assert.deepEqual(removed, ['/local/inbox/photo.jpg'])
 })
 
 test('emits relay status heartbeats for an external channel monitor', async t => {

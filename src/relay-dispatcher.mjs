@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto'
 
+import { classifyImageAttachment } from './image-attachment.mjs'
+import { DEFAULT_RELAY_ATTACHMENT_MAX_BYTES } from './relay-attachment-transfer.mjs'
 import { normalizeUpdate } from './update-normalizer.mjs'
+import { resolveTopicName } from './topic-map.mjs'
 
 export const RELAY_JOB_TTL_MS = 86_400_000
 
@@ -23,6 +26,15 @@ function eventText(update) {
     return `Telegram reaction event on bot message ${update.reaction.messageId}. Added: ${added}. Removed: ${removed}.`
   }
   return `Telegram ${update.type} event.`
+}
+
+function shouldBypassCoalescing(update, ownerUserId) {
+  return update.type === 'message'
+    && update.chat?.type === 'private'
+    && update.chat.id === ownerUserId
+    && update.actor?.id === ownerUserId
+    && typeof update.message?.text === 'string'
+    && update.message.text.trimStart().startsWith('/')
 }
 
 function topicId(update) {
@@ -53,6 +65,9 @@ export class RelayDispatcher {
   #state
   #policy
   #sessionLabel
+  #telegram
+  #attachmentStore
+  #topicNames
   #ownerUserId
   #workerId
   #updateLeaseMs
@@ -62,6 +77,9 @@ export class RelayDispatcher {
     stateStore,
     engagementPolicy,
     sessionLabel,
+    telegramClient = null,
+    attachmentStore = null,
+    topicNames = new Map(),
     ownerUserId,
     workerId = `relay-dispatcher-${process.pid}`,
     updateLeaseMs = 120_000,
@@ -72,6 +90,9 @@ export class RelayDispatcher {
     this.#state = stateStore
     this.#policy = engagementPolicy
     this.#sessionLabel = sessionLabel
+    this.#telegram = telegramClient
+    this.#attachmentStore = attachmentStore
+    this.#topicNames = topicNames
     this.#ownerUserId = String(ownerUserId)
     this.#workerId = workerId
     this.#updateLeaseMs = updateLeaseMs
@@ -95,7 +116,7 @@ export class RelayDispatcher {
     }
   }
 
-  #recordApprovedUpdate(update, row) {
+  async #recordApprovedUpdate(update, row) {
     if (!this.#state.getApprovedChat(update.conversationKey)) {
       this.#state.upsertApprovedChat({
         conversationKey: update.conversationKey,
@@ -105,7 +126,7 @@ export class RelayDispatcher {
         nowMs: this.#clock(),
       })
     }
-    if (!update.message) return
+    if (!update.message) return []
     this.#state.recordMessage({
       updateId: row.updateId,
       conversationKey: update.conversationKey,
@@ -116,6 +137,37 @@ export class RelayDispatcher {
       metadata: update,
       nowMs: this.#clock(),
     })
+    const attachments = []
+    for (const attachment of update.message.attachments ?? []) {
+      if (!this.#telegram || !this.#attachmentStore) {
+        throw new Error('relay attachment transport is not configured')
+      }
+      if (Number.isFinite(attachment.fileSize) && attachment.fileSize > DEFAULT_RELAY_ATTACHMENT_MAX_BYTES) {
+        throw new Error('Telegram attachment declared size exceeds relay limit')
+      }
+      const downloaded = await this.#telegram.downloadFile(attachment.fileId, {
+        maxBytes: DEFAULT_RELAY_ATTACHMENT_MAX_BYTES,
+      })
+      const imageInput = classifyImageAttachment(attachment, downloaded.bytes)
+      const classified = imageInput ? { ...attachment, ...imageInput } : attachment
+      const saved = await this.#attachmentStore.save({
+        updateId: row.updateId,
+        attachment: classified,
+        bytes: downloaded.bytes,
+      })
+      this.#state.recordAttachment({
+        updateId: row.updateId,
+        telegramFileId: attachment.fileId,
+        telegramUniqueId: attachment.uniqueId,
+        localPath: saved.localPath,
+        mediaType: attachment.kind,
+        byteSize: saved.byteSize,
+        sha256: saved.sha256,
+        nowMs: this.#clock(),
+      })
+      attachments.push({ ...classified, ...saved })
+    }
+    return attachments
   }
 
   #queueOfflineNotice(update) {
@@ -213,7 +265,9 @@ export class RelayDispatcher {
         return { status: 'completed', action: 'expired' }
       }
 
-      this.#recordApprovedUpdate(update, row)
+      const attachments = await this.#recordApprovedUpdate(update, row)
+      const threadId = topicId(update)
+      const threadName = resolveTopicName(this.#topicNames, update.chat.id, threadId)
       this.#state.enqueueRelayJob({
         jobId: `telegram:${update.updateId}`,
         sourceType: 'telegram',
@@ -222,12 +276,17 @@ export class RelayDispatcher {
         sessionLabel: this.#sessionLabel,
         payload: {
           text: eventText(update),
+          ...(attachments.length > 0 ? { attachments } : {}),
+          ...(shouldBypassCoalescing(update, this.#ownerUserId)
+            ? { dispatch: { bypassCoalesce: true } }
+            : {}),
           telegramContext: {
             updateId: update.updateId,
             updateType: update.type,
             chatId: update.chat.id,
             conversationKey: update.conversationKey,
-            threadId: topicId(update),
+            threadId,
+            ...(threadName ? { threadName } : {}),
             messageId: messageIdForReply(update),
             senderId: update.actor?.id ?? null,
             senderIsBot: update.actor?.isBot ?? false,

@@ -776,6 +776,40 @@ test('claims, accepts, and finalizes one conversation batch atomically', async t
   assert.equal(store.getOutboundAction('batch-answer').status, 'pending')
 })
 
+test('never coalesces different Telegram authors into one relay batch', async t => {
+  const { store } = await openStore()
+  t.after(() => store.close())
+  for (const [id, senderId, senderIsBot, nowMs] of [
+    ['1', '42', false, 100],
+    ['2', '99', true, 110],
+    ['3', '42', false, 120],
+  ]) {
+    store.enqueueRelayJob({
+      jobId: `telegram:${id}`,
+      sourceType: 'telegram',
+      sourceId: id,
+      conversationKey: 'repair-group',
+      sessionLabel: 'tg-engage',
+      payload: {
+        text: `message ${id}`,
+        telegramContext: { senderId, senderIsBot },
+      },
+      expiresAtMs: 10_000,
+      nowMs,
+    })
+  }
+
+  const owner = store.claimRelayJobBatch({
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-a',
+    maxBatchBytes: 100_000,
+    nowMs: 200,
+  })
+  assert.deepEqual(owner.map(job => job.jobId), ['telegram:1'])
+  assert.equal(store.getRelayJob('telegram:2').status, 'pending')
+  assert.equal(store.getRelayJob('telegram:3').status, 'pending')
+})
+
 test('releases every unaccepted job in a deferred batch without crossing conversations', async t => {
   const { store } = await openStore()
   t.after(() => store.close())

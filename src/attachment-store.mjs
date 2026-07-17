@@ -4,7 +4,9 @@ import {
   link,
   mkdir,
   readFile,
+  readdir,
   realpath,
+  rmdir,
   stat,
   unlink,
   writeFile,
@@ -118,5 +120,45 @@ export class AttachmentStore {
       throw new Error('export file is outside configured export roots')
     }
     return canonical
+  }
+
+  async remove(path) {
+    let canonical
+    try {
+      canonical = await realpath(path)
+    } catch (error) {
+      if (error.code === 'ENOENT') return false
+      throw error
+    }
+    if (!isWithin(this.#root, canonical) || canonical === this.#root) {
+      throw new Error('attachment path is outside configured attachment root')
+    }
+    const metadata = await stat(canonical)
+    if (!metadata.isFile()) throw new Error('attachment path must be a regular file')
+    await unlink(canonical)
+    await rmdir(join(canonical, '..')).catch(error => {
+      if (!['ENOENT', 'ENOTEMPTY'].includes(error.code)) throw error
+    })
+    return true
+  }
+
+  async pruneOlderThan(cutoffMs) {
+    if (!Number.isFinite(cutoffMs)) throw new Error('attachment prune cutoff must be finite')
+    let removed = 0
+    for (const directory of await readdir(this.#root, { withFileTypes: true })) {
+      if (!directory.isDirectory() || !/^\d+$/u.test(directory.name)) continue
+      const directoryPath = join(this.#root, directory.name)
+      for (const entry of await readdir(directoryPath, { withFileTypes: true })) {
+        if (!entry.isFile()) continue
+        const path = join(directoryPath, entry.name)
+        if ((await stat(path)).mtimeMs >= cutoffMs) continue
+        await unlink(path)
+        removed += 1
+      }
+      await rmdir(directoryPath).catch(error => {
+        if (!['ENOENT', 'ENOTEMPTY'].includes(error.code)) throw error
+      })
+    }
+    return removed
   }
 }

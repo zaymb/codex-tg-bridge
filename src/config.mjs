@@ -1,5 +1,5 @@
 import { readFileSync, statSync } from 'node:fs'
-import { isAbsolute } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 
 const DECIMAL_ID = /^-?\d+$/
 const POSITIVE_DECIMAL_ID = /^\d+$/
@@ -23,6 +23,21 @@ function parseInteger(env, name, fallback, minimum, maximum) {
     throw new Error(`${name} must be between ${minimum} and ${maximum}`)
   }
   return value
+}
+
+function parseRelayCoalescing(env) {
+  // Pilot on 3,163 historical inbound messages (2026-07-13): 2.5s merged
+  // 444 messages versus 391 at 2s; 3s gained only 63 more at +500ms latency.
+  // The 8s cap bounds continuously extended bursts without a 30s stall.
+  const quietMs = parseInteger(env, 'BRIDGE_RELAY_COALESCE_QUIET_MS', 2_500, 0, 60_000)
+  const maxMs = parseInteger(env, 'BRIDGE_RELAY_COALESCE_MAX_MS', 8_000, 0, 300_000)
+  if ((quietMs === 0) !== (maxMs === 0)) {
+    throw new Error('BRIDGE_RELAY_COALESCE_QUIET_MS and BRIDGE_RELAY_COALESCE_MAX_MS must both be zero to disable coalescing')
+  }
+  if (maxMs < quietMs) {
+    throw new Error('BRIDGE_RELAY_COALESCE_MAX_MS must be at least BRIDGE_RELAY_COALESCE_QUIET_MS')
+  }
+  return { coalesceQuietMs: quietMs, coalesceMaxMs: maxMs }
 }
 
 function parseId(value, name, positiveOnly = false) {
@@ -91,6 +106,36 @@ function parseAliases(value, allowedChatIds, allowedChannelIds) {
     aliases.set(alias, target)
   }
   return aliases
+}
+
+function parseTopicNames(value, allowedChatIds) {
+  if (!value) return new Map()
+  let parsed
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    throw new Error('TELEGRAM_TOPIC_NAMES must be a JSON object')
+  }
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+    throw new Error('TELEGRAM_TOPIC_NAMES must be a JSON object')
+  }
+
+  const topics = new Map()
+  const namesByChat = new Map()
+  for (const [target, rawName] of Object.entries(parsed)) {
+    const match = target.match(/^(-?\d+)(?::(\d+))?$/u)
+    if (!match || !allowedChatIds.has(match[1])) {
+      throw new Error(`topic ${target} must target an approved Telegram group`)
+    }
+    const name = typeof rawName === 'string' ? rawName.trim() : ''
+    if (!name || name.length > 128) throw new Error(`topic ${target} must have a name up to 128 characters`)
+    const usedNames = namesByChat.get(match[1]) ?? new Set()
+    if (usedNames.has(name)) throw new Error(`duplicate Telegram topic name in ${match[1]}: ${name}`)
+    usedNames.add(name)
+    namesByChat.set(match[1], usedNames)
+    topics.set(target, name)
+  }
+  return topics
 }
 
 function createTokenReader(env) {
@@ -168,6 +213,7 @@ export function loadConfig(env = process.env) {
     repairChatIds: parseIdSet(env.TELEGRAM_REPAIR_CHAT_IDS, 'TELEGRAM_REPAIR_CHAT_IDS'),
     allowedChannelIds,
     chatAliases: parseAliases(env.TELEGRAM_CHAT_ALIASES, allowedChatIds, allowedChannelIds),
+    topicNames: parseTopicNames(env.TELEGRAM_TOPIC_NAMES, allowedChatIds),
     tokenFile: token.tokenFile,
     appServerSocket: requireAbsolutePath(env.APP_SERVER_SOCKET, 'APP_SERVER_SOCKET'),
     actionSocket: requireAbsolutePath(env.BRIDGE_ACTION_SOCKET, 'BRIDGE_ACTION_SOCKET'),
@@ -196,14 +242,20 @@ export function loadTransportConfig(env = process.env) {
   const ownerUserId = parseId(env.TELEGRAM_OWNER_USER_ID, 'TELEGRAM_OWNER_USER_ID', true)
   const allowedChatIds = parseIdSet(env.TELEGRAM_ALLOWED_CHAT_IDS, 'TELEGRAM_ALLOWED_CHAT_IDS')
   const allowedChannelIds = parseIdSet(env.TELEGRAM_ALLOWED_CHANNEL_IDS, 'TELEGRAM_ALLOWED_CHANNEL_IDS')
+  const dbPath = requireAbsolutePath(env.BRIDGE_DB_PATH, 'BRIDGE_DB_PATH')
   const config = {
     ownerUserId,
     allowedChatIds,
     allowedChannelIds,
     chatAliases: parseAliases(env.TELEGRAM_CHAT_ALIASES, allowedChatIds, allowedChannelIds),
+    topicNames: parseTopicNames(env.TELEGRAM_TOPIC_NAMES, allowedChatIds),
     tokenFile: token.tokenFile,
     sessionLabel: parseSessionLabel(env.BRIDGE_SESSION_LABEL),
-    dbPath: requireAbsolutePath(env.BRIDGE_DB_PATH, 'BRIDGE_DB_PATH'),
+    dbPath,
+    attachmentRoot: requireAbsolutePath(
+      env.BRIDGE_ATTACHMENT_ROOT ?? join(dirname(dbPath), 'attachments'),
+      'BRIDGE_ATTACHMENT_ROOT',
+    ),
     pollTimeoutSec: parseInteger(env, 'BRIDGE_POLL_TIMEOUT_SEC', 50, 1, 50),
     updateLeaseMs: parseInteger(env, 'BRIDGE_UPDATE_LEASE_MS', 120_000, 1_000, 3_600_000),
     deliverAllGroupMessages: parseBoolean(env.BRIDGE_DELIVER_ALL_GROUP_MESSAGES, false),
@@ -214,13 +266,19 @@ export function loadTransportConfig(env = process.env) {
 }
 
 export function loadRelayConfig(env = process.env) {
+  const dbPath = requireAbsolutePath(env.BRIDGE_DB_PATH, 'BRIDGE_DB_PATH')
   return {
     sessionLabel: parseSessionLabel(env.BRIDGE_SESSION_LABEL),
-    dbPath: requireAbsolutePath(env.BRIDGE_DB_PATH, 'BRIDGE_DB_PATH'),
+    dbPath,
+    attachmentRoot: requireAbsolutePath(
+      env.BRIDGE_ATTACHMENT_ROOT ?? join(dirname(dbPath), 'attachments'),
+      'BRIDGE_ATTACHMENT_ROOT',
+    ),
     frameMaxBytes: parseInteger(env, 'BRIDGE_RELAY_FRAME_MAX_BYTES', 262_144, 1_024, 1_048_576),
     claimIntervalMs: parseInteger(env, 'BRIDGE_RELAY_CLAIM_INTERVAL_MS', 250, 50, 10_000),
     sessionLeaseMs: parseInteger(env, 'BRIDGE_RELAY_SESSION_LEASE_MS', 20_000, 5_000, 120_000),
     jobLeaseMs: parseInteger(env, 'BRIDGE_RELAY_JOB_LEASE_MS', 120_000, 10_000, 900_000),
+    ...parseRelayCoalescing(env),
   }
 }
 
@@ -237,6 +295,7 @@ export function loadLocalConnectorConfig(env = process.env) {
     ['read-only', 'workspace-write', 'danger-full-access'],
     'workspace-write',
   )
+  const appServerSocket = requireAbsolutePath(env.APP_SERVER_SOCKET, 'APP_SERVER_SOCKET')
   const config = {
     ownerUserId: parseId(env.TELEGRAM_OWNER_USER_ID, 'TELEGRAM_OWNER_USER_ID', true),
     privateChatIds: parseIdSet(env.TELEGRAM_PRIVATE_CHAT_IDS, 'TELEGRAM_PRIVATE_CHAT_IDS'),
@@ -244,11 +303,16 @@ export function loadLocalConnectorConfig(env = process.env) {
     sessionLabel: parseSessionLabel(env.BRIDGE_SESSION_LABEL),
     codexSessionId: requireSimpleValue(env.CODEX_SESSION_ID, 'CODEX_SESSION_ID'),
     threadId: requireSimpleValue(env.CODEX_THREAD_ID ?? env.CODEX_SESSION_ID, 'CODEX_THREAD_ID'),
-    appServerSocket: requireAbsolutePath(env.APP_SERVER_SOCKET, 'APP_SERVER_SOCKET'),
+    appServerSocket,
+    localAttachmentRoot: requireAbsolutePath(
+      env.BRIDGE_LOCAL_ATTACHMENT_ROOT ?? join(dirname(appServerSocket), 'telegram-attachments'),
+      'BRIDGE_LOCAL_ATTACHMENT_ROOT',
+    ),
     contractPath: requireAbsolutePath(env.CODEX_CONTRACT_PATH, 'CODEX_CONTRACT_PATH'),
     relayMode,
     frameMaxBytes: parseInteger(env, 'BRIDGE_RELAY_FRAME_MAX_BYTES', 262_144, 1_024, 1_048_576),
     heartbeatIntervalMs: parseInteger(env, 'BRIDGE_RELAY_HEARTBEAT_INTERVAL_MS', 5_000, 1_000, 30_000),
+    ...parseRelayCoalescing(env),
     approvalPolicy: parseChoice(
       env.CODEX_APPROVAL_POLICY,
       'CODEX_APPROVAL_POLICY',
@@ -262,13 +326,22 @@ export function loadLocalConnectorConfig(env = process.env) {
         : { type: 'workspaceWrite', writableRoots: [], networkAccess: false },
   }
   if (relayMode === 'local') {
+    const localDbPath = requireAbsolutePath(env.BRIDGE_RELAY_DB_PATH, 'BRIDGE_RELAY_DB_PATH')
     return {
       ...config,
       localNodePath: requireAbsolutePath(env.BRIDGE_RELAY_NODE_PATH ?? process.execPath, 'BRIDGE_RELAY_NODE_PATH'),
       localScriptPath: requireAbsolutePath(env.BRIDGE_RELAY_SCRIPT_PATH, 'BRIDGE_RELAY_SCRIPT_PATH'),
-      localDbPath: requireAbsolutePath(env.BRIDGE_RELAY_DB_PATH, 'BRIDGE_RELAY_DB_PATH'),
+      localDbPath,
+      relayAttachmentRoot: requireAbsolutePath(
+        env.BRIDGE_RELAY_ATTACHMENT_ROOT ?? join(dirname(localDbPath), 'attachments'),
+        'BRIDGE_RELAY_ATTACHMENT_ROOT',
+      ),
     }
   }
+  const remoteDbPath = requireAbsolutePath(
+    env.BRIDGE_RELAY_DB_PATH ?? '/var/lib/codex-tg-bridge/bridge.sqlite3',
+    'BRIDGE_RELAY_DB_PATH',
+  )
   return {
     ...config,
     sshPath: requireAbsolutePath(env.BRIDGE_SSH_PATH ?? '/usr/bin/ssh', 'BRIDGE_SSH_PATH'),
@@ -278,6 +351,10 @@ export function loadLocalConnectorConfig(env = process.env) {
     remoteServiceUser: requireSimpleValue(env.BRIDGE_RELAY_SERVICE_USER ?? 'tgbridge', 'BRIDGE_RELAY_SERVICE_USER'),
     remoteNodePath: requireAbsolutePath(env.BRIDGE_RELAY_NODE_PATH ?? '/usr/local/bin/node', 'BRIDGE_RELAY_NODE_PATH'),
     remoteScriptPath: requireAbsolutePath(env.BRIDGE_RELAY_SCRIPT_PATH ?? '/opt/codex-tg-bridge/src/relay-stdio.mjs', 'BRIDGE_RELAY_SCRIPT_PATH'),
-    remoteDbPath: requireAbsolutePath(env.BRIDGE_RELAY_DB_PATH ?? '/var/lib/codex-tg-bridge/bridge.sqlite3', 'BRIDGE_RELAY_DB_PATH'),
+    remoteDbPath,
+    relayAttachmentRoot: requireAbsolutePath(
+      env.BRIDGE_RELAY_ATTACHMENT_ROOT ?? join(dirname(remoteDbPath), 'attachments'),
+      'BRIDGE_RELAY_ATTACHMENT_ROOT',
+    ),
   }
 }

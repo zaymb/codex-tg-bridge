@@ -18,6 +18,10 @@ function threadId(conversationKey) {
   return index === -1 ? null : conversationKey.slice(index + 1)
 }
 
+function displayName(chat) {
+  return chat.title ?? null
+}
+
 export class ControlServer {
   #state
   #dispatcher
@@ -49,9 +53,12 @@ export class ControlServer {
 
   #resolveTarget(target) {
     requiredString(target, 'target', 128)
-    const chat = this.#state.getApprovedChatByAlias(target) ?? this.#state.getApprovedChat(target)
-    if (!chat) throw new Error('unknown or unapproved Telegram target')
-    return chat
+    const direct = this.#state.getApprovedChatByAlias(target) ?? this.#state.getApprovedChat(target)
+    if (direct) return direct
+    const named = this.#state.listApprovedChats().filter(chat => displayName(chat) === target)
+    if (named.length === 1) return named[0]
+    if (named.length > 1) throw new Error('ambiguous approved Telegram target name')
+    throw new Error('unknown or unapproved Telegram target')
   }
 
   #isOwnerDm(chat) {
@@ -75,7 +82,7 @@ export class ControlServer {
       return this.#state.listApprovedChats().map(chat => ({
         alias: chat.alias,
         conversationKey: chat.conversationKey,
-        title: chat.title,
+        title: displayName(chat),
         kind: chat.kind,
       }))
     }

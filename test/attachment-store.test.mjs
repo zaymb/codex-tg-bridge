@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, realpath, stat, symlink, writeFile } from 'node:fs/promises'
+import { access, mkdtemp, mkdir, readFile, realpath, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -80,4 +80,28 @@ test('rejects a symlink inside an export root that escapes the root', async () =
   await symlink(outside, link)
 
   await assert.rejects(store.assertExportPath(link), /outside configured export roots/)
+})
+
+test('removes only managed attachments and prunes stale crash leftovers', async () => {
+  const { dir, store } = await fixture()
+  const first = await store.save({
+    updateId: '201',
+    attachment: { kind: 'document', fileId: 'first', fileName: 'first.txt' },
+    bytes: Buffer.from('first'),
+  })
+  const stale = await store.save({
+    updateId: '202',
+    attachment: { kind: 'document', fileId: 'stale', fileName: 'stale.txt' },
+    bytes: Buffer.from('stale'),
+  })
+  const outside = join(dir, 'outside.txt')
+  await writeFile(outside, 'outside')
+
+  assert.equal(await store.remove(first.localPath), true)
+  await assert.rejects(access(first.localPath))
+  await assert.rejects(store.remove(outside), /outside configured attachment root/)
+
+  await utimes(stale.localPath, new Date(1_000), new Date(1_000))
+  assert.equal(await store.pruneOlderThan(2_000), 1)
+  await assert.rejects(access(stale.localPath))
 })

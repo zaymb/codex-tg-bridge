@@ -25,7 +25,13 @@ test('hardens the transport while keeping only its durable state writable', asyn
   assert.match(bridge, /^PrivateTmp=true$/m)
   assert.match(bridge, /^NoNewPrivileges=true$/m)
   assert.match(bridge, /^ReadOnlyPaths=\/opt\/codex-tg-bridge$/m)
-  assert.match(bridge, /^ReadWritePaths=\/var\/lib\/codex-tg-bridge$/m)
+  assert.match(bridge, /^ReadWritePaths=\/var\/lib\/codex-tg-bridge \/srv\/codex-inbox$/m)
+})
+
+test('transport installer creates its attachment inbox without Codex user dependencies', async () => {
+  const install = await file('install.sh')
+  assert.match(install, /install -d -o tgbridge -g tgbridge -m 0750 \/srv\/codex-inbox/u)
+  assert.doesNotMatch(install, /systemd-tmpfiles/u)
 })
 
 test('installer requires Node only and does not provision a cloud Codex runtime', async () => {

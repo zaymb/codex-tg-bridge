@@ -27,6 +27,7 @@ cd "$INSTALL_ROOT"
 
 install -D -o root -g root -m 0644 "$SOURCE_ROOT/deploy/codex-tg-bridge.service" /etc/systemd/system/codex-tg-bridge.service
 /usr/bin/systemd-analyze verify /etc/systemd/system/codex-tg-bridge.service
+install -d -o tgbridge -g tgbridge -m 0750 /srv/codex-inbox
 install -d -o root -g tgbridge -m 0750 /etc/codex-tg-bridge
 
 if [[ ! -e /etc/codex-tg-bridge/bridge.env ]]; then

@@ -88,6 +88,49 @@ test('parses optional targeted Telegram responses without losing legacy text out
   })).responses, [{ messageId: '30', action: 'dice', text: '🎲' }])
 })
 
+test('normalizes targeted response aliases and never combines them with root text', () => {
+  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+    action: 'send',
+    text: '',
+    responses: [{ message_id: 6957, text: 'targeted answer' }],
+    reason: 'model used the inbound field spelling',
+  })), {
+    action: 'send',
+    skipped: false,
+    finalText: '',
+    responses: [{ messageId: '6957', action: 'reply', text: 'targeted answer' }],
+    reason: 'model used the inbound field spelling',
+  })
+
+  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+    action: 'send',
+    text: 'one final answer',
+    responses: [{ message_id: 6957, text: 'one final answer' }],
+    reason: 'model duplicated the reply into both fields',
+  })), {
+    action: 'send',
+    skipped: false,
+    finalText: 'one final answer',
+    responses: [],
+    reason: 'model duplicated the reply into both fields',
+  })
+})
+
+test('fails closed when an empty root reply contains malformed targeted responses', () => {
+  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+    action: 'send',
+    text: '',
+    responses: [{ text: 'missing target' }],
+    reason: 'invalid target',
+  })), {
+    action: 'skip',
+    skipped: true,
+    finalText: null,
+    responses: [],
+    reason: 'malformed_structured_output',
+  })
+})
+
 test('fails closed instead of leaking a structured envelope with trailing garbage', () => {
   assert.deepEqual(parseTelegramStructuredOutput(
     '{"action":"skip","text":"","responses":[],"reason":"no reply"} trailing words',

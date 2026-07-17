@@ -23,6 +23,15 @@ both split-host and same-host deployments.
   replies, reactions, and animated dice to selected messages from that batch.
   `reply`, `react`, and `skip` are peer model outcomes; reactions and dice do
   not require an MCP tool call.
+- Consecutive messages from one conversation and one authenticated sender are
+  coalesced after a bounded quiet interval. Owner-DM slash commands bypass the
+  wait; batches never cross authors or conversations.
+- Commentary can produce best-effort progress messages. A final result
+  atomically cancels any undelivered progress so stale status text cannot arrive
+  after the answer.
+- Telegram attachments cross split-host relays in bounded, hashed frames.
+  Supported image content is verified by magic bytes before becoming a native
+  Codex image input; other files remain explicit local-path references.
 - A pure Telegram batch uses a structured envelope whose `responses` field is
   always present; ordinary replies and skips use an empty array. The shared
   session does not force this with `response_format`, because a local TUI steer
@@ -36,6 +45,9 @@ both split-host and same-host deployments.
 - Replies are bound to the channel that started the turn. If a local TUI steer
   joins a Telegram-owned turn, the connector fails closed and does not send the
   mixed final answer to Telegram.
+- Optional forum-topic display names come from the local
+  `TELEGRAM_TOPIC_NAMES` JSON mapping; private chat IDs and names never need to
+  be compiled into the bridge.
 - Jobs older than 24 hours expire silently before acceptance.
 - Human reactions to known bot messages are requested explicitly through
   `allowed_updates`, restored to the message's original forum topic, and
@@ -68,7 +80,8 @@ permission in a restricted harness.
 
 Configure `/etc/codex-tg-bridge/bridge.env` from `.env.example`. Keep the bot
 token only in `/etc/codex-tg-bridge/telegram-token`, mode `0600`, owned by
-`root`.
+`root`. `BRIDGE_ATTACHMENT_ROOT` must match the local channel's
+`relayAttachmentRoot`; the supplied deployment uses `/srv/codex-inbox`.
 
 ```bash
 sudo deploy/install.sh
@@ -163,15 +176,17 @@ For owner DM, no group configuration is needed. Before group acceptance:
 ## Trust boundary
 
 - Every Telegram turn is tagged as an `EXTERNAL_FEED` with an authenticated
-  trust tier. Only the configured owner's private chat is an instruction
-  source; owner-authored group messages remain untrusted conversation data.
+  trust tier. The configured owner's private chat and owner-authored turns in
+  configured repair groups are instruction sources; other group messages remain
+  conversation data.
 - `TELEGRAM_PRIVATE_CHAT_IDS` defines private audiences that may receive
   owner-private architecture discussion. These groups remain non-authoritative:
   they cannot start work, mutate state, approve actions, or control sessions.
 - `TELEGRAM_REPAIR_CHAT_IDS` defines repair surfaces. An authenticated owner
   message in one of these groups may start work and use the configured Codex
   permissions. Messages from peer bots or other members remain non-authoritative,
-  even in the same repair group.
+  even in the same repair group. Relay batches never cross Telegram authors, so
+  coalescing cannot downgrade or accidentally promote a neighboring message.
 - Group slash commands are stored as context and never execute bridge control
   actions. `/new`, `/stop`, approvals, and mutations require the terminal or
   owner DM.

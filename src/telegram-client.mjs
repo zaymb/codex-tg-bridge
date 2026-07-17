@@ -238,9 +238,15 @@ export class TelegramClient {
     return this.#request('getFile', { file_id: fileId })
   }
 
-  async downloadFile(fileId, { signal } = {}) {
+  async downloadFile(fileId, { signal, maxBytes = null } = {}) {
+    if (maxBytes !== null && (!Number.isSafeInteger(maxBytes) || maxBytes <= 0)) {
+      throw new Error('Telegram download maxBytes must be a positive safe integer')
+    }
     const metadata = await this.getFile(fileId)
     if (!metadata?.file_path) throw new TelegramApiError('Telegram getFile returned no file_path', { method: 'getFile' })
+    if (maxBytes !== null && Number.isFinite(Number(metadata.file_size)) && Number(metadata.file_size) > maxBytes) {
+      throw new TelegramApiError('Telegram file declared size exceeds download limit', { method: 'downloadFile' })
+    }
     const token = this.#tokenReader()
     const url = `${this.#baseUrl}/file/bot${token}/${metadata.file_path}`
     let response
@@ -263,9 +269,13 @@ export class TelegramClient {
         code: response.status,
       })
     }
+    const declaredLength = Number(response.headers?.get?.('content-length'))
+    if (maxBytes !== null && Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+      throw new TelegramApiError('Telegram file download exceeds limit', { method: 'downloadFile' })
+    }
     return {
       filePath: metadata.file_path,
-      bytes: Buffer.from(await response.arrayBuffer()),
+      bytes: await readDownloadBody(response, maxBytes),
       metadata,
     }
   }
@@ -277,4 +287,33 @@ export class TelegramClient {
   deleteWebhook({ dropPendingUpdates = false } = {}) {
     return this.#request('deleteWebhook', { drop_pending_updates: dropPendingUpdates })
   }
+}
+
+async function readDownloadBody(response, maxBytes) {
+  if (!response.body?.getReader) {
+    const bytes = Buffer.from(await response.arrayBuffer())
+    if (maxBytes !== null && bytes.length > maxBytes) {
+      throw new TelegramApiError('Telegram file download exceeds limit', { method: 'downloadFile' })
+    }
+    return bytes
+  }
+  const reader = response.body.getReader()
+  const chunks = []
+  let total = 0
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      const chunk = Buffer.from(value)
+      total += chunk.length
+      if (maxBytes !== null && total > maxBytes) {
+        await reader.cancel().catch(() => {})
+        throw new TelegramApiError('Telegram file download exceeds limit', { method: 'downloadFile' })
+      }
+      chunks.push(chunk)
+    }
+  } finally {
+    reader.releaseLock?.()
+  }
+  return Buffer.concat(chunks, total)
 }

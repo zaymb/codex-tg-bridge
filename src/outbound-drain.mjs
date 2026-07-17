@@ -51,6 +51,7 @@ export class OutboundDrain {
       return this.#state.getOutboundAction(actionId).status
     }
     action = this.#state.getOutboundAction(actionId)
+    const bestEffort = action.payload?.deliveryClass === 'progress'
     try {
       const result = await this.#execute(action)
       this.#state.markOutboundSent(actionId, {
@@ -65,7 +66,7 @@ export class OutboundDrain {
         this.#state.markOutboundFailed(
           actionId,
           error.message,
-          this.#clock() + error.retryAfterSec * 1_000,
+          bestEffort ? null : this.#clock() + error.retryAfterSec * 1_000,
           this.#clock(),
         )
         return 'failed'
@@ -74,7 +75,9 @@ export class OutboundDrain {
         this.#state.markOutboundAmbiguous(actionId, error.message, this.#clock())
         return 'ambiguous'
       }
-      const retryAtMs = error instanceof TelegramTransportError ? this.#clock() + 1_000 : null
+      const retryAtMs = error instanceof TelegramTransportError && !bestEffort
+        ? this.#clock() + 1_000
+        : null
       this.#state.markOutboundFailed(actionId, error.message, retryAtMs, this.#clock())
       return 'failed'
     }

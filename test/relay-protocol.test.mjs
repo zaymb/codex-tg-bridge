@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 
 import { RelayProtocolSession } from '../src/relay-protocol.mjs'
 import { StateStore } from '../src/state-store.mjs'
 
-function fixture() {
+function fixture({ coalesceQuietMs = 0, coalesceMaxMs = 0, removeAttachment = null } = {}) {
   const state = StateStore.open(':memory:')
   const frames = []
   let now = 1_000
@@ -17,11 +20,21 @@ function fixture() {
     leaseMs: 20_000,
     jobLeaseMs: 120_000,
     frameMaxBytes: 262_144,
+    coalesceQuietMs,
+    coalesceMaxMs,
+    removeAttachment,
   })
   return { state, frames, session, setNow(value) { now = value } }
 }
 
-function enqueue(state, updateId = '1', conversationKey = '42', nowMs = 1_000, contextOverrides = {}) {
+function enqueue(
+  state,
+  updateId = '1',
+  conversationKey = '42',
+  nowMs = 1_000,
+  contextOverrides = {},
+  payloadOverrides = {},
+) {
   state.enqueueRelayJob({
     jobId: `telegram:${updateId}`,
     sourceType: 'telegram',
@@ -36,13 +49,71 @@ function enqueue(state, updateId = '1', conversationKey = '42', nowMs = 1_000, c
         messageId: String(Number(updateId) * 10),
         ...contextOverrides,
       },
+      ...payloadOverrides,
     },
     expiresAtMs: nowMs + 86_400_000,
     nowMs,
   })
 }
 
-async function hello(setup, acceptingJobs = true) {
+test('waits for a quiet interval and resets it when a follow-up arrives', async t => {
+  const setup = fixture({ coalesceQuietMs: 7_000, coalesceMaxMs: 30_000 })
+  t.after(() => setup.state.close())
+  enqueue(setup.state, '1', 'group-a', 1_000)
+  await hello(setup)
+
+  setup.setNow(7_999)
+  assert.equal(await setup.session.claimOnce(), false)
+  enqueue(setup.state, '2', 'group-a', 5_000)
+  setup.setNow(11_999)
+  assert.equal(await setup.session.claimOnce(), false)
+
+  setup.setNow(12_000)
+  assert.equal(await setup.session.claimOnce(), true)
+  assert.deepEqual(setup.frames.at(-1).batch.jobs.map(job => job.jobId), [
+    'telegram:1',
+    'telegram:2',
+  ])
+})
+
+test('dispatches a continuously extended burst at the hard cap', async t => {
+  const setup = fixture({ coalesceQuietMs: 7_000, coalesceMaxMs: 30_000 })
+  t.after(() => setup.state.close())
+  for (const [id, nowMs] of [['1', 1_000], ['2', 7_000], ['3', 13_000], ['4', 19_000], ['5', 25_000]]) {
+    enqueue(setup.state, id, 'group-a', nowMs)
+  }
+  await hello(setup)
+
+  setup.setNow(30_999)
+  assert.equal(await setup.session.claimOnce(), false)
+  setup.setNow(31_000)
+  assert.equal(await setup.session.claimOnce(), true)
+  assert.deepEqual(setup.frames.at(-1).batch.jobs.map(job => job.jobId), [
+    'telegram:1',
+    'telegram:2',
+    'telegram:3',
+    'telegram:4',
+    'telegram:5',
+  ])
+})
+
+test('lets an explicit control bypass coalescing without crossing conversations', async t => {
+  const setup = fixture({ coalesceQuietMs: 7_000, coalesceMaxMs: 30_000 })
+  t.after(() => setup.state.close())
+  enqueue(setup.state, '1', 'group-a', 1_000)
+  enqueue(setup.state, '2', 'owner-dm', 2_000, {}, {
+    text: '/stop',
+    dispatch: { bypassCoalesce: true },
+  })
+  await hello(setup)
+
+  setup.setNow(2_000)
+  assert.equal(await setup.session.claimOnce(), true)
+  assert.deepEqual(setup.frames.at(-1).batch.jobs.map(job => job.jobId), ['telegram:2'])
+  assert.equal(setup.state.getRelayJob('telegram:1').status, 'pending')
+})
+
+async function hello(setup, acceptingJobs = true, capabilities = []) {
   await setup.session.handleFrame({
     version: 1,
     type: 'hello',
@@ -50,8 +121,69 @@ async function hello(setup, acceptingJobs = true) {
     connectorId: 'connector-a',
     codexSessionId: 'session-a',
     acceptingJobs,
+    capabilities,
   })
 }
+
+test('negotiates attachment transfer and leaves attachment conversations pending for legacy connectors', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  enqueue(setup.state, '90', 'group-with-file', 1_000, { updateId: '90' }, {
+    attachments: [{
+      kind: 'document',
+      fileId: 'file-a',
+      localPath: '/not-read-by-legacy-connector',
+      byteSize: 1,
+      sha256: '0'.repeat(64),
+    }],
+  })
+  enqueue(setup.state, '91', 'group-with-text', 1_001)
+
+  await hello(setup)
+  assert.deepEqual(setup.frames[0].capabilities, [])
+  assert.equal(await setup.session.claimOnce(), true)
+  assert.deepEqual(setup.frames.at(-1).batch.jobs.map(job => job.jobId), ['telegram:91'])
+  assert.equal(setup.state.getRelayJob('telegram:90').status, 'pending')
+})
+
+test('sends attachment frames only after the connector advertises the capability', async t => {
+  const removed = []
+  const setup = fixture({ removeAttachment: async path => { removed.push(path) } })
+  const root = await mkdtemp(join(tmpdir(), 'relay-protocol-attachment-'))
+  t.after(async () => {
+    setup.state.close()
+    await rm(root, { recursive: true, force: true })
+  })
+  const localPath = join(root, 'photo.jpg')
+  const bytes = Buffer.from('photo')
+  await writeFile(localPath, bytes)
+  enqueue(setup.state, '92', 'group-with-file', 1_000, { updateId: '92' }, {
+    attachments: [{
+      kind: 'photo',
+      fileId: 'photo-a',
+      localPath,
+      byteSize: bytes.length,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+    }],
+  })
+
+  await hello(setup, true, ['attachment_transfer_v1'])
+  assert.deepEqual(setup.frames[0].capabilities, ['attachment_transfer_v1'])
+  assert.equal(await setup.session.claimOnce(), true)
+  assert.deepEqual(setup.frames.slice(1).map(frame => frame.type), [
+    'attachment_manifest',
+    'attachment_chunk',
+    'job_batch',
+  ])
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_accepted',
+    batchId: setup.frames.at(-1).batch.batchId,
+    threadId: 'thread-a',
+    turnId: 'turn-a',
+  })
+  assert.deepEqual(removed, [localPath])
+})
 
 test('leases all currently pending jobs for the oldest conversation as one batch', async t => {
   const setup = fixture()
@@ -78,6 +210,29 @@ test('leases all currently pending jobs for the oldest conversation as one batch
   })
   assert.equal(setup.state.getRelayJob('telegram:1').status, 'accepted')
   assert.equal(setup.state.getRelayJob('telegram:2').turnId, 'turn-a')
+})
+
+test('fails only the poison attachment job and keeps the relay usable', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  enqueue(setup.state, '91', '42', 1_000, { updateId: '91' }, {
+    attachments: [{
+      kind: 'document',
+      fileId: 'missing-file',
+      localPath: '/definitely/missing/relay-attachment.bin',
+      byteSize: 1,
+      sha256: '0'.repeat(64),
+    }],
+  })
+  enqueue(setup.state, '92', 'other-conversation', 1_001)
+  await hello(setup, true, ['attachment_transfer_v1'])
+
+  assert.equal(await setup.session.claimOnce(), true)
+  assert.equal(setup.state.getRelayJob('telegram:91').status, 'failed')
+  assert.match(setup.state.getRelayJob('telegram:91').lastError, /ENOENT/)
+
+  assert.equal(await setup.session.claimOnce(), true)
+  assert.deepEqual(setup.frames.at(-1).batch.jobs.map(job => job.jobId), ['telegram:92'])
 })
 
 test('records one final reply for the batch using the latest Telegram message', async t => {
@@ -112,6 +267,90 @@ test('records one final reply for the batch using the latest Telegram message', 
   assert.equal(outbound.payload.text, 'one final answer')
   assert.equal(setup.frames.at(-1).type, 'job_recorded')
   assert.deepEqual(setup.frames.at(-1).jobIds, ['telegram:1', 'telegram:2'])
+})
+
+test('queues an in-progress reply without completing the accepted batch', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  enqueue(setup.state, '1', '42', 1_000)
+  enqueue(setup.state, '2', '42', 1_001)
+  await hello(setup)
+  await setup.session.claimOnce()
+  const { batchId } = setup.frames.at(-1).batch
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_accepted',
+    batchId,
+    threadId: 'thread-a',
+    turnId: 'turn-a',
+  })
+
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_progress',
+    batchId,
+    turnId: 'turn-a',
+    progressId: 'commentary-1',
+    text: 'work is in progress',
+  })
+
+  assert.equal(setup.state.getRelayJob('telegram:1').status, 'accepted')
+  assert.equal(setup.state.getRelayJob('telegram:2').status, 'accepted')
+  const outbound = setup.state.claimDueOutboundActions({
+    workerId: 'progress-probe',
+    limit: 10,
+    nowMs: 1_000,
+  })
+  assert.equal(outbound.length, 1)
+  assert.equal(outbound[0].actionType, 'reply')
+  assert.equal(outbound[0].payload.messageId, '20')
+  assert.equal(outbound[0].payload.text, 'work is in progress')
+  assert.equal(setup.frames.some(frame => frame.type === 'job_recorded'), false)
+})
+
+test('a final result supersedes progress that has not been delivered', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  enqueue(setup.state, '1', '42', 1_000)
+  await hello(setup)
+  await setup.session.claimOnce()
+  const { batchId } = setup.frames.at(-1).batch
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_accepted',
+    batchId,
+    threadId: 'thread-a',
+    turnId: 'turn-a',
+  })
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_progress',
+    batchId,
+    turnId: 'turn-a',
+    progressId: 'commentary-1',
+    text: 'work is in progress',
+  })
+
+  const progressKey = createHash('sha256')
+    .update('turn-a\0commentary-1')
+    .digest('hex')
+    .slice(0, 32)
+  const progressId = `relay-batch:${batchId}:progress:${progressKey}:0000`
+  assert.equal(setup.state.getOutboundAction(progressId).status, 'pending')
+
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_result',
+    batchId,
+    turnId: 'turn-a',
+    result: { action: 'reply', text: 'final answer' },
+  })
+
+  const progress = setup.state.getOutboundAction(progressId)
+  assert.equal(progress.status, 'failed')
+  assert.equal(progress.nextAttemptAtMs, null)
+  assert.match(progress.lastError, /superseded by final relay result/u)
+  assert.equal(setup.state.getOutboundAction(`relay-batch:${batchId}:0000`).status, 'pending')
 })
 
 test('records a first-class reaction against the latest Telegram message', async t => {
@@ -323,7 +562,55 @@ test('rejects reply context that disagrees with the durable conversation key', a
   }), /does not match its conversation/)
 })
 
-test('rejects targeted responses outside the current batch and duplicate targets', async t => {
+test('fails targeted responses outside the current batch and duplicate targets', async t => {
+  const cases = [
+    {
+      name: 'outside batch',
+      responses: [{ messageId: '999', text: 'wrong target' }],
+      error: /current batch/,
+    },
+    {
+      name: 'duplicate target',
+      responses: [
+        { messageId: '10', text: 'one' },
+        { messageId: '10', text: 'two' },
+      ],
+      error: /duplicate/,
+    },
+  ]
+  for (const testCase of cases) {
+    await t.test(testCase.name, async t => {
+      const setup = fixture()
+      t.after(() => setup.state.close())
+      enqueue(setup.state, '1', '42', 1_000)
+      await hello(setup)
+      await setup.session.claimOnce()
+      const { batchId } = setup.frames.at(-1).batch
+      await setup.session.handleFrame({
+        version: 1,
+        type: 'job_accepted',
+        batchId,
+        threadId: 'thread-a',
+        turnId: 'turn-a',
+      })
+
+      await setup.session.handleFrame({
+        version: 1,
+        type: 'job_result',
+        batchId,
+        turnId: 'turn-a',
+        result: { action: 'reply', text: '', responses: testCase.responses },
+      })
+
+      const job = setup.state.getRelayJob('telegram:1')
+      assert.equal(job.status, 'failed')
+      assert.match(job.lastError, testCase.error)
+      assert.equal(setup.frames.at(-1).type, 'job_recorded')
+    })
+  }
+})
+
+test('fails only the accepted batch when a model result is malformed', async t => {
   const setup = fixture()
   t.after(() => setup.state.close())
   enqueue(setup.state, '1', '42', 1_000)
@@ -338,31 +625,45 @@ test('rejects targeted responses outside the current batch and duplicate targets
     turnId: 'turn-a',
   })
 
-  await assert.rejects(setup.session.handleFrame({
+  await setup.session.handleFrame({
     version: 1,
     type: 'job_result',
     batchId,
     turnId: 'turn-a',
     result: {
       action: 'reply',
-      text: '',
-      responses: [{ messageId: '999', text: 'wrong target' }],
+      text: 'duplicate answer',
+      responses: [{ messageId: '10', text: 'duplicate answer' }],
     },
-  }), /current batch/)
-  await assert.rejects(setup.session.handleFrame({
+  })
+
+  const job = setup.state.getRelayJob('telegram:1')
+  assert.equal(job.status, 'failed')
+  assert.match(job.lastError, /cannot combine text with targeted responses/)
+  assert.equal(setup.frames.at(-1).type, 'job_recorded')
+  assert.equal(setup.session.ready, true)
+})
+
+test('fails an accepted inflight batch when its relay session closes', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  enqueue(setup.state, '1', '42', 1_000)
+  await hello(setup)
+  await setup.session.claimOnce()
+  const { batchId } = setup.frames.at(-1).batch
+  await setup.session.handleFrame({
     version: 1,
-    type: 'job_result',
+    type: 'job_accepted',
     batchId,
+    threadId: 'thread-a',
     turnId: 'turn-a',
-    result: {
-      action: 'reply',
-      text: '',
-      responses: [
-        { messageId: '10', text: 'one' },
-        { messageId: '10', text: 'two' },
-      ],
-    },
-  }), /duplicate/)
+  })
+
+  await setup.session.close()
+
+  const job = setup.state.getRelayJob('telegram:1')
+  assert.equal(job.status, 'failed')
+  assert.match(job.lastError, /disconnected before recording a result/)
 })
 
 test('records batch SKIP without outbound and rejects a mismatched turn', async t => {

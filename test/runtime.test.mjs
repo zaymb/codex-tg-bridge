@@ -16,6 +16,7 @@ test('seeds owner, groups, channels, and forum aliases into the durable chat led
       ['sandbox-topic', '-100123:7'],
       ['announcements', '-100777'],
     ]),
+    topicNames: new Map([['-100123:7', 'Support']]),
   }
 
   seedApprovedChats(state, config, 100)
@@ -45,12 +46,14 @@ test('replaces the approved chat ledger so removed chats and moved aliases are r
     allowedChatIds: new Set(['-1001', '-1002']),
     allowedChannelIds: new Set(),
     chatAliases: new Map([['sandbox', '-1001']]),
+    topicNames: new Map(),
   }
   const second = {
     ownerUserId: '42',
     allowedChatIds: new Set(['-1002']),
     allowedChannelIds: new Set(),
     chatAliases: new Map([['sandbox', '-1002']]),
+    topicNames: new Map(),
   }
 
   seedApprovedChats(state, first, 100)
@@ -59,4 +62,22 @@ test('replaces the approved chat ledger so removed chats and moved aliases are r
   assert.equal(state.getApprovedChat('-1001'), null)
   assert.equal(state.getApprovedChatByAlias('sandbox').conversationKey, '-1002')
   assert.deepEqual(state.listApprovedChats().map(chat => chat.conversationKey), ['42', '-1002'])
+})
+
+test('seeds configured forum topic names for an approved group', t => {
+  const state = StateStore.open(':memory:')
+  t.after(() => state.close())
+  seedApprovedChats(state, {
+    ownerUserId: '42',
+    allowedChatIds: new Set(['-100123']),
+    allowedChannelIds: new Set(),
+    chatAliases: new Map(),
+    topicNames: new Map([
+      ['-100123:7', 'Support'],
+      ['-100123:9', 'Planning'],
+    ]),
+  }, 100)
+
+  assert.equal(state.getApprovedChat('-100123:7').title, 'Support')
+  assert.equal(state.getApprovedChat('-100123:9').title, 'Planning')
 })

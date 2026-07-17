@@ -33,7 +33,7 @@ RestrictRealtime=true
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadOnlyPaths=/opt/codex-tg-bridge
-ReadWritePaths=/var/lib/codex-tg-bridge
+ReadWritePaths=/var/lib/codex-tg-bridge /srv/codex-inbox
 MemoryMax=256M
 TasksMax=64
 

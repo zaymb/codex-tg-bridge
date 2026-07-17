@@ -27,7 +27,7 @@ class FakeAttachmentStore {
   }
 }
 
-async function fixture({ privateChatIds = new Set() } = {}) {
+async function fixture({ privateChatIds = new Set(), includeKnownTopic = false } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'tg-bridge-control-'))
   const socketPath = join(dir, 'action.sock')
   const state = StateStore.open(':memory:')
@@ -39,6 +39,16 @@ async function fixture({ privateChatIds = new Set() } = {}) {
     kind: 'forum_topic',
     nowMs: 1,
   })
+  if (includeKnownTopic) {
+    state.upsertApprovedChat({
+      conversationKey: '-100456:9',
+      telegramChatId: '-100456',
+      alias: null,
+      title: 'Planning',
+      kind: 'forum_topic',
+      nowMs: 1,
+    })
+  }
   state.upsertApprovedChat({
     conversationKey: '42',
     telegramChatId: '42',
@@ -152,6 +162,20 @@ test('lists approved chats without exposing Telegram credentials', async t => {
     title: 'Sandbox Topic',
     kind: 'forum_topic',
   }])
+})
+
+test('resolves and lists a known forum topic by its display name', async t => {
+  const setup = await fixture({ includeKnownTopic: true })
+  t.after(() => setup.client.close())
+  t.after(() => setup.server.close())
+  t.after(() => setup.state.close())
+
+  await setup.client.request('send_text', { target: 'Planning', text: 'hello' }, { actionId: 'topic-name-action' })
+  assert.equal(setup.dispatcher.actions[0].conversationKey, '-100456:9')
+  assert.equal(setup.dispatcher.actions[0].payload.threadId, '9')
+
+  const listed = await setup.client.request('list_chats', {}, { actionId: 'topic-name-list' })
+  assert.equal(listed.find(chat => chat.conversationKey === '-100456:9').title, 'Planning')
 })
 
 test('blocks sensitive public text and public file export while preserving owner DM output', async t => {

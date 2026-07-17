@@ -4,7 +4,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { loadConfig, loadLocalConnectorConfig, loadTransportConfig } from '../src/config.mjs'
+import {
+  loadConfig,
+  loadLocalConnectorConfig,
+  loadRelayConfig,
+  loadTransportConfig,
+} from '../src/config.mjs'
 
 async function tokenFixture(mode = 0o600, content = '123456:secret-token\n') {
   const dir = await mkdtemp(join(tmpdir(), 'tg-bridge-config-'))
@@ -61,6 +66,30 @@ test('accepts a forum-topic alias when its base group is approved', async () => 
   const config = loadConfig(env)
 
   assert.equal(config.chatAliases.get('sandbox-topic'), '-1001234567890123456:77')
+})
+
+test('loads configured topic names for approved groups', async () => {
+  const tokenPath = await tokenFixture()
+  const env = validEnv(tokenPath)
+  env.TELEGRAM_TOPIC_NAMES = '{"-1001234567890123456:77":"support","-1001234567890123456:88":"lobby"}'
+
+  const config = loadTransportConfig({ ...env, BRIDGE_SESSION_LABEL: 'tg-engage' })
+
+  assert.deepEqual([...config.topicNames], [
+    ['-1001234567890123456:77', 'support'],
+    ['-1001234567890123456:88', 'lobby'],
+  ])
+})
+
+test('rejects topic names for unapproved groups or duplicate names', async () => {
+  const tokenPath = await tokenFixture()
+  const unknownGroup = validEnv(tokenPath)
+  unknownGroup.TELEGRAM_TOPIC_NAMES = '{"-1009999999999999999:77":"support"}'
+  assert.throws(() => loadConfig(unknownGroup), /must target an approved Telegram group/)
+
+  const duplicateName = validEnv(tokenPath)
+  duplicateName.TELEGRAM_TOPIC_NAMES = '{"-1001234567890123456:77":"support","-1001234567890123456:88":"support"}'
+  assert.throws(() => loadConfig(duplicateName), /duplicate Telegram topic name/)
 })
 
 test('reads and trims the token only through a non-enumerable function', async () => {
@@ -141,6 +170,7 @@ test('loads the transport-only config without Codex app-server settings', async 
 
   assert.equal(config.sessionLabel, 'tg-engage')
   assert.equal(config.dbPath, '/var/lib/codex-tg-bridge/bridge.sqlite3')
+  assert.equal(config.attachmentRoot, '/var/lib/codex-tg-bridge/attachments')
   assert.equal(config.pollTimeoutSec, 50)
   assert.equal(config.updateLeaseMs, 120_000)
   assert.equal(config.deliverAllGroupMessages, false)
@@ -181,6 +211,7 @@ test('loads explicit no-prompt permissions for the local Telegram connector', ()
     BRIDGE_RELAY_HOST: 'relay.example',
     BRIDGE_RELAY_SSH_USER: 'ubuntu',
     BRIDGE_RELAY_IDENTITY_FILE: '/home/alta/.ssh/id_ed25519',
+    BRIDGE_RELAY_ATTACHMENT_ROOT: '/srv/codex-inbox',
     CODEX_APPROVAL_POLICY: 'never',
     CODEX_SANDBOX_MODE: 'danger-full-access',
   }
@@ -189,12 +220,34 @@ test('loads explicit no-prompt permissions for the local Telegram connector', ()
   assert.deepEqual([...config.privateChatIds], ['-100123'])
   assert.deepEqual([...config.repairChatIds], ['-100123'])
   assert.equal(config.approvalPolicy, 'never')
+  assert.match(config.localAttachmentRoot, /telegram-attachments$/)
+  assert.equal(config.relayAttachmentRoot, '/srv/codex-inbox')
+  assert.equal(config.coalesceQuietMs, 2_500)
+  assert.equal(config.coalesceMaxMs, 8_000)
   assert.deepEqual(config.sandboxPolicy, { type: 'dangerFullAccess' })
   env.CODEX_APPROVAL_POLICY = 'sometimes'
   assert.throws(() => loadLocalConnectorConfig(env), /CODEX_APPROVAL_POLICY/)
   env.CODEX_APPROVAL_POLICY = 'never'
   env.CODEX_SANDBOX_MODE = 'everything'
   assert.throws(() => loadLocalConnectorConfig(env), /CODEX_SANDBOX_MODE/)
+})
+
+test('loads and validates relay coalescing bounds', () => {
+  const env = {
+    BRIDGE_SESSION_LABEL: 'tg-engage',
+    BRIDGE_DB_PATH: '/var/lib/codex-tg-bridge/bridge.sqlite3',
+  }
+  assert.equal(loadRelayConfig(env).coalesceQuietMs, 2_500)
+  assert.equal(loadRelayConfig(env).coalesceMaxMs, 8_000)
+
+  env.BRIDGE_RELAY_COALESCE_QUIET_MS = '9000'
+  env.BRIDGE_RELAY_COALESCE_MAX_MS = '8000'
+  assert.throws(() => loadRelayConfig(env), /COALESCE_MAX_MS.*at least.*COALESCE_QUIET_MS/)
+
+  env.BRIDGE_RELAY_COALESCE_QUIET_MS = '0'
+  env.BRIDGE_RELAY_COALESCE_MAX_MS = '0'
+  assert.equal(loadRelayConfig(env).coalesceQuietMs, 0)
+  assert.equal(loadRelayConfig(env).coalesceMaxMs, 0)
 })
 
 test('loads a same-host relay without requiring SSH configuration', () => {
