@@ -2,12 +2,12 @@
 
 import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
-import { pathToFileURL } from 'node:url'
 
 import { AppServerClient } from './app-server-client.mjs'
 import { AttachmentStore } from './attachment-store.mjs'
 import { loadLocalConnectorConfig } from './config.mjs'
 import { LocalSessionConnector } from './local-session-connector.mjs'
+import { isMainModule } from './main-module.mjs'
 import { ProcessRelayClient } from './process-relay-client.mjs'
 import { RELAY_JOB_TTL_MS } from './relay-dispatcher.mjs'
 
@@ -123,7 +123,7 @@ export async function main(env = process.env) {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   try {
     await main()
   } catch (error) {

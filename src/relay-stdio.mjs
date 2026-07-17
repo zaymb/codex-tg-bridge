@@ -2,10 +2,10 @@
 
 import { once } from 'node:events'
 import { createInterface } from 'node:readline'
-import { pathToFileURL } from 'node:url'
 
 import { AttachmentStore } from './attachment-store.mjs'
 import { loadRelayConfig } from './config.mjs'
+import { isMainModule } from './main-module.mjs'
 import { RelayProtocolSession, RELAY_PROTOCOL_VERSION } from './relay-protocol.mjs'
 import { StateStore } from './state-store.mjs'
 
@@ -63,7 +63,7 @@ export async function main(env = process.env, input = process.stdin, output = pr
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   try {
     await main()
   } catch (error) {

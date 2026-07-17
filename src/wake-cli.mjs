@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 
 import { randomUUID } from 'node:crypto'
-import { pathToFileURL } from 'node:url'
 
 import { ControlClient } from './control-client.mjs'
+import { isMainModule } from './main-module.mjs'
 
 function parseArgs(argv) {
   const args = {}
@@ -41,6 +41,6 @@ async function main() {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   await main()
 }

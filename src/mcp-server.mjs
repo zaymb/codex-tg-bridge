@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 
 import { randomUUID } from 'node:crypto'
-import { pathToFileURL } from 'node:url'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
 
 import { ControlClient } from './control-client.mjs'
+import { isMainModule } from './main-module.mjs'
 
 export const TELEGRAM_TOOL_NAMES = Object.freeze([
   'telegram_send_text',
@@ -141,6 +141,6 @@ async function main() {
   await server.connect(new StdioServerTransport())
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   await main()
 }

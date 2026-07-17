@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 
-import { pathToFileURL } from 'node:url'
-
 import { loadConfig } from './config.mjs'
+import { isMainModule } from './main-module.mjs'
 import { createBridgeRuntime } from './runtime.mjs'
 
 export async function main(env = process.env) {
@@ -22,7 +21,7 @@ export async function main(env = process.env) {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   try {
     await main()
   } catch (error) {

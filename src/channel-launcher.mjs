@@ -4,9 +4,10 @@ import { spawn } from 'node:child_process'
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
 
 import { ConnectorSupervisor, createChannelStatusWriter } from './connector-supervisor.mjs'
+import { isMainModule } from './main-module.mjs'
 
 const bridgeRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -186,7 +187,7 @@ export async function runCli(
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   try {
     await runCli()
   } catch (error) {
