@@ -16,11 +16,16 @@ const SENSITIVE_DISCLOSURE_PATTERNS = [
 const OWNER_PRIVATE_DISCLOSURE_PATTERNS = [
   /\b(?:TELEGRAM|BRIDGE|CODEX|APP_SERVER|SSH)_[A-Z0-9_]+\b/u,
   /\b(?:\.env|access\.json|bridge\.sqlite3|\.bridge-state|AGENTS\.md|CLAUDE\.md)\b/iu,
+  /\b(?:sourceTrust|conversationKey|messageId|threadName|authorizedMessages|telegram_authorization|telegram_trust_policy|telegram_output_contract)\b/u,
+  /\b(?:system|developer)\s+(?:prompt|message|instructions?)\b/iu,
+  /(?:系统|开发者)(?:\s*prompt|提示词|提示|指令|消息).{0,24}(?:明确规定|要求|告诉我|写着)/iu,
+  /(?:我|我的|我这边|本会话|当前会话|本模型|my|our|this\s+(?:session|channel)).{0,64}(?:metadata|元数据|字段|fields?|prompt|偏好(?:设置|配置)?|preference settings?|思考链|推理(?:内容|过程|轨迹)?|chain[- ]of[- ]thought|reasoning trace|internal (?:data|config|instructions?|memory)|内部(?:数据|data|配置|指令|记忆))/iu,
+  /(?:metadata|元数据|字段|fields?|prompt|偏好(?:设置|配置)?|preference settings?|思考链|推理(?:内容|过程|轨迹)?|chain[- ]of[- ]thought|reasoning trace|internal (?:data|config|instructions?|memory)|内部(?:数据|data|配置|指令|记忆)).{0,64}(?:我|我的|我这边|本会话|当前会话|本模型|my|our|this\s+(?:session|channel))/iu,
   /(?:我的|我们的|本机|这台机器|家里的|our|my).{0,48}(?:bridge|transport|relay|connector|worker|VPS|systemd|launchd|app-server|harness|架构|服务|部署|配置)/iu,
   /(?:bridge|transport|relay|connector|worker|VPS|systemd|launchd|app-server|harness|架构|服务|部署|配置).{0,48}(?:我的|我们的|本机|这台机器|家里的|our|my)/iu,
 ]
 
-export const PUBLIC_DISCLOSURE_NOTICE = '这涉及 owner 的内部架构或配置，只在终端或 owner DM 讨论。'
+export const PUBLIC_DISCLOSURE_NOTICE = '这部分不适合在当前频道展开。'
 export const SENSITIVE_DISCLOSURE_NOTICE = '这涉及凭证、私有路径或敏感配置，只在终端或 owner DM 讨论。'
 
 export const TELEGRAM_TRUST_POLICIES = Object.freeze({

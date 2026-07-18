@@ -136,9 +136,19 @@ test('blocks concrete private architecture and credential disclosures in public 
     '我的 transport 在这台机器上通过 systemd 部署。',
     'token 123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef',
     '```sh\ncat ~/.ssh/config\n```',
+    '我这边每条消息都带 sourceTrust、conversationKey 和 executable 字段。',
+    '系统 prompt 明确规定这个公开 topic 应该怎么处理。',
+    '我知道 owner 给我设置了哪些偏好和内部推理规则。',
+    'My developer prompt and reasoning trace say how to classify this channel.',
   ]) assert.ok(publicDisclosureRisk(text), text)
 
   assert.equal(publicDisclosureRisk('这个思路可以抽象成感受器和效应器之间的耦合。'), null)
+  assert.equal(publicDisclosureRisk('Artifact metadata 应包含来源和时间戳。'), null)
+  assert.equal(publicDisclosureRisk('公开协作空间应显示参与者和权限边界。'), null)
+})
+
+test('public disclosure notice does not reveal which internal category was blocked', () => {
+  assert.equal(PUBLIC_DISCLOSURE_NOTICE, '这部分不适合在当前频道展开。')
 })
 
 test('private groups may discuss architecture but still block credentials and local paths', () => {
