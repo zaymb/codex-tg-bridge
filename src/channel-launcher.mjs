@@ -42,8 +42,11 @@ function processGroupExists(processGroupId) {
     process.kill(-processGroupId, 0)
     return true
   } catch (error) {
-    if (error.code === 'ESRCH') return false
-    throw error
+    // Darwin reports EPERM when the remaining group members are zombies.
+    // This probe only runs after the group leader has been reaped, so there
+    // is no live, owned process left that a later signal could usefully stop.
+    if (error.code === 'ESRCH' || error.code === 'EPERM') return false
+    throw new Error(`cannot probe process group ${processGroupId}: ${error.code ?? error.message}`, { cause: error })
   }
 }
 
@@ -55,7 +58,7 @@ function signalDetachedProcessGroup(child, signal) {
     return true
   } catch (error) {
     if (error.code === 'ESRCH') return false
-    throw error
+    throw new Error(`cannot send ${signal} to process group ${child.pid}: ${error.code ?? error.message}`, { cause: error })
   }
 }
 
@@ -72,14 +75,32 @@ async function stopDetachedProcessGroup(child, graceMs) {
     await childExit(child)
     return
   }
-  signalDetachedProcessGroup(child, 'SIGTERM')
+  const leaderExit = childExit(child)
+  // Give libuv one turn to reap a leader that already exited. On macOS,
+  // probing a process group whose only member is an unreaped zombie returns
+  // EPERM, even when that zombie belongs to this user.
+  await Promise.race([leaderExit, wait(0)])
+  if (child.exitCode === null && child.signalCode === null) {
+    signalDetachedProcessGroup(child, 'SIGTERM')
+  }
+  const leaderExited = await Promise.race([
+    leaderExit.then(() => true),
+    wait(graceMs).then(() => false),
+  ])
+  if (!leaderExited) {
+    signalDetachedProcessGroup(child, 'SIGKILL')
+    const killedLeaderExited = await Promise.race([
+      leaderExit.then(() => true),
+      wait(graceMs).then(() => false),
+    ])
+    if (!killedLeaderExited) throw new Error('Codex app-server leader did not exit after SIGKILL')
+  }
   if (!await waitForProcessGroupExit(child.pid, graceMs)) {
     signalDetachedProcessGroup(child, 'SIGKILL')
     if (!await waitForProcessGroupExit(child.pid, graceMs)) {
       throw new Error('Codex app-server process group did not exit')
     }
   }
-  await childExit(child)
 }
 
 export async function waitForChannelExit(tui, connectorRun) {
@@ -96,7 +117,7 @@ export async function waitForChannelExit(tui, connectorRun) {
 export async function main(
   argv = process.argv.slice(2),
   env = process.env,
-  { signal } = {},
+  { signal, setEngageHandler } = {},
 ) {
   const sessionId = argv[0]
   if (!sessionId || !/^[A-Za-z0-9-]+$/u.test(sessionId)) {
@@ -134,11 +155,11 @@ export async function main(
   const connectorController = new AbortController()
   let connectorRun = null
   let tui = null
+  let clearEngageHandler = () => {}
   let stopReason = 'launcher_failure'
   const shutdown = () => {
     connectorController.abort()
     if (tui?.exitCode === null && tui.signalCode === null) tui.kill('SIGTERM')
-    signalDetachedProcessGroup(appServer, 'SIGTERM')
   }
   signal?.addEventListener('abort', shutdown, { once: true })
   if (signal?.aborted) shutdown()
@@ -176,6 +197,7 @@ export async function main(
             : '/opt/codex-tg-bridge/src/relay-stdio.mjs'),
         BRIDGE_RELAY_DB_PATH: local.relayDbPath ?? '/var/lib/codex-tg-bridge/bridge.sqlite3',
         BRIDGE_RELAY_ATTACHMENT_ROOT: local.relayAttachmentRoot ?? '/var/lib/codex-tg-bridge/attachments',
+        BRIDGE_RELAY_CLOSE_GRACE_MS: String(local.relayCloseGraceMs ?? 2_000),
         CODEX_APPROVAL_POLICY: local.approvalPolicy ?? 'on-request',
         CODEX_SANDBOX_MODE: local.sandboxMode ?? 'workspace-write',
       },
@@ -184,6 +206,8 @@ export async function main(
       reconnectMaxMs: local.reconnectMaxMs ?? 20_000,
       heartbeatTimeoutMs: local.heartbeatTimeoutMs ?? 20_000,
     })
+    setEngageHandler?.(() => supervisor.engage())
+    clearEngageHandler = () => setEngageHandler?.(() => false)
     connectorRun = supervisor.run({ signal: connectorController.signal })
 
     tui = spawn(codexPath, ['resume', '--remote', `unix://${socketPath}`, sessionId], {
@@ -197,6 +221,7 @@ export async function main(
     if (!signal?.aborted) throw error
     stopReason = 'launcher_shutdown'
   } finally {
+    clearEngageHandler()
     signal?.removeEventListener('abort', shutdown)
     connectorController.abort()
     if (tui?.exitCode === null && tui.signalCode === null) tui.kill('SIGTERM')
@@ -215,6 +240,21 @@ export async function main(
   }
 }
 
+export function bindCliSignals(processRef, { shutdown, engage }) {
+  const shutdownHandlers = new Map([
+    ['SIGHUP', () => shutdown('SIGHUP')],
+    ['SIGINT', () => shutdown('SIGINT')],
+    ['SIGTERM', () => shutdown('SIGTERM')],
+  ])
+  const engageHandler = () => engage()
+  for (const [signal, handler] of shutdownHandlers) processRef.once(signal, handler)
+  processRef.on('SIGUSR1', engageHandler)
+  return () => {
+    for (const [signal, handler] of shutdownHandlers) processRef.off(signal, handler)
+    processRef.off('SIGUSR1', engageHandler)
+  }
+}
+
 export async function runCli(
   argv = process.argv.slice(2),
   env = process.env,
@@ -222,16 +262,19 @@ export async function runCli(
 ) {
   const controller = new AbortController()
   const shutdown = signal => controller.abort(signal)
-  const handlers = new Map([
-    ['SIGHUP', () => shutdown('SIGHUP')],
-    ['SIGINT', () => shutdown('SIGINT')],
-    ['SIGTERM', () => shutdown('SIGTERM')],
-  ])
-  for (const [signal, handler] of handlers) processRef.once(signal, handler)
+  let engageHandler = () => false
+  const unbind = bindCliSignals(processRef, {
+    shutdown,
+    engage: () => engageHandler(),
+  })
   try {
-    await main(argv, env, { signal: controller.signal })
+    await main(argv, env, {
+      signal: controller.signal,
+      setEngageHandler: handler => { engageHandler = handler },
+    })
   } finally {
-    for (const [signal, handler] of handlers) processRef.off(signal, handler)
+    engageHandler = () => false
+    unbind()
   }
 }
 

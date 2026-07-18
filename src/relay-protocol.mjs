@@ -191,6 +191,8 @@ export class RelayProtocolSession {
   #capabilities = new Set()
   #closed = false
   #removeAttachment
+  #transportControl
+  #disengageNotified = false
 
   constructor({
     stateStore,
@@ -203,6 +205,7 @@ export class RelayProtocolSession {
     coalesceQuietMs = 0,
     coalesceMaxMs = 0,
     removeAttachment = null,
+    transportControl = null,
   }) {
     this.#state = stateStore
     this.#sessionLabel = sessionLabel
@@ -214,6 +217,7 @@ export class RelayProtocolSession {
     this.#coalesceQuietMs = coalesceQuietMs
     this.#coalesceMaxMs = coalesceMaxMs
     this.#removeAttachment = removeAttachment
+    this.#transportControl = transportControl
   }
 
   get ready() {
@@ -284,6 +288,14 @@ export class RelayProtocolSession {
 
   async claimOnce() {
     if (!this.ready) return false
+    const disengageReadyAt = this.#transportControl?.disengageReadyAt() ?? null
+    if (disengageReadyAt !== null) {
+      if (this.#disengageNotified) return false
+      await this.#write({ type: 'transport_disengaged', atMs: disengageReadyAt })
+      this.#disengageNotified = true
+      this.#acceptingJobs = false
+      return true
+    }
     if (!this.#inflightApprovalId) {
       const approval = this.#state.nextRelayApprovalResponse({
         sessionLabel: this.#sessionLabel,

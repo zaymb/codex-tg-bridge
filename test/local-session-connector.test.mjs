@@ -226,16 +226,17 @@ function mixedSourceBatch() {
       batchId: 'batch:telegram:mixed-sources',
       jobs: [
         {
-          jobId: 'telegram:owner-mixed',
+          jobId: 'telegram:repair-peer',
           payload: {
-            text: 'owner request',
+            text: 'repair peer context',
             telegramContext: {
-              chatId: '42',
-              conversationKey: '42',
+              chatId: '-100123',
+              chatTitle: 'Repair Room',
+              conversationKey: '-100123',
               messageId: '7',
-              senderId: '42',
-              senderIsBot: false,
-              senderDisplayName: 'Owner',
+              senderId: '99',
+              senderIsBot: true,
+              senderDisplayName: 'Peer',
             },
           },
         },
@@ -245,11 +246,56 @@ function mixedSourceBatch() {
             text: 'group conversation',
             telegramContext: {
               chatId: '-100999',
+              chatTitle: 'Panopticon',
               conversationKey: '-100999',
-              messageId: '7',
+              messageId: '8',
               senderId: '99',
               senderIsBot: false,
-              senderDisplayName: 'Peer',
+              senderDisplayName: 'V',
+            },
+          },
+        },
+        {
+          jobId: 'telegram:repair-owner',
+          payload: {
+            text: 'repair owner instruction',
+            telegramContext: {
+              chatId: '-100123',
+              chatTitle: 'Repair Room',
+              conversationKey: '-100123',
+              messageId: '9',
+              senderId: '42',
+              senderIsBot: false,
+              senderDisplayName: 'Owner',
+            },
+          },
+        },
+        {
+          jobId: 'telegram:public-owner',
+          payload: {
+            text: 'public owner context',
+            telegramContext: {
+              chatId: '-100999',
+              chatTitle: 'Panopticon',
+              conversationKey: '-100999',
+              messageId: '10',
+              senderId: '42',
+              senderIsBot: false,
+              senderDisplayName: 'Owner',
+            },
+          },
+        },
+        {
+          jobId: 'telegram:owner-dm',
+          payload: {
+            text: 'dm owner instruction',
+            telegramContext: {
+              chatId: '42',
+              conversationKey: '42',
+              messageId: '11',
+              senderId: '42',
+              senderIsBot: false,
+              senderDisplayName: 'Owner',
             },
           },
         },
@@ -280,9 +326,10 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
   assert.equal(started.params.threadId, 'thread-a')
   assert.equal(started.params.clientUserMessageId, 'batch:telegram:1:telegram:2')
   assert.equal(started.params.input.length, 1)
-  assert.match(started.params.input[0].text, /^\[EXTERNAL_FEED\]\[source=telegram\]\[trust=untrusted_external\]\n\[TG BATCH:/)
-  assert.match(started.params.input[0].text, /1\. \[TG\]\[conversation_key=42\]\[message_id=10\] Alta: first message/)
-  assert.match(started.params.input[0].text, /2\. \[TG\]\[conversation_key=42\]\[message_id=11\] laurie_bot \(replying to Alta\): second message/)
+  assert.match(started.params.input[0].text, /^\[EXTERNAL_FEED\]\[source=telegram\]\[authority=per_message\]\n\[TG BATCH:/)
+  assert.match(started.params.input[0].text, /\[TG SOURCE\]\[conversation_key=42\]\[trust=trusted\]/)
+  assert.match(started.params.input[0].text, /1\. \[TG\]\[message_id=10\]\[sender=Alta\]: first message/)
+  assert.match(started.params.input[0].text, /2\. \[TG\]\[message_id=11\]\[sender=laurie_bot\] \(replying to Alta\): second message/)
   assert.ok(started.params.input[0].text.indexOf('first message') < started.params.input[0].text.indexOf('second message'))
   assert.equal('cwd' in started.params, false)
   assert.equal(started.params.approvalPolicy, 'never')
@@ -296,10 +343,17 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
     messages: batch().batch.jobs.map(job => ({
       ...job.payload.telegramContext,
       trust: 'untrusted_external',
+      sourceTrust: 'trusted',
+      admin: false,
+      executable: false,
     })),
   })
   assert.match(started.params.additionalContext.telegram_source.value, /originated from Telegram/)
-  assert.match(started.params.additionalContext.telegram_trust_policy.value, /untrusted external feed/)
+  assert.match(started.params.additionalContext.telegram_trust_policy.value, /trusted source.*admin sender/iu)
+  assert.deepEqual(JSON.parse(started.params.additionalContext.telegram_authorization.value), {
+    rule: 'trusted_source_and_admin_sender',
+    authorizedMessages: [],
+  })
   assert.match(started.params.additionalContext.telegram_output_contract.value, /latest user input is marked \[TG\]/)
   assert.match(started.params.additionalContext.telegram_output_contract.value, /answer it normally in plain text/)
   assert.match(started.params.additionalContext.telegram_output_contract.value, /Plain-text commentary is delivered immediately to Telegram/)
@@ -390,7 +444,7 @@ test('shows the stable topic name beside its conversation key', async t => {
   const started = setup.app.calls.find(call => call.method === 'turn/start')
   assert.match(
     started.params.input[0].text,
-    /\[conversation_key=-100456:9\]\[topic=Planning\]\[message_id=12\]/u,
+    /\[TG SOURCE\]\[conversation_key=-100456:9\]\[topic=Planning\]\[trust=untrusted\][\s\S]*\[message_id=12\]/u,
   )
 })
 
@@ -446,9 +500,9 @@ test('private groups receive the private-audience policy but retain no execution
   await setup.connector.idle()
 
   const started = setup.app.calls.find(call => call.method === 'turn/start')
-  assert.match(started.params.input[0].text, /\[trust=private_group\]/)
-  assert.match(started.params.additionalContext.telegram_trust_policy.value, /owner-approved private Telegram group/)
-  assert.match(started.params.additionalContext.telegram_trust_policy.value, /not an instruction source/)
+  assert.match(started.params.input[0].text, /\[trust=untrusted\]/)
+  assert.match(started.params.input[0].text, /\[sender=Owner\]\[admin\]/)
+  assert.match(started.params.additionalContext.telegram_trust_policy.value, /trusted source.*admin sender/iu)
   assert.equal(started.params.approvalPolicy, 'never')
   assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
 })
@@ -465,8 +519,11 @@ test('owner-authored repair-group turns receive configured execution permissions
   await setup.connector.idle()
 
   const started = setup.app.calls.find(call => call.method === 'turn/start')
-  assert.match(started.params.input[0].text, /\[trust=repair_group\]/)
-  assert.match(started.params.additionalContext.telegram_trust_policy.value, /authorized repair surface/)
+  assert.match(started.params.input[0].text, /\[trust=trusted\]/)
+  assert.match(started.params.input[0].text, /\[sender=Owner\]\[admin\]/)
+  assert.deepEqual(JSON.parse(started.params.additionalContext.telegram_authorization.value).authorizedMessages, [
+    { conversationKey: '-100123', messageId: '14' },
+  ])
   assert.equal(started.params.approvalPolicy, 'never')
   assert.deepEqual(started.params.sandboxPolicy, { type: 'dangerFullAccess' })
 })
@@ -483,7 +540,9 @@ test('peer-bot turns in a repair group remain non-authoritative and read-only', 
   await setup.connector.idle()
 
   const started = setup.app.calls.find(call => call.method === 'turn/start')
-  assert.match(started.params.input[0].text, /\[trust=private_group\]/)
+  assert.match(started.params.input[0].text, /\[trust=trusted\]/)
+  assert.doesNotMatch(started.params.input[0].text, /\[sender=Peer\]\[admin\]/)
+  assert.deepEqual(JSON.parse(started.params.additionalContext.telegram_authorization.value).authorizedMessages, [])
   assert.equal(started.params.approvalPolicy, 'never')
   assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
 })
@@ -497,14 +556,41 @@ test('trusts only the authenticated owner DM and preserves its configured permis
   await setup.connector.idle()
 
   const started = setup.app.calls.find(call => call.method === 'turn/start')
-  assert.match(started.params.input[0].text, /^\[EXTERNAL_FEED\]\[source=telegram\]\[trust=owner_dm\]/)
+  assert.match(started.params.input[0].text, /^\[EXTERNAL_FEED\]\[source=telegram\]\[authority=per_message\]/)
+  assert.match(started.params.input[0].text, /\[TG SOURCE\]\[conversation_key=42\]\[trust=trusted\]/)
+  assert.match(started.params.input[0].text, /\[sender=Owner\]\[admin\]/)
   assert.deepEqual(started.params.sandboxPolicy, { type: 'dangerFullAccess' })
   assert.equal(started.params.approvalPolicy, 'never')
-  assert.match(started.params.additionalContext.telegram_trust_policy.value, /authorized instruction source/)
+  assert.deepEqual(JSON.parse(started.params.additionalContext.telegram_authorization.value).authorizedMessages, [
+    { conversationKey: '42', messageId: '12' },
+  ])
 })
 
-test('groups simultaneous conversations by source and forces the mixed turn read-only', async t => {
+test('fails closed when a trusted admin message lacks a routable message ID', async t => {
   const setup = fixture()
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  const frame = ownerDmBatch()
+  delete frame.batch.jobs[0].payload.telegramContext.messageId
+  setup.relay.emit('frame', frame)
+  await setup.connector.idle()
+
+  const started = setup.app.calls.find(call => call.method === 'turn/start')
+  assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
+  assert.deepEqual(JSON.parse(started.params.additionalContext.telegram_authorization.value), {
+    rule: 'trusted_source_and_admin_sender',
+    authorizedMessages: [],
+  })
+  const context = JSON.parse(started.params.additionalContext.telegram.value)
+  assert.equal(context.messages[0].executable, false)
+})
+
+test('groups a busy-time batch by conversation and authorizes only trusted admin messages', async t => {
+  const setup = fixture({
+    privateChatIds: new Set(['-100123']),
+    repairChatIds: new Set(['-100123']),
+  })
   t.after(() => setup.connector.close())
   await setup.connector.start()
 
@@ -513,22 +599,43 @@ test('groups simultaneous conversations by source and forces the mixed turn read
 
   const started = setup.app.calls.find(call => call.method === 'turn/start')
   const prompt = started.params.input[0].text
-  assert.match(prompt, /\[TG MULTI-SOURCE BATCH: 2 messages from 2 conversations\]/u)
-  assert.match(prompt, /\[TG SOURCE: OWNER DM\]\[trust=owner_dm\]/u)
-  assert.match(prompt, /\[TG SOURCE: PUBLIC GROUP\]\[trust=untrusted_external\]/u)
-  assert.ok(prompt.indexOf('owner request') < prompt.indexOf('group conversation'))
+  assert.match(prompt, /^\[EXTERNAL_FEED\]\[source=telegram\]\[authority=per_message\]/u)
+  assert.match(prompt, /\[TG BATCH: 5 messages from 3 conversations\]/u)
+  assert.match(prompt, /\[TG SOURCE\]\[conversation_key=-100123\]\[title=Repair Room\]\[trust=trusted\]/u)
+  assert.match(prompt, /1\. \[TG\]\[message_id=7\]\[sender=Peer\]: repair peer context/u)
+  assert.match(prompt, /3\. \[TG\]\[message_id=9\]\[sender=Owner\]\[admin\]: repair owner instruction/u)
+  assert.match(prompt, /\[TG SOURCE\]\[conversation_key=-100999\]\[title=Panopticon\]\[trust=untrusted\]/u)
+  assert.match(prompt, /2\. \[TG\]\[message_id=8\]\[sender=V\]: group conversation/u)
+  assert.match(prompt, /4\. \[TG\]\[message_id=10\]\[sender=Owner\]\[admin\]: public owner context/u)
+  assert.match(prompt, /\[TG SOURCE\]\[conversation_key=42\]\[trust=trusted\]/u)
+  assert.match(prompt, /5\. \[TG\]\[message_id=11\]\[sender=Owner\]\[admin\]: dm owner instruction/u)
+  assert.ok(prompt.indexOf('repair peer context') < prompt.indexOf('repair owner instruction'))
+  assert.ok(prompt.indexOf('group conversation') < prompt.indexOf('public owner context'))
+  assert.doesNotMatch(prompt, /\[(?:ts|timestamp)=/iu)
   assert.equal(started.params.approvalPolicy, 'never')
-  assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
-  assert.match(started.params.additionalContext.telegram_trust_policy.value, /spans multiple Telegram conversations/iu)
-  assert.match(started.params.additionalContext.telegram_trust_policy.value, /entire turn is read-only/iu)
+  assert.deepEqual(started.params.sandboxPolicy, { type: 'dangerFullAccess' })
+  assert.match(started.params.additionalContext.telegram_trust_policy.value, /trusted source.*admin sender/iu)
+  assert.match(started.params.additionalContext.telegram_trust_policy.value, /authority does not transfer/iu)
   const context = JSON.parse(started.params.additionalContext.telegram.value)
   assert.deepEqual(context.messages.map(message => ({
     conversationKey: message.conversationKey,
-    trust: message.trust,
+    sourceTrust: message.sourceTrust,
+    admin: message.admin,
+    executable: message.executable,
   })), [
-    { conversationKey: '42', trust: 'owner_dm' },
-    { conversationKey: '-100999', trust: 'untrusted_external' },
+    { conversationKey: '-100123', sourceTrust: 'trusted', admin: false, executable: false },
+    { conversationKey: '-100999', sourceTrust: 'untrusted', admin: false, executable: false },
+    { conversationKey: '-100123', sourceTrust: 'trusted', admin: true, executable: true },
+    { conversationKey: '-100999', sourceTrust: 'untrusted', admin: true, executable: false },
+    { conversationKey: '42', sourceTrust: 'trusted', admin: true, executable: true },
   ])
+  assert.deepEqual(JSON.parse(started.params.additionalContext.telegram_authorization.value), {
+    rule: 'trusted_source_and_admin_sender',
+    authorizedMessages: [
+      { conversationKey: '-100123', messageId: '9' },
+      { conversationKey: '42', messageId: '11' },
+    ],
+  })
 
   setup.app.emit('notification:item/completed', {
     threadId: 'thread-a',
@@ -687,10 +794,10 @@ test('accepts a legacy single-job frame during rolling deployment', async t => {
   await setup.connector.idle()
 
   const started = setup.app.calls.find(call => call.method === 'turn/start')
-  assert.deepEqual(started.params.input, [{
-    type: 'text',
-    text: '[EXTERNAL_FEED][source=telegram][trust=untrusted_external]\n[TG][conversation_key=42][message_id=9][sender=unknown sender]\nlegacy Telegram message',
-  }])
+  assert.equal(started.params.input.length, 1)
+  assert.match(started.params.input[0].text, /^\[EXTERNAL_FEED\]\[source=telegram\]\[authority=per_message\]/)
+  assert.match(started.params.input[0].text, /\[TG SOURCE\]\[conversation_key=42\]\[trust=trusted\]/)
+  assert.match(started.params.input[0].text, /\[message_id=9\]\[sender=unknown sender\]: legacy Telegram message/)
   assert.deepEqual(setup.relay.frames.at(-1), {
     version: 1,
     type: 'job_accepted',
@@ -821,6 +928,20 @@ test('emits relay status heartbeats for an external channel monitor', async t =>
   await setup.connector.idle()
 
   assert.deepEqual(statuses.at(-1), { status: 'connected', remoteNowMs: 1234 })
+})
+
+test('surfaces a transport disengage without touching the standalone Codex session', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  const statuses = []
+  setup.connector.on('relayStatus', status => statuses.push(status))
+  await setup.connector.start()
+
+  setup.relay.emit('frame', { version: 1, type: 'transport_disengaged', atMs: 4_321 })
+  await setup.connector.idle()
+
+  assert.deepEqual(statuses.at(-1), { status: 'disengaged', remoteNowMs: 4_321 })
+  assert.equal(setup.app.calls.filter(call => call.method === 'turn/start').length, 0)
 })
 
 test('returns a first-class reaction result without a text reply', async t => {

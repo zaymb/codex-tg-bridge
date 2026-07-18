@@ -2,6 +2,8 @@ const OWNER_DM = 'owner_dm'
 const REPAIR_GROUP = 'repair_group'
 const PRIVATE_GROUP = 'private_group'
 const UNTRUSTED_EXTERNAL = 'untrusted_external'
+const TRUSTED_SOURCE = 'trusted'
+const UNTRUSTED_SOURCE = 'untrusted'
 
 const SENSITIVE_DISCLOSURE_PATTERNS = [
   /(?:^|\s)(?:\/Users\/|\/home\/|\/opt\/|\/var\/(?:lib|run)\/|~\/\.(?:claude|codex|ssh)\/)/iu,
@@ -61,6 +63,16 @@ function isPrivateGroupContext(context, privateChatIds) {
   return privateChatIds?.has(String(context?.chatId)) ?? false
 }
 
+function isOwnerDmSourceContext(context, ownerUserId) {
+  const owner = String(ownerUserId)
+  const conversation = context?.conversationKey ?? context?.chatId
+  return context?.chatId === owner && conversation === owner
+}
+
+function isRepairGroupSourceContext(context, repairChatIds) {
+  return repairChatIds?.has(String(context?.chatId)) ?? false
+}
+
 function isRepairGroupContext(context, ownerUserId, repairChatIds) {
   return repairChatIds?.has(String(context?.chatId))
     && context?.senderId === String(ownerUserId)
@@ -77,6 +89,28 @@ export function classifyTelegramContext(
   if (isRepairGroupContext(context, ownerUserId, repairChatIds)) return REPAIR_GROUP
   if (isPrivateGroupContext(context, privateChatIds)) return PRIVATE_GROUP
   return UNTRUSTED_EXTERNAL
+}
+
+export function classifyTelegramAuthority(
+  context,
+  ownerUserId,
+  privateChatIds = new Set(),
+  repairChatIds = new Set(),
+) {
+  const admin = context?.senderId === String(ownerUserId) && context?.senderIsBot !== true
+  const trustedSource = isOwnerDmSourceContext(context, ownerUserId)
+    || isRepairGroupSourceContext(context, repairChatIds)
+  return {
+    sourceTrust: trustedSource ? TRUSTED_SOURCE : UNTRUSTED_SOURCE,
+    admin,
+    executable: trustedSource && admin,
+    audienceTrust: classifyTelegramContext(
+      context,
+      ownerUserId,
+      privateChatIds,
+      repairChatIds,
+    ),
+  }
 }
 
 export function classifyTelegramJobs(
@@ -159,4 +193,9 @@ export const TELEGRAM_TRUST = Object.freeze({
   REPAIR_GROUP,
   PRIVATE_GROUP,
   UNTRUSTED_EXTERNAL,
+})
+
+export const TELEGRAM_SOURCE_TRUST = Object.freeze({
+  TRUSTED: TRUSTED_SOURCE,
+  UNTRUSTED: UNTRUSTED_SOURCE,
 })

@@ -68,6 +68,7 @@ export async function main(env = process.env) {
   const relayClient = new ProcessRelayClient({
     ...relayProcess,
     frameMaxBytes: config.frameMaxBytes,
+    closeGraceMs: config.relayCloseGraceMs,
   })
   const attachmentStore = await AttachmentStore.open({ root: config.localAttachmentRoot })
   await attachmentStore.pruneOlderThan(Date.now() - RELAY_JOB_TTL_MS)
@@ -97,8 +98,20 @@ export async function main(env = process.env) {
     appServerClient.once('close', fail)
     appServerClient.once('protocolError', fail)
   })
+  let resolveDisengaged
+  const disengaged = new Promise(resolve => { resolveDisengaged = resolve })
+  let outcome = { disengaged: false }
   try {
     connector.on('relayStatus', status => {
+      if (status.status === 'disengaged') {
+        console.log(JSON.stringify({
+          level: 'info',
+          event: 'local_connector_disengaged',
+          remoteNowMs: status.remoteNowMs ?? null,
+        }))
+        resolveDisengaged({ disengaged: true })
+        return
+      }
       console.log(JSON.stringify({
         level: 'info',
         event: 'local_connector_heartbeat',
@@ -112,20 +125,22 @@ export async function main(env = process.env) {
       sessionLabel: config.sessionLabel,
     }))
     const aborted = new Promise(resolve => {
-      controller.signal.addEventListener('abort', resolve, { once: true })
+      controller.signal.addEventListener('abort', () => resolve({ disengaged: false }), { once: true })
     })
-    await Promise.race([aborted, failure])
+    outcome = await Promise.race([aborted, failure, disengaged])
   } finally {
     process.off('SIGINT', shutdown)
     process.off('SIGTERM', shutdown)
     await connector.close()
     await appServerClient.close()
   }
+  return outcome
 }
 
 if (isMainModule(import.meta.url)) {
   try {
-    await main()
+    const outcome = await main()
+    if (outcome.disengaged) process.exitCode = 78
   } catch (error) {
     console.error(JSON.stringify({
       level: 'error',

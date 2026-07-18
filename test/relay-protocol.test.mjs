@@ -7,9 +7,11 @@ import test from 'node:test'
 
 import { RelayProtocolSession } from '../src/relay-protocol.mjs'
 import { StateStore } from '../src/state-store.mjs'
+import { TransportControl } from '../src/transport-control.mjs'
 
 function fixture({ coalesceQuietMs = 0, coalesceMaxMs = 0, removeAttachment = null } = {}) {
   const state = StateStore.open(':memory:')
+  const transportControl = new TransportControl({ stateStore: state })
   const frames = []
   let now = 1_000
   const session = new RelayProtocolSession({
@@ -23,8 +25,9 @@ function fixture({ coalesceQuietMs = 0, coalesceMaxMs = 0, removeAttachment = nu
     coalesceQuietMs,
     coalesceMaxMs,
     removeAttachment,
+    transportControl,
   })
-  return { state, frames, session, setNow(value) { now = value } }
+  return { state, transportControl, frames, session, setNow(value) { now = value } }
 }
 
 function enqueue(
@@ -157,6 +160,25 @@ async function hello(setup, acceptingJobs = true, capabilities = []) {
     capabilities,
   })
 }
+
+test('publishes a ready disengage once and never claims another job', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  enqueue(setup.state, '99')
+  setup.transportControl.requestDisengage({ ackActionId: 'bye-1', nowMs: 1_000 })
+  setup.transportControl.handleAckSent('bye-1', 1_001)
+  setup.transportControl.markDisengageReady(1_002)
+  await hello(setup)
+
+  assert.equal(await setup.session.claimOnce(), true)
+  assert.deepEqual(setup.frames.at(-1), {
+    version: 1,
+    type: 'transport_disengaged',
+    atMs: 1_002,
+  })
+  assert.equal(await setup.session.claimOnce(), false)
+  assert.equal(setup.state.getRelayJob('telegram:99').status, 'pending')
+})
 
 test('negotiates attachment transfer and leaves attachment conversations pending for legacy connectors', async t => {
   const setup = fixture()

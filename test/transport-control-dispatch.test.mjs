@@ -226,7 +226,9 @@ test('runtime quiesces and leaves via DisengagedError after a confirmed farewell
 
   // The active disengage must have survived on disk (run() closed the store).
   const inspection = StateStore.open(dbPath)
-  assert.equal(new TransportControl({ stateStore: inspection }).isDisengaged(), true)
+  const inspectionControl = new TransportControl({ stateStore: inspection })
+  assert.equal(inspectionControl.isDisengaged(), true)
+  assert.equal(inspectionControl.isDisengageReady(), true, 'local disconnect is published only after quiesce')
   inspection.close()
 
   // A restarted runtime is a tombstone: it must leave the same way without

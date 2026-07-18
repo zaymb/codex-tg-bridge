@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import test from 'node:test'
 
-import { waitForChannelExit } from '../src/channel-launcher.mjs'
+import { bindCliSignals, waitForChannelExit } from '../src/channel-launcher.mjs'
 
 const bridgeRoot = resolve(import.meta.dirname, '..')
 const launcherPath = join(bridgeRoot, 'src', 'channel-launcher.mjs')
@@ -40,7 +40,7 @@ function processExists(pid) {
   }
 }
 
-async function createFixture({ appServerShutdownGraceMs = 2_000 } = {}) {
+async function createFixture({ appServerShutdownGraceMs = 200 } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'tg-channel-launcher-'))
   const records = join(directory, 'records')
   const fakeCodexPath = join(directory, 'fake-codex.mjs')
@@ -173,6 +173,26 @@ test('an unexpected supervisor stop terminates the channel wait', async () => {
   )
 })
 
+test('SIGUSR1 requests a reconnect without shutting down the launcher', () => {
+  const processRef = new EventEmitter()
+  const controller = new AbortController()
+  let engageCalls = 0
+  const unbind = bindCliSignals(processRef, {
+    shutdown: signal => controller.abort(signal),
+    engage: () => { engageCalls += 1 },
+  })
+
+  processRef.emit('SIGUSR1')
+  processRef.emit('SIGUSR1')
+  assert.equal(engageCalls, 2)
+  assert.equal(controller.signal.aborted, false)
+
+  processRef.emit('SIGTERM')
+  assert.equal(controller.signal.aborted, true)
+  unbind()
+  assert.equal(processRef.listenerCount('SIGUSR1'), 0)
+})
+
 for (const signal of ['SIGHUP', 'SIGINT', 'SIGTERM']) {
   test(`${signal} stops every channel child, removes the socket, and records stopped`, async () => {
     const fixture = await createFixture()
@@ -226,13 +246,15 @@ test('a normal TUI exit performs the same cleanup and records its reason', async
 test('kills the detached app-server process group when its wrapper leaves a worker behind', async () => {
   const fixture = await createFixture({ appServerShutdownGraceMs: 100 })
   const launcher = startLauncher(fixture, { FAKE_ORPHAN_WORKER: '1' })
+  let stderr = ''
+  launcher.stderr.on('data', chunk => { stderr += chunk })
   let children = {}
   try {
     children = await readChannelChildren(fixture.records)
     children.worker = await readRecordedProcess(fixture.records, 'worker')
 
     launcher.kill('SIGTERM')
-    assert.deepEqual(await childExit(launcher), { code: 0, signal: null })
+    assert.deepEqual(await childExit(launcher), { code: 0, signal: null }, stderr)
     await waitFor(() => !processExists(children.appServer.pid) && !processExists(children.worker.pid))
   } finally {
     await cleanupChildren(launcher, children)

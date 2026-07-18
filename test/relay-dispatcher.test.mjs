@@ -285,6 +285,7 @@ test('includes the replied-to message and actor identity in the relay job', asyn
     updateId: '7',
     updateType: 'message',
     chatId: '-100123',
+    chatTitle: 'Sandbox',
     conversationKey: '-100123:9',
     threadId: '9',
     messageId: '70',

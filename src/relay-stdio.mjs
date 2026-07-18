@@ -8,6 +8,7 @@ import { loadRelayConfig } from './config.mjs'
 import { isMainModule } from './main-module.mjs'
 import { RelayProtocolSession, RELAY_PROTOCOL_VERSION } from './relay-protocol.mjs'
 import { StateStore } from './state-store.mjs'
+import { TransportControl } from './transport-control.mjs'
 
 export function createFrameWriter(output) {
   return async frame => {
@@ -20,6 +21,7 @@ export async function main(env = process.env, input = process.stdin, output = pr
   const stateStore = StateStore.open(config.dbPath)
   const attachmentStore = await AttachmentStore.open({ root: config.attachmentRoot })
   const writeFrame = createFrameWriter(output)
+  const transportControl = new TransportControl({ stateStore })
   const session = new RelayProtocolSession({
     stateStore,
     sessionLabel: config.sessionLabel,
@@ -30,6 +32,7 @@ export async function main(env = process.env, input = process.stdin, output = pr
     coalesceQuietMs: config.coalesceQuietMs,
     coalesceMaxMs: config.coalesceMaxMs,
     removeAttachment: path => attachmentStore.remove(path),
+    transportControl,
   })
   const lines = createInterface({ input, crlfDelay: Infinity })
   let chain = Promise.resolve()

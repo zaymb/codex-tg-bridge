@@ -2,12 +2,37 @@ import { EventEmitter } from 'node:events'
 import { spawn } from 'node:child_process'
 import { createInterface } from 'node:readline'
 
+function childExit(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve()
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      child.off('error', onError)
+      child.off('exit', onExit)
+    }
+    const onError = error => {
+      cleanup()
+      reject(error)
+    }
+    const onExit = () => {
+      cleanup()
+      resolve()
+    }
+    child.once('error', onError)
+    child.once('exit', onExit)
+  })
+}
+
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
 export class ProcessRelayClient extends EventEmitter {
   #command
   #args
   #spawn
   #frameMaxBytes
   #connectTimeoutMs
+  #closeGraceMs
   #env
   #child = null
   #lines = null
@@ -19,6 +44,7 @@ export class ProcessRelayClient extends EventEmitter {
     spawnImpl = spawn,
     frameMaxBytes = 262_144,
     connectTimeoutMs = 15_000,
+    closeGraceMs = 2_000,
     env = process.env,
   }) {
     super()
@@ -27,6 +53,7 @@ export class ProcessRelayClient extends EventEmitter {
     this.#spawn = spawnImpl
     this.#frameMaxBytes = frameMaxBytes
     this.#connectTimeoutMs = connectTimeoutMs
+    this.#closeGraceMs = closeGraceMs
     this.#env = env
   }
 
@@ -96,6 +123,19 @@ export class ProcessRelayClient extends EventEmitter {
     this.#closed = true
     this.#lines?.close()
     this.#child?.stdin?.end()
-    if (this.#child && this.#child.exitCode === null) this.#child.kill('SIGTERM')
+    if (!this.#child) return
+    const exit = childExit(this.#child)
+    if (this.#child.exitCode === null && this.#child.signalCode === null) this.#child.kill('SIGTERM')
+    const exited = await Promise.race([
+      exit.then(() => true),
+      wait(this.#closeGraceMs).then(() => false),
+    ])
+    if (exited) return
+    this.#child.kill('SIGKILL')
+    const killed = await Promise.race([
+      exit.then(() => true),
+      wait(this.#closeGraceMs).then(() => false),
+    ])
+    if (!killed) throw new Error('relay process did not exit after SIGKILL')
   }
 }

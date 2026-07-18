@@ -151,6 +151,11 @@ test('disengage hard boundary: only a confirmed farewell activates it', () => {
   control.requestDisengage({ ackActionId: 'bye-2', nowMs: 3_000 })
   assert.equal(control.handleAckSent('bye-2', 4_000), 'disengage')
   assert.equal(control.isDisengaged(), true)
+  assert.equal(control.isDisengageReady(), false, 'activation alone must not disconnect the local relay')
+  assert.equal(control.markDisengageReady(5_000), true)
+  assert.equal(control.isDisengageReady(), true)
+  assert.equal(control.read().disengage.readyAtMs, 5_000)
+  assert.equal(control.markDisengageReady(6_000), false, 'the ready transition is idempotent')
 })
 
 test('duplicate disengage and away-during-disengage are dropped', () => {

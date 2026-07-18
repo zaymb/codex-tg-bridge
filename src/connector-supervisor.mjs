@@ -46,6 +46,8 @@ export class ConnectorSupervisor {
   #heartbeatTimeoutMs
   #child = null
   #statusChain = Promise.resolve()
+  #disengaged = false
+  #engageResolve = null
 
   constructor({
     command,
@@ -84,6 +86,7 @@ export class ConnectorSupervisor {
 
   #monitorOutput(child) {
     let connected = false
+    let disengaged = false
     let lastHeartbeatAtMs = null
     let heartbeatTimer = null
     const errorLines = []
@@ -94,6 +97,11 @@ export class ConnectorSupervisor {
       try {
         event = JSON.parse(line)
       } catch {
+        return
+      }
+      if (event?.event === 'local_connector_disengaged') {
+        disengaged = true
+        clearTimeout(heartbeatTimer)
         return
       }
       if (!['local_connector_ready', 'local_connector_heartbeat'].includes(event?.event)) return
@@ -121,6 +129,7 @@ export class ConnectorSupervisor {
     })
     return {
       connected: () => connected,
+      disengaged: () => disengaged,
       lastError: () => errorLines.length > 0 ? errorLines.join('\n') : null,
       close() {
         clearTimeout(heartbeatTimer)
@@ -128,6 +137,28 @@ export class ConnectorSupervisor {
         stderr.close()
       },
     }
+  }
+
+  engage() {
+    if (!this.#disengaged) return false
+    this.#disengaged = false
+    const resolve = this.#engageResolve
+    this.#engageResolve = null
+    resolve?.()
+    return true
+  }
+
+  #waitForEngage(signal) {
+    if (!this.#disengaged || signal?.aborted) return Promise.resolve()
+    return new Promise(resolve => {
+      const done = () => {
+        signal?.removeEventListener('abort', done)
+        if (this.#engageResolve === done) this.#engageResolve = null
+        resolve()
+      }
+      this.#engageResolve = done
+      signal?.addEventListener('abort', done, { once: true })
+    })
   }
 
   async run({ signal } = {}) {
@@ -158,6 +189,19 @@ export class ConnectorSupervisor {
         if (this.#child === child) this.#child = null
       }
       if (signal?.aborted) break
+
+      if (exit.code === 78) {
+        this.#disengaged = true
+        await this.#writeStatus('disengaged', {
+          connectorPid: child.pid ?? null,
+          exitCode: exit.code,
+          farewellObserved: monitor.disengaged(),
+        })
+        await this.#waitForEngage(signal)
+        if (signal?.aborted) break
+        failedAttempts = 0
+        continue
+      }
 
       failedAttempts = monitor.connected() ? 0 : failedAttempts + 1
       const exponent = Math.min(Math.max(0, failedAttempts - 1), 30)

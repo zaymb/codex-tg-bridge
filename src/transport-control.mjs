@@ -79,7 +79,7 @@ export function isAwayReleaseMention(update, { ownerUserId, botUsername }) {
 //
 // away:      { phase: 'pending'|'active', requestedDurationMs, untilMs?,
 //              ackActionId, previous?: { untilMs } }
-// disengage: { phase: 'pending'|'active', ackActionId }
+// disengage: { phase: 'pending'|'active', ackActionId, readyAtMs? }
 //
 // Race rule (v2.1): pending is set in the same tick the command is claimed, so
 // new turns are blocked while the ack is still in flight. The away timer only
@@ -240,6 +240,30 @@ export class TransportControl {
 
   isDisengaged() {
     return this.read().disengage?.phase === 'active'
+  }
+
+  // The farewell ack activates disengage, but the local relay must stay up
+  // until the transport has drained every in-flight turn and outbound action.
+  // This second, persisted transition is the handoff boundary for the relay.
+  markDisengageReady(nowMs = this.#clock()) {
+    const state = this.read()
+    if (state.disengage?.phase !== 'active' || state.disengage.readyAtMs !== undefined) return false
+    this.#write({
+      ...state,
+      disengage: { ...state.disengage, readyAtMs: nowMs },
+    }, nowMs)
+    return true
+  }
+
+  disengageReadyAt() {
+    const disengage = this.read().disengage
+    return disengage?.phase === 'active' && Number.isSafeInteger(disengage.readyAtMs)
+      ? disengage.readyAtMs
+      : null
+  }
+
+  isDisengageReady() {
+    return this.disengageReadyAt() !== null
   }
 
   // --- restart recovery -------------------------------------------------------

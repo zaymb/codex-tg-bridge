@@ -224,12 +224,16 @@ test('loads explicit no-prompt permissions for the local Telegram connector', ()
   assert.equal(config.relayAttachmentRoot, '/srv/codex-inbox')
   assert.equal(config.coalesceQuietMs, 2_500)
   assert.equal(config.coalesceMaxMs, 8_000)
+  assert.equal(config.relayCloseGraceMs, 2_000)
   assert.deepEqual(config.sandboxPolicy, { type: 'dangerFullAccess' })
   env.CODEX_APPROVAL_POLICY = 'sometimes'
   assert.throws(() => loadLocalConnectorConfig(env), /CODEX_APPROVAL_POLICY/)
   env.CODEX_APPROVAL_POLICY = 'never'
   env.CODEX_SANDBOX_MODE = 'everything'
   assert.throws(() => loadLocalConnectorConfig(env), /CODEX_SANDBOX_MODE/)
+  env.CODEX_SANDBOX_MODE = 'danger-full-access'
+  env.BRIDGE_RELAY_CLOSE_GRACE_MS = '30001'
+  assert.throws(() => loadLocalConnectorConfig(env), /BRIDGE_RELAY_CLOSE_GRACE_MS/)
 })
 
 test('loads and validates relay coalescing bounds', () => {

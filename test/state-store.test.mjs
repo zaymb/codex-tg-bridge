@@ -776,7 +776,7 @@ test('claims, accepts, and finalizes every ready conversation in one batch atomi
   assert.equal(store.getOutboundAction('batch-answer').status, 'pending')
 })
 
-test('takes only the first author partition from each ready conversation', async t => {
+test('takes every pending author from each ready conversation', async t => {
   const { store } = await openStore()
   t.after(() => store.close())
   for (const [id, conversationKey, senderId, nowMs] of [
@@ -806,11 +806,11 @@ test('takes only the first author partition from each ready conversation', async
     nowMs: 200,
   })
 
-  assert.deepEqual(batch.map(job => job.jobId), ['telegram:1', 'telegram:3'])
-  assert.equal(store.getRelayJob('telegram:2').status, 'pending')
+  assert.deepEqual(batch.map(job => job.jobId), ['telegram:1', 'telegram:2', 'telegram:3'])
+  assert.equal(store.getRelayJob('telegram:2').status, 'leased')
 })
 
-test('never coalesces different Telegram authors into one relay batch', async t => {
+test('coalesces alternating Telegram authors into one relay batch', async t => {
   const { store } = await openStore()
   t.after(() => store.close())
   for (const [id, senderId, senderIsBot, nowMs] of [
@@ -833,15 +833,15 @@ test('never coalesces different Telegram authors into one relay batch', async t 
     })
   }
 
-  const owner = store.claimRelayJobBatch({
+  const batch = store.claimRelayJobBatch({
     sessionLabel: 'tg-engage',
     connectorId: 'connector-a',
     maxBatchBytes: 100_000,
     nowMs: 200,
   })
-  assert.deepEqual(owner.map(job => job.jobId), ['telegram:1'])
-  assert.equal(store.getRelayJob('telegram:2').status, 'pending')
-  assert.equal(store.getRelayJob('telegram:3').status, 'pending')
+  assert.deepEqual(batch.map(job => job.jobId), ['telegram:1', 'telegram:2', 'telegram:3'])
+  assert.equal(store.getRelayJob('telegram:2').status, 'leased')
+  assert.equal(store.getRelayJob('telegram:3').status, 'leased')
 })
 
 test('releases every unaccepted job in a deferred batch without crossing conversations', async t => {

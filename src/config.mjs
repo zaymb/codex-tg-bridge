@@ -312,6 +312,9 @@ export function loadLocalConnectorConfig(env = process.env) {
     relayMode,
     frameMaxBytes: parseInteger(env, 'BRIDGE_RELAY_FRAME_MAX_BYTES', 262_144, 1_024, 1_048_576),
     heartbeatIntervalMs: parseInteger(env, 'BRIDGE_RELAY_HEARTBEAT_INTERVAL_MS', 5_000, 1_000, 30_000),
+    // Same graceful-shutdown budget as the channel launcher. Relay teardown
+    // should normally complete on EOF; this only bounds failure handling.
+    relayCloseGraceMs: parseInteger(env, 'BRIDGE_RELAY_CLOSE_GRACE_MS', 2_000, 0, 30_000),
     ...parseRelayCoalescing(env),
     approvalPolicy: parseChoice(
       env.CODEX_APPROVAL_POLICY,

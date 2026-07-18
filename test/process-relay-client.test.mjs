@@ -5,12 +5,21 @@ import test from 'node:test'
 
 import { ProcessRelayClient } from '../src/process-relay-client.mjs'
 
-function fakeChild() {
+function fakeChild({ ignoreSigterm = false } = {}) {
   const child = new EventEmitter()
+  child.exitCode = null
+  child.signalCode = null
+  child.signals = []
   child.stdin = new PassThrough()
   child.stdout = new PassThrough()
   child.stderr = new PassThrough()
-  child.kill = () => child.emit('exit', 0, 'SIGTERM')
+  child.kill = signal => {
+    child.signals.push(signal)
+    if (ignoreSigterm && signal === 'SIGTERM') return true
+    child.signalCode = signal
+    child.emit('exit', null, signal)
+    return true
+  }
   return child
 }
 
@@ -68,4 +77,23 @@ test('fails closed on malformed or oversized relay output', async () => {
     await assert.rejects(connecting, /relay|JSON|size/i)
     await client.close()
   }
+})
+
+test('waits for relay exit and hard-kills a detached SSH process that ignores SIGTERM', async () => {
+  const child = fakeChild({ ignoreSigterm: true })
+  const client = new ProcessRelayClient({
+    command: 'ssh',
+    args: [],
+    spawnImpl: () => child,
+    connectTimeoutMs: 1_000,
+    closeGraceMs: 5,
+  })
+  const connecting = client.connect({ version: 1, type: 'hello' })
+  child.stdout.write(`${JSON.stringify({ version: 1, type: 'ready' })}\n`)
+  await connecting
+
+  await client.close()
+
+  assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL'])
+  assert.equal(child.signalCode, 'SIGKILL')
 })

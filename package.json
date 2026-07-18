@@ -12,6 +12,7 @@
     "transport": "node src/transport-index.mjs",
     "local-connector": "node src/local-connector-index.mjs",
     "channel": "node src/channel-launcher.mjs",
+    "engage-local": "node scripts/engage-local.mjs",
     "mcp": "node src/mcp-server.mjs",
     "wake": "node src/wake-cli.mjs"
   },

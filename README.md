@@ -12,7 +12,9 @@ both split-host and same-host deployments.
 - The launcher supervises the connector, writes `.state/channel-status.json`,
   and reconnects with bounded exponential backoff while the TUI stays open.
   Connected status carries a heartbeat expiry; a stale heartbeat is marked
-  disconnected and the connector is restarted automatically.
+  disconnected and the connector is restarted automatically. An intentional
+  disengage is different: status becomes `disengaged`, automatic reconnect is
+  disabled, and the TUI/app-server continue as a standalone local session.
 - Split-host mode uses outbound-only SSH stdio. Same-host mode starts the relay
   process directly without opening a listener.
 - App-server, connector, and SSH relay processes are detached from the TUI's
@@ -94,6 +96,37 @@ sudo systemctl enable --now codex-tg-bridge.service
 The service starts `transport-index.mjs`; it has no app-server socket, Codex
 login, workspace, or model dependency.
 
+### Transport controls
+
+`/away Nm` accepts integer durations from 1 to 60 minutes. Telegram intake is
+stored durably but no Codex turn starts until the timer expires or the owner
+mentions the bot. The timer starts only after Telegram confirms the reply
+`Will be back in Nm.`
+
+`/disengage` is a hard, manual boundary. After Telegram confirms
+`Until next time.`, the transport stops polling, drains accepted relay work and
+outbound actions, persists a ready marker, and exits with status 78. The relay
+then tells the local connector to close; that connector waits for its detached
+SSH/process relay to exit, escalating from TERM to KILL after the configured
+grace period. Its supervisor records `disengaged` and does not reconnect. The
+shared Codex TUI and app-server stay open locally.
+
+Re-engage is deliberately two explicit operations, remote first and local
+second:
+
+```bash
+# On the transport host, with the transport environment loaded:
+node scripts/engage.mjs
+sudo systemctl start codex-tg-bridge
+
+# On the local host, for the still-open channel launcher:
+npm run engage-local
+```
+
+The local command refuses unless the channel status is exactly `disengaged`;
+it signals only the recorded launcher PID. Network recovery alone never
+reconnects a disengaged channel.
+
 Relay preflight, without claiming work:
 
 ```bash
@@ -123,8 +156,9 @@ The launcher starts a temporary local app-server, attaches the Telegram
 connector, and opens the normal Codex TUI on the same thread. Exiting the TUI
 closes the connector and the app-server's detached process group. The optional
 `appServerShutdownGraceMs` setting controls the bounded TERM grace period before
-the exact group is killed; the default is 2000 ms. It installs no launchd
-service.
+the exact group is killed; the default is 2000 ms. `relayCloseGraceMs` applies
+the same 2000 ms default to the detached SSH/local relay process. It installs
+no launchd service.
 
 The checked contract fixture targets local `codex-cli 0.144.1`. Regenerate and
 review it whenever Codex CLI changes; startup fails closed on a version mismatch.
@@ -181,28 +215,37 @@ For owner DM, no group configuration is needed. Before group acceptance:
 
 ## Trust boundary
 
-- Every Telegram turn is tagged as an `EXTERNAL_FEED` with an authenticated
-  trust tier. The configured owner's private chat and owner-authored turns in
-  configured repair groups are instruction sources; other group messages remain
-  conversation data.
+- Every Telegram message is tagged as an `EXTERNAL_FEED`. Source trust and
+  sender identity are computed independently by the connector: owner DM and
+  configured repair groups are `trusted` sources, while only the configured
+  human owner is `admin`. A message can authorize execution only when both are
+  true.
 - `TELEGRAM_PRIVATE_CHAT_IDS` defines private audiences that may receive
   owner-private architecture discussion. These groups remain non-authoritative:
   they cannot start work, mutate state, approve actions, or control sessions.
 - `TELEGRAM_REPAIR_CHAT_IDS` defines repair surfaces. An authenticated owner
   message in one of these groups may start work and use the configured Codex
   permissions. Messages from peer bots or other members remain non-authoritative,
-  even in the same repair group. Each conversation contributes only one
-  contiguous author partition to a relay batch, so coalescing cannot downgrade
-  or accidentally promote a neighboring message.
-- A batch spanning more than one conversation is always read-only and
-  non-authoritative, even when one partition came from the owner DM. Per-message
-  trust labels remain available for audience classification and reply routing.
-- Group slash commands are stored as context and never execute bridge control
-  actions. `/new`, `/stop`, approvals, and mutations require the terminal or
-  owner DM.
-- Untrusted turns run with `readOnly`, network disabled, `approvalPolicy=never`,
-  and automatic denial of any approval request that still reaches the local
-  connector.
+  even in the same repair group.
+- While Codex is busy, Telegram jobs remain durable in the relay queue. Once the
+  session is available, every pending message in each ready conversation joins
+  the same bounded batch; sender changes do not split it. Model input is grouped
+  by conversation, preserves natural order within each source, and retains every
+  `message_id` for selective replies.
+- For mixed-source batches, the connector emits an exact
+  `telegram_authorization.authorizedMessages` manifest. Only listed
+  `conversationKey + messageId` pairs may authorize work. Other messages remain
+  conversation data, and authority never transfers between messages or sources.
+- Ordinary group slash commands are stored as context and never execute bridge
+  control actions. `/new`, `/stop`, and approval callback resolution require
+  the terminal or owner DM. The transport-only `/away` and `/disengage`
+  commands are the narrow exception: they bypass the model and require the
+  authenticated admin sender, independent of conversation trust. Ordinary tool
+  work requested by an authorized repair message still follows the manifest
+  rule above.
+- Batches with no authorized message run with `readOnly`, network disabled,
+  `approvalPolicy=never`, and automatic denial of any approval request that
+  still reaches the local connector.
 - Public Telegram output passes a deterministic disclosure guard. Concrete
   local paths, credentials, environment/config identifiers, private
   infrastructure details, code blocks, oversized responses, and file exports

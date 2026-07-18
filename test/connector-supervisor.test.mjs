@@ -122,3 +122,36 @@ test('marks a stale heartbeat disconnected and restarts the connector', async ()
   controller.abort()
   await running
 })
+
+test('holds a disengaged connector offline until an explicit engage', async () => {
+  const children = []
+  const statuses = []
+  const controller = new AbortController()
+  const supervisor = new ConnectorSupervisor({
+    command: '/usr/local/bin/node',
+    spawnImpl() {
+      const child = fakeChild(300 + children.length)
+      children.push(child)
+      return child
+    },
+    statusWriter: status => statuses.push(status),
+    waitImpl: async () => {},
+    reconnectInitialMs: 1,
+  })
+
+  const running = supervisor.run({ signal: controller.signal })
+  await waitFor(() => children.length === 1)
+  children[0].stdout.write(`${JSON.stringify({ event: 'local_connector_disengaged' })}\n`)
+  children[0].exit(78)
+  await waitFor(() => statuses.some(status => status.status === 'disengaged'))
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(children.length, 1, 'disengage must not enter the reconnect loop')
+
+  assert.equal(supervisor.engage(), true)
+  await waitFor(() => children.length === 2)
+  assert.equal(supervisor.engage(), false, 'engage only has meaning while held offline')
+
+  controller.abort()
+  await running
+  assert.equal(children[1].signalCode, 'SIGTERM')
+})

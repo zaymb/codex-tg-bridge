@@ -3,7 +3,9 @@ import test from 'node:test'
 
 import {
   PUBLIC_DISCLOSURE_NOTICE,
+  TELEGRAM_SOURCE_TRUST,
   TELEGRAM_TRUST,
+  classifyTelegramAuthority,
   classifyTelegramJobs,
   externalFeedTag,
   guardTelegramOutput,
@@ -14,6 +16,50 @@ import {
 function job(context) {
   return { payload: { telegramContext: context } }
 }
+
+test('computes source trust and admin identity as orthogonal authority fields', () => {
+  const privateGroups = new Set(['-1001'])
+  const repairGroups = new Set(['-1001'])
+  const cases = [
+    {
+      name: 'owner DM owner',
+      context: {
+        chatId: '42', conversationKey: '42', senderId: '42', senderIsBot: false,
+      },
+      expected: { sourceTrust: TELEGRAM_SOURCE_TRUST.TRUSTED, admin: true, executable: true },
+    },
+    {
+      name: 'repair group owner',
+      context: {
+        chatId: '-1001', conversationKey: '-1001', senderId: '42', senderIsBot: false,
+      },
+      expected: { sourceTrust: TELEGRAM_SOURCE_TRUST.TRUSTED, admin: true, executable: true },
+    },
+    {
+      name: 'public group owner',
+      context: {
+        chatId: '-1002', conversationKey: '-1002', senderId: '42', senderIsBot: false,
+      },
+      expected: { sourceTrust: TELEGRAM_SOURCE_TRUST.UNTRUSTED, admin: true, executable: false },
+    },
+    {
+      name: 'repair group peer',
+      context: {
+        chatId: '-1001', conversationKey: '-1001', senderId: '99', senderIsBot: true,
+      },
+      expected: { sourceTrust: TELEGRAM_SOURCE_TRUST.TRUSTED, admin: false, executable: false },
+    },
+  ]
+
+  for (const { name, context, expected } of cases) {
+    const authority = classifyTelegramAuthority(context, '42', privateGroups, repairGroups)
+    assert.deepEqual({
+      sourceTrust: authority.sourceTrust,
+      admin: authority.admin,
+      executable: authority.executable,
+    }, expected, name)
+  }
+})
 
 test('trusts only an authenticated owner private-chat batch', () => {
   const owner = job({

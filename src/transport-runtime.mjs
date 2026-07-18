@@ -119,7 +119,10 @@ export async function createTransportRuntime({
               const busy = sent > 0
                 || stateStore.countUndeliveredOutboundActions() > 0
                 || stateStore.countActiveRelayJobs(config.sessionLabel) > 0
-              if (!busy) throw new DisengagedError()
+              if (!busy) {
+                transportControl.markDisengageReady()
+                throw new DisengagedError()
+              }
               await idle(workerIdleMs, controller.signal)
               continue
             }

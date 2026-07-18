@@ -140,14 +140,14 @@ The implementation uses a currently supported Node.js LTS selected and pinned du
 - The owner Telegram user ID is the only authority for pairing, configuration changes, approvals, and system commands.
 - Approved group IDs are configured explicitly.
 - Other DMs are rejected before entering the durable Codex work queue.
-- Group messages are treated as untrusted content even when posted by the owner; they cannot request privileged actions. The owner must issue a fresh instruction in DM or the terminal.
+- Source trust and sender identity are separate. Owner DM and configured repair groups are trusted sources; only the configured human owner is an admin sender. A Telegram message can request privileged action only when both conditions hold and its exact conversation/message ID appears in the connector-generated authorization manifest.
 - Bot-to-bot mode is enabled for the new bot. Group Privacy is disabled so ordinary group messages can be ingested.
 
 ### Codex permissions
 
-- Owner DM turns default to `workspace-write` with `on-request` approvals and configured writable roots.
-- Group and non-owner turns use `read-only`, network disabled, and `approvalPolicy=never`.
-- Approval requests from an untrusted turn are denied automatically. Approval requests from terminal or owner-DM work may be sent to the owner DM with opaque, expiring callback tokens.
+- Batches containing at least one manifest-authorized message use the configured execution policy. Authority remains scoped to the listed message and does not transfer to neighboring messages in the same batch.
+- Batches with no manifest-authorized message use `read-only`, network disabled, and `approvalPolicy=never`.
+- Approval requests from a batch with no authorized message are denied automatically. Approval requests from terminal or manifest-authorized work may be sent to the owner DM with opaque, expiring callback tokens.
 - Only callback queries from the owner ID can resolve approvals.
 - Unknown approval methods, expired callbacks, and approval state mismatches fail closed.
 - Current app-server methods handled explicitly:
