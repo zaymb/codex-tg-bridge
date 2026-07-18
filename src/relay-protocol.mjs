@@ -6,6 +6,7 @@ import {
   RelayAttachmentPreparationError,
 } from './relay-attachment-transfer.mjs'
 import { requireTelegramDiceEmoji } from './telegram-dice.mjs'
+import { RELAY_RUNTIME_FINGERPRINT } from './runtime-fingerprint.mjs'
 
 export const RELAY_PROTOCOL_VERSION = 1
 export const RELAY_ATTACHMENT_CAPABILITY = 'attachment_transfer_v1'
@@ -193,6 +194,7 @@ export class RelayProtocolSession {
   #removeAttachment
   #transportControl
   #disengageNotified = false
+  #runtimeFingerprint
 
   constructor({
     stateStore,
@@ -206,6 +208,7 @@ export class RelayProtocolSession {
     coalesceMaxMs = 0,
     removeAttachment = null,
     transportControl = null,
+    runtimeFingerprint = RELAY_RUNTIME_FINGERPRINT,
   }) {
     this.#state = stateStore
     this.#sessionLabel = sessionLabel
@@ -218,6 +221,7 @@ export class RelayProtocolSession {
     this.#coalesceMaxMs = coalesceMaxMs
     this.#removeAttachment = removeAttachment
     this.#transportControl = transportControl
+    this.#runtimeFingerprint = runtimeFingerprint
   }
 
   get ready() {
@@ -262,6 +266,9 @@ export class RelayProtocolSession {
     if (frame.type !== 'hello') throw new Error('hello must be the first relay frame')
     const sessionLabel = requireText(frame.sessionLabel, 'sessionLabel')
     if (sessionLabel !== this.#sessionLabel) throw new Error('relay session label does not match')
+    if (frame.runtimeFingerprint !== this.#runtimeFingerprint) {
+      throw new Error('relay runtime fingerprint mismatch')
+    }
     const connectorId = requireText(frame.connectorId, 'connectorId')
     const codexSessionId = requireText(frame.codexSessionId, 'codexSessionId')
     const registered = this.#state.registerRelaySession({
@@ -282,6 +289,7 @@ export class RelayProtocolSession {
       type: 'ready',
       sessionLabel,
       leaseMs: this.#leaseMs,
+      runtimeFingerprint: this.#runtimeFingerprint,
       capabilities: [...this.#capabilities],
     })
   }

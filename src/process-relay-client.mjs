@@ -34,6 +34,7 @@ export class ProcessRelayClient extends EventEmitter {
   #connectTimeoutMs
   #closeGraceMs
   #env
+  #expectedRuntimeFingerprint = null
   #child = null
   #lines = null
   #closed = false
@@ -59,6 +60,11 @@ export class ProcessRelayClient extends EventEmitter {
 
   connect(hello) {
     if (this.#child) throw new Error('relay process is already started')
+    if (typeof hello?.runtimeFingerprint !== 'string' || !hello.runtimeFingerprint) {
+      throw new Error('relay runtime fingerprint is required')
+    }
+    const expectedFingerprint = hello.runtimeFingerprint
+    this.#expectedRuntimeFingerprint = expectedFingerprint
     this.#child = this.#spawn(this.#command, this.#args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: true,
@@ -87,6 +93,10 @@ export class ProcessRelayClient extends EventEmitter {
       const onExit = (code, signal) => fail(new Error(`relay process exited before ready (${code ?? signal})`))
       const onFrame = frame => {
         if (frame?.type !== 'ready') return
+        if (frame.runtimeFingerprint !== expectedFingerprint) {
+          fail(new Error('relay runtime fingerprint mismatch'))
+          return
+        }
         settled = true
         cleanup()
         resolve()
@@ -107,6 +117,9 @@ export class ProcessRelayClient extends EventEmitter {
         frame = JSON.parse(line)
       } catch {
         throw new Error('relay output is not valid JSON')
+      }
+      if (frame?.type === 'ready' && frame.runtimeFingerprint !== this.#expectedRuntimeFingerprint) {
+        throw new Error('relay runtime fingerprint mismatch')
       }
       this.emit('frame', frame)
     }

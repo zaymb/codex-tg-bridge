@@ -17,6 +17,7 @@ import {
 } from './channel-trust.mjs'
 import { RELAY_ATTACHMENT_CAPABILITY, RELAY_PROTOCOL_VERSION } from './relay-protocol.mjs'
 import { RelayAttachmentReceiver } from './relay-attachment-transfer.mjs'
+import { RELAY_RUNTIME_FINGERPRINT } from './runtime-fingerprint.mjs'
 
 function isActiveStatus(status) {
   return ['inProgress', 'in_progress', 'running', 'started'].includes(status)
@@ -161,6 +162,7 @@ export class LocalSessionConnector extends EventEmitter {
   #pendingApprovals = new Map()
   #attachmentReceiver = null
   #attachmentStore = null
+  #runtimeFingerprint
 
   constructor({
     appServerClient,
@@ -178,6 +180,7 @@ export class LocalSessionConnector extends EventEmitter {
     approvalTtlMs = 10 * 60 * 1_000,
     clock = Date.now,
     attachmentStore = null,
+    runtimeFingerprint = RELAY_RUNTIME_FINGERPRINT,
   }) {
     super()
     this.#app = appServerClient
@@ -195,6 +198,7 @@ export class LocalSessionConnector extends EventEmitter {
     this.#repairChatIds = new Set([...repairChatIds].map(String))
     this.#approvalTtlMs = approvalTtlMs
     this.#clock = clock
+    this.#runtimeFingerprint = runtimeFingerprint
     if (attachmentStore) {
       this.#attachmentStore = attachmentStore
       this.#attachmentReceiver = new RelayAttachmentReceiver({ attachmentStore })
@@ -264,6 +268,7 @@ export class LocalSessionConnector extends EventEmitter {
     await this.#relay.connect({
       version: RELAY_PROTOCOL_VERSION,
       type: 'hello',
+      runtimeFingerprint: this.#runtimeFingerprint,
       sessionLabel: this.#sessionLabel,
       connectorId: this.#connectorId,
       codexSessionId: this.#codexSessionId,

@@ -9,7 +9,12 @@ import { RelayProtocolSession } from '../src/relay-protocol.mjs'
 import { StateStore } from '../src/state-store.mjs'
 import { TransportControl } from '../src/transport-control.mjs'
 
-function fixture({ coalesceQuietMs = 0, coalesceMaxMs = 0, removeAttachment = null } = {}) {
+function fixture({
+  coalesceQuietMs = 0,
+  coalesceMaxMs = 0,
+  removeAttachment = null,
+  runtimeFingerprint = 'runtime-a',
+} = {}) {
   const state = StateStore.open(':memory:')
   const transportControl = new TransportControl({ stateStore: state })
   const frames = []
@@ -26,6 +31,7 @@ function fixture({ coalesceQuietMs = 0, coalesceMaxMs = 0, removeAttachment = nu
     coalesceMaxMs,
     removeAttachment,
     transportControl,
+    runtimeFingerprint,
   })
   return { state, transportControl, frames, session, setNow(value) { now = value } }
 }
@@ -153,6 +159,7 @@ async function hello(setup, acceptingJobs = true, capabilities = []) {
   await setup.session.handleFrame({
     version: 1,
     type: 'hello',
+    runtimeFingerprint: 'runtime-a',
     sessionLabel: 'tg-engage',
     connectorId: 'connector-a',
     codexSessionId: 'session-a',
@@ -160,6 +167,22 @@ async function hello(setup, acceptingJobs = true, capabilities = []) {
     capabilities,
   })
 }
+
+test('rejects a connector running a different source tree', async t => {
+  const setup = fixture({ runtimeFingerprint: 'runtime-a' })
+  t.after(() => setup.state.close())
+
+  await assert.rejects(setup.session.handleFrame({
+    version: 1,
+    type: 'hello',
+    runtimeFingerprint: 'runtime-b',
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-a',
+    codexSessionId: 'session-a',
+    acceptingJobs: true,
+    capabilities: [],
+  }), /runtime fingerprint mismatch/i)
+})
 
 test('publishes a ready disengage once and never claims another job', async t => {
   const setup = fixture()

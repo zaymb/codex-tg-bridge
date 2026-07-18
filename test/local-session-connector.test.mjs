@@ -49,6 +49,7 @@ function fixture({
   privateChatIds = new Set(),
   repairChatIds = new Set(),
   attachmentStore = null,
+  runtimeFingerprint = 'runtime-a',
 } = {}) {
   const app = new FakeAppServer()
   const relay = new FakeRelay()
@@ -66,6 +67,7 @@ function fixture({
     privateChatIds,
     repairChatIds,
     attachmentStore,
+    runtimeFingerprint,
   })
   return { app, relay, connector }
 }
@@ -317,6 +319,7 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
   t.after(() => setup.connector.close())
   await setup.connector.start()
   assert.deepEqual(setup.relay.hello.capabilities, [])
+  assert.equal(setup.relay.hello.runtimeFingerprint, 'runtime-a')
 
   assert.equal(setup.relay.hello.acceptingJobs, true)
   setup.relay.emit('frame', batch())

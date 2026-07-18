@@ -38,12 +38,21 @@ test('starts the relay command, completes hello, and parses frames', async t => 
     },
     connectTimeoutMs: 1_000,
   })
-  t.after(() => client.close())
   const frames = []
   client.on('frame', frame => frames.push(frame))
+  t.after(() => client.close())
 
-  const connecting = client.connect({ version: 1, type: 'hello', sessionLabel: 'tg-engage' })
-  child.stdout.write(`${JSON.stringify({ version: 1, type: 'ready' })}\n`)
+  const connecting = client.connect({
+    version: 1,
+    type: 'hello',
+    sessionLabel: 'tg-engage',
+    runtimeFingerprint: 'runtime-a',
+  })
+  child.stdout.write(`${JSON.stringify({
+    version: 1,
+    type: 'ready',
+    runtimeFingerprint: 'runtime-a',
+  })}\n`)
   await connecting
   child.stdout.write(`${JSON.stringify({ version: 1, type: 'job', job: { jobId: 'telegram:1' } })}\n`)
   await new Promise(resolve => setImmediate(resolve))
@@ -58,8 +67,35 @@ test('starts the relay command, completes hello, and parses frames', async t => 
     version: 1,
     type: 'hello',
     sessionLabel: 'tg-engage',
+    runtimeFingerprint: 'runtime-a',
   })
   assert.equal(frames.at(-1).job.jobId, 'telegram:1')
+})
+
+test('fails closed when the remote relay reports a different runtime fingerprint', async () => {
+  const child = fakeChild()
+  const client = new ProcessRelayClient({
+    command: 'ssh',
+    args: [],
+    spawnImpl: () => child,
+    connectTimeoutMs: 1_000,
+  })
+  const frames = []
+  client.on('frame', frame => frames.push(frame))
+  const connecting = client.connect({
+    version: 1,
+    type: 'hello',
+    runtimeFingerprint: 'runtime-a',
+  })
+  child.stdout.write(`${JSON.stringify({
+    version: 1,
+    type: 'ready',
+    runtimeFingerprint: 'runtime-b',
+  })}\n`)
+
+  await assert.rejects(connecting, /runtime fingerprint mismatch/i)
+  assert.deepEqual(frames, [])
+  await client.close()
 })
 
 test('fails closed on malformed or oversized relay output', async () => {
@@ -72,7 +108,7 @@ test('fails closed on malformed or oversized relay output', async () => {
       frameMaxBytes: 32,
       connectTimeoutMs: 1_000,
     })
-    const connecting = client.connect({ version: 1, type: 'hello' })
+    const connecting = client.connect({ version: 1, type: 'hello', runtimeFingerprint: 'runtime-a' })
     child.stdout.write(line)
     await assert.rejects(connecting, /relay|JSON|size/i)
     await client.close()
@@ -88,8 +124,12 @@ test('waits for relay exit and hard-kills a detached SSH process that ignores SI
     connectTimeoutMs: 1_000,
     closeGraceMs: 5,
   })
-  const connecting = client.connect({ version: 1, type: 'hello' })
-  child.stdout.write(`${JSON.stringify({ version: 1, type: 'ready' })}\n`)
+  const connecting = client.connect({ version: 1, type: 'hello', runtimeFingerprint: 'runtime-a' })
+  child.stdout.write(`${JSON.stringify({
+    version: 1,
+    type: 'ready',
+    runtimeFingerprint: 'runtime-a',
+  })}\n`)
   await connecting
 
   await client.close()
