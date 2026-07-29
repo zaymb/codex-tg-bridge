@@ -1762,6 +1762,77 @@ test('surfaces and acknowledges Telegram delivery receipts', async t => {
   })
 })
 
+test('injects failed delivery receipts into the next trusted owner turn', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', {
+    version: 1,
+    type: 'delivery_receipt',
+    receiptId: 'relay-delivery:failed-batch',
+    batchId: 'failed-batch',
+    jobIds: ['telegram:failed'],
+    status: 'failed',
+    actions: [{
+      actionId: 'relay-batch:failed-batch:0000',
+      conversationKey: '-100123',
+      status: 'failed',
+      telegramMessageId: null,
+      error: 'job result response target is not in the current batch',
+    }],
+  })
+  await setup.connector.idle()
+
+  setup.relay.emit('frame', ownerDmBatch())
+  await setup.connector.idle()
+
+  const started = setup.app.calls.find(call => call.method === 'turn/start')
+  const context = JSON.parse(
+    started.params.additionalContext.telegram_delivery_failures.value,
+  )
+  assert.match(context.rule, /not confirmed delivered/u)
+  assert.equal(context.receipts.length, 1)
+  assert.equal(context.receipts[0].receiptId, 'relay-delivery:failed-batch')
+  assert.equal(context.receipts[0].actions[0].telegramMessageId, null)
+  assert.equal(
+    context.receipts[0].actions[0].error,
+    'job result response target is not in the current batch',
+  )
+})
+
+test('does not disclose pending delivery failures to an untrusted group turn', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', {
+    version: 1,
+    type: 'delivery_receipt',
+    receiptId: 'relay-delivery:private-failure',
+    batchId: 'private-failure',
+    jobIds: ['telegram:private-failure'],
+    status: 'failed',
+    actions: [{
+      actionId: 'relay-batch:private-failure:0000',
+      conversationKey: '42',
+      status: 'failed',
+      telegramMessageId: null,
+      error: 'private delivery detail',
+    }],
+  })
+  await setup.connector.idle()
+
+  setup.relay.emit('frame', privateGroupBatch())
+  await setup.connector.idle()
+
+  const started = setup.app.calls.find(call => call.method === 'turn/start')
+  assert.equal(
+    Object.hasOwn(started.params.additionalContext, 'telegram_delivery_failures'),
+    false,
+  )
+})
+
 test('surfaces a relay-rejected result as a failed delivery receipt', async t => {
   const setup = fixture()
   t.after(() => setup.connector.close())

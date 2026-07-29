@@ -277,8 +277,10 @@ For owner DM, no group configuration is needed. Before group acceptance:
   automatically repeated.
 - Telegram API failures and relay-side result rejection both return a typed
   failed-delivery receipt to the local connector. The launcher records it in
-  channel status and prints one terminal alert; successful delivery stays
-  quiet apart from durable status.
+  channel status and prints one terminal alert. Pending failures are also
+  injected into the next authenticated owner turn, so the model cannot mistake
+  a rejected action for a delivered one. Successful delivery stays quiet apart
+  from durable status.
 - Final relay result and outbound actions commit in one SQLite transaction.
 - Successful bot reactions are captured in a durable, idempotent event outbox
   for side-channel consumers and never extend engagement cooldown.

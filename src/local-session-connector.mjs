@@ -14,6 +14,7 @@ import {
 import {
   classifyTelegramAuthority,
   classifyTelegramJobs,
+  TELEGRAM_SOURCE_TRUST,
   TELEGRAM_TRUST,
 } from './channel-trust.mjs'
 import { RELAY_ATTACHMENT_CAPABILITY, RELAY_PROTOCOL_VERSION } from './relay-protocol.mjs'
@@ -179,6 +180,7 @@ export class LocalSessionConnector extends EventEmitter {
   #interruptFanout
   #taskContextResolver
   #pendingRelayFrames = 0
+  #pendingDeliveryFailures = []
   #operationController = new AbortController()
 
   constructor({
@@ -236,6 +238,13 @@ export class LocalSessionConnector extends EventEmitter {
 
   #acceptingJobs() {
     return this.#available() && this.#pendingRelayFrames === 0
+  }
+
+  #rememberDeliveryFailure(receipt) {
+    if (!receipt || receipt.status === 'sent') return
+    if (this.#pendingDeliveryFailures.some(entry => entry.receiptId === receipt.receiptId)) return
+    this.#pendingDeliveryFailures.push(receipt)
+    if (this.#pendingDeliveryFailures.length > 32) this.#pendingDeliveryFailures.shift()
   }
 
   #send(frame) {
@@ -627,6 +636,7 @@ export class LocalSessionConnector extends EventEmitter {
         status: frame.status,
         actions: frame.actions,
       }
+      this.#rememberDeliveryFailure(receipt)
       this.emit('deliveryReceipt', receipt)
       this.#send({ type: 'delivery_recorded', receiptId: frame.receiptId })
       return
@@ -638,7 +648,7 @@ export class LocalSessionConnector extends EventEmitter {
         const error = typeof frame.error === 'string' && frame.error
           ? frame.error
           : 'relay rejected the Telegram result'
-        this.emit('deliveryReceipt', {
+        const receipt = {
           receiptId: `relay-result:${this.#currentJob.batchId ?? this.#currentJob.jobs[0].jobId}`,
           batchId: this.#currentJob.batchId ?? this.#currentJob.jobs[0].jobId,
           jobIds: this.#currentJob.jobs.map(job => String(job.jobId)),
@@ -653,7 +663,9 @@ export class LocalSessionConnector extends EventEmitter {
             telegramMessageId: null,
             error,
           })),
-        })
+        }
+        this.#rememberDeliveryFailure(receipt)
+        this.emit('deliveryReceipt', receipt)
       }
       await this.#restoreConfiguredPolicyForCurrentJob()
       const paths = this.#currentJob.jobs.flatMap(job => (job.payload?.attachments ?? [])
@@ -738,6 +750,9 @@ export class LocalSessionConnector extends EventEmitter {
       return { ...authority, executable: admitted }
     }))
     const messageTrusts = messageAuthorities.map(authority => authority.audienceTrust)
+    const mayObserveDeliveryFailures = classifiedAuthorities.some(authority => (
+      authority.sourceTrust === TELEGRAM_SOURCE_TRUST.TRUSTED && authority.admin
+    ))
     const crossConversation = new Set(inbound.jobs.map(job => (
       job.payload?.telegramContext?.conversationKey
       || job.conversationKey
@@ -773,6 +788,9 @@ export class LocalSessionConnector extends EventEmitter {
       mixedSource: false,
       commentaryForwarded: false,
       unforwardedCommentaryResponses: [],
+      deliveryFailures: mayObserveDeliveryFailures
+        ? this.#pendingDeliveryFailures.slice()
+        : [],
     }
     this.#send({ type: 'heartbeat', acceptingJobs: false })
     try {
@@ -858,6 +876,17 @@ export class LocalSessionConnector extends EventEmitter {
             kind: 'application',
             value: JSON.stringify({ messages: telegramCapabilities }),
           },
+          ...(this.#currentJob.deliveryFailures.length > 0
+            ? {
+                telegram_delivery_failures: {
+                  kind: 'application',
+                  value: JSON.stringify({
+                    rule: 'These are transport receipts for earlier Telegram final decisions. Failed or ambiguous actions were not confirmed delivered. Do not claim success. Retry only when the current user message authorizes and still intends the outbound action.',
+                    receipts: this.#currentJob.deliveryFailures,
+                  }),
+                },
+              }
+            : {}),
           ...(taskqContext && taskqContext.status !== 'none'
             ? {
                 taskq_reference_gate: {
@@ -891,6 +920,12 @@ export class LocalSessionConnector extends EventEmitter {
       if (!turnId) throw new Error('Codex turn/start returned no turn ID')
       this.#currentJob.turnId = turnId
       this.#activeTurns.add(turnId)
+      if (this.#currentJob.deliveryFailures.length > 0) {
+        const injected = new Set(this.#currentJob.deliveryFailures.map(receipt => receipt.receiptId))
+        this.#pendingDeliveryFailures = this.#pendingDeliveryFailures.filter(
+          receipt => !injected.has(receipt.receiptId),
+        )
+      }
       this.#send(this.#resultFrame('job_accepted', {
         threadId: this.#threadId,
         turnId,
