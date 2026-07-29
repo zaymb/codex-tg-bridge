@@ -59,6 +59,33 @@ test('/disengage is exact-form only', () => {
   assert.equal(parseTransportCommand(update('/disengagex'), CONTEXT), null)
 })
 
+test('accepts exact admin stop controls without treating prose as a command', () => {
+  assert.deepEqual(parseTransportCommand(update('/stop'), CONTEXT), { kind: 'interrupt' })
+  assert.deepEqual(parseTransportCommand(update('/stop@bridge_bot'), CONTEXT), { kind: 'interrupt' })
+  assert.deepEqual(parseTransportCommand(update('停'), CONTEXT), { kind: 'interrupt' })
+  assert.deepEqual(parseTransportCommand(update('stop'), CONTEXT), { kind: 'interrupt' })
+  assert.deepEqual(parseTransportCommand(update(' STOP '), CONTEXT), { kind: 'interrupt' })
+  assert.deepEqual(parseTransportCommand(update('/continue'), CONTEXT), { kind: 'resume' })
+  assert.deepEqual(parseTransportCommand(update('/continue@bridge_bot'), CONTEXT), { kind: 'resume' })
+  assert.deepEqual(parseTransportCommand(update('继续'), CONTEXT), { kind: 'resume' })
+  assert.deepEqual(parseTransportCommand(update('continue'), CONTEXT), { kind: 'resume' })
+  assert.equal(parseTransportCommand(update('停一下'), CONTEXT), null)
+  assert.equal(parseTransportCommand(update('stop now'), CONTEXT), null)
+  assert.equal(parseTransportCommand(update('/stop now'), CONTEXT), null)
+  assert.equal(parseTransportCommand(update('continue working'), CONTEXT), null)
+})
+
+test('accepts exact per-agent stop controls and rejects unknown targets', () => {
+  for (const text of ['/stop elio', '/stop@bridge_bot elio', '/stop @bridge_bot elio', 'stop elio', ' STOP ELIO ']) {
+    assert.deepEqual(parseTransportCommand(update(text), CONTEXT), { kind: 'interrupt', target: 'elio' }, text)
+  }
+  for (const text of ['/stop laurie', '/stop@bridge_bot laurie', 'stop laurie']) {
+    assert.deepEqual(parseTransportCommand(update(text), CONTEXT), { kind: 'interrupt', target: 'laurie' }, text)
+  }
+  assert.equal(parseTransportCommand(update('/stop gale'), CONTEXT), null)
+  assert.equal(parseTransportCommand(update('stop gale'), CONTEXT), null)
+})
+
 test('only the admin sender qualifies; bots with the admin id never do', () => {
   assert.equal(parseTransportCommand(update('/away 15m', { senderId: '77' }), CONTEXT), null)
   assert.equal(parseTransportCommand(update('/away 15m', { senderId: '42', isBot: true }), CONTEXT), null)
@@ -163,6 +190,73 @@ test('duplicate disengage and away-during-disengage are dropped', () => {
   control.requestDisengage({ ackActionId: 'bye-1', nowMs: 1_000 })
   assert.deepEqual(control.requestDisengage({ ackActionId: 'bye-2', nowMs: 2_000 }), { accepted: false })
   assert.deepEqual(control.requestAway({ durationMs: 60_000, ackActionId: 'ack-9', nowMs: 2_000 }), { accepted: false })
+})
+
+test('interrupt requests are durable, idempotent, and explicitly acknowledged', () => {
+  const control = new TransportControl({ stateStore: fakeStore(), clock: () => 1_000 })
+  assert.deepEqual(control.requestInterrupt({
+    requestId: 'interrupt-1',
+    conversationKey: '-100123:7',
+    nowMs: 1_000,
+  }), { accepted: true })
+  assert.deepEqual(control.requestInterrupt({
+    requestId: 'interrupt-1',
+    conversationKey: '-100123:7',
+    nowMs: 2_000,
+  }), { accepted: false })
+
+  assert.deepEqual(control.nextInterrupt(), {
+    requestId: 'interrupt-1',
+    conversationKey: '-100123:7',
+    requestedAtMs: 1_000,
+  })
+  assert.equal(control.completeInterrupt('other', 3_000), false)
+  assert.equal(control.completeInterrupt('interrupt-1', 3_000), true)
+  assert.equal(control.nextInterrupt(), null)
+})
+
+test('continue requests preserve their control action through the durable queue', () => {
+  const control = new TransportControl({ stateStore: fakeStore(), clock: () => 1_000 })
+  assert.deepEqual(control.requestInterrupt({
+    requestId: 'resume-1',
+    conversationKey: '-100123:7',
+    action: 'continue',
+    nowMs: 1_000,
+  }), { accepted: true })
+
+  assert.deepEqual(control.nextInterrupt(), {
+    requestId: 'resume-1',
+    conversationKey: '-100123:7',
+    action: 'continue',
+    requestedAtMs: 1_000,
+  })
+  assert.throws(() => control.requestInterrupt({
+    requestId: 'bad-1',
+    conversationKey: '-100123:7',
+    action: 'pause',
+  }), /stop or continue/u)
+})
+
+test('targeted stop requests preserve their target through the durable queue', () => {
+  const control = new TransportControl({ stateStore: fakeStore(), clock: () => 1_000 })
+  assert.deepEqual(control.requestInterrupt({
+    requestId: 'interrupt-elio-1',
+    conversationKey: '-100123:7',
+    target: 'elio',
+    nowMs: 1_000,
+  }), { accepted: true })
+
+  assert.deepEqual(control.nextInterrupt(), {
+    requestId: 'interrupt-elio-1',
+    conversationKey: '-100123:7',
+    target: 'elio',
+    requestedAtMs: 1_000,
+  })
+  assert.throws(() => control.requestInterrupt({
+    requestId: 'interrupt-unknown-1',
+    conversationKey: '-100123:7',
+    target: 'gale',
+  }), /all, elio, or laurie/u)
 })
 
 test('recover promotes, reverts, or keeps pending based on the ack terminal state', () => {

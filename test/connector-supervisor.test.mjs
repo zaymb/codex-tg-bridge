@@ -78,6 +78,47 @@ test('isolates connector stdio from the TUI and restarts after relay disconnect'
   assert.equal(statuses.at(-1).status, 'stopped')
 })
 
+test('persists the latest Telegram delivery result across heartbeat status updates', async () => {
+  const children = []
+  const statuses = []
+  const alerts = []
+  const controller = new AbortController()
+  const supervisor = new ConnectorSupervisor({
+    command: '/usr/local/bin/node',
+    spawnImpl() {
+      const child = fakeChild(400 + children.length)
+      children.push(child)
+      return child
+    },
+    statusWriter: status => statuses.push(status),
+    deliveryAlert: receipt => alerts.push(receipt),
+    waitImpl: async () => {},
+    heartbeatTimeoutMs: 1_000,
+  })
+
+  const running = supervisor.run({ signal: controller.signal })
+  await waitFor(() => children.length === 1)
+  children[0].stdout.write(`${JSON.stringify({
+    event: 'local_connector_delivery',
+    receipt: {
+      receiptId: 'relay-delivery:batch-a',
+      batchId: 'batch-a',
+      status: 'failed',
+      actions: [{ actionId: 'reply-a', status: 'failed', error: 'Telegram rejected the message' }],
+    },
+  })}\n`)
+  children[0].stdout.write(`${JSON.stringify({ event: 'local_connector_heartbeat' })}\n`)
+
+  await waitFor(() => statuses.some(status => status.lastDelivery?.batchId === 'batch-a'))
+  const connected = statuses.filter(status => status.status === 'connected').at(-1)
+  assert.equal(connected.lastDelivery.status, 'failed')
+  assert.equal(connected.lastDelivery.actions[0].error, 'Telegram rejected the message')
+  assert.deepEqual(alerts, [connected.lastDelivery])
+
+  controller.abort()
+  await running
+})
+
 test('writes an owner-only atomic channel status file', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'tg-channel-status-'))
   const path = join(directory, 'nested', 'status.json')

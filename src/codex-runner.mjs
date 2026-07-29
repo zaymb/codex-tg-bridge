@@ -2,71 +2,75 @@ import { AppServerRpcError } from './app-server-client.mjs'
 import {
   TELEGRAM_TRUST,
   TELEGRAM_TRUST_POLICIES,
-  classifyTelegramContext,
+  classifyTelegramAuthority,
   externalFeedTag,
-  guardTelegramOutput,
-  isInstructionTrust,
 } from './channel-trust.mjs'
 
-export const TELEGRAM_OUTPUT_SCHEMA = Object.freeze({
-  type: 'object',
-  additionalProperties: false,
-  required: ['action', 'text', 'reason'],
-  properties: {
-    action: { type: 'string', enum: ['send', 'react', 'skip'] },
-    text: { type: 'string' },
-    reason: { type: 'string' },
-  },
-})
-
-export const TELEGRAM_BATCH_OUTPUT_SCHEMA = Object.freeze({
-  type: 'object',
-  additionalProperties: false,
-  required: ['action', 'text', 'responses', 'reason'],
-  properties: {
-    action: { type: 'string', enum: ['send', 'react', 'skip'] },
-    text: { type: 'string' },
-    responses: {
-      type: 'array',
-      maxItems: 32,
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['messageId', 'action', 'text', 'isBig'],
-        properties: {
-          conversationKey: { type: 'string', minLength: 1 },
-          messageId: { type: 'string', pattern: '^\\d+$' },
-          action: { type: 'string', enum: ['send', 'react', 'dice'] },
-          text: { type: 'string', minLength: 1 },
-          isBig: { type: 'boolean' },
+function telegramDecisionSchema() {
+  return Object.freeze({
+    type: 'object',
+    additionalProperties: false,
+    required: ['decision', 'text', 'targets'],
+    properties: {
+      decision: {
+        type: 'string',
+        enum: ['send', 'reply', 'react', 'skip', 'targeted'],
+      },
+      text: { type: 'string' },
+      targets: {
+        type: 'array',
+        maxItems: 32,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['conversationKey', 'messageId', 'decision', 'text', 'big'],
+          properties: {
+            conversationKey: { type: 'string', minLength: 1 },
+            messageId: { type: ['string', 'null'], pattern: '^\\d+$' },
+            decision: { type: 'string', enum: ['send', 'reply', 'react', 'dice'] },
+            text: { type: 'string', minLength: 1 },
+            big: { type: 'boolean' },
+          },
         },
       },
     },
-    reason: { type: 'string' },
-  },
-})
+  })
+}
+
+export const TELEGRAM_OUTPUT_SCHEMA = telegramDecisionSchema()
+export const TELEGRAM_BATCH_OUTPUT_SCHEMA = TELEGRAM_OUTPUT_SCHEMA
 
 export const TELEGRAM_OUTPUT_INSTRUCTIONS = [
   'Return only the structured result required by outputSchema.',
-  'Use action=send and put the complete Telegram-ready final answer in text.',
-  'Use action=react and put exactly one Telegram reaction emoji in text when a reaction is better than a written reply.',
-  'Use action=skip only when no Telegram response should be sent, with a concise reason.',
+  'Select decision=send to post a standalone message in the current Telegram conversation.',
+  'Select decision=reply only when intentionally replying to the latest Telegram message in the current batch.',
+  'Select decision=react when a reaction is better than a written reply. Use exactly one of these Telegram-supported reactions: ❤ 👍 👎 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🙏 👌 🤣 👀 🫡.',
+  'Group participation: independently decide whether the conversation interests you or you have something natural to add. Another participant or agent already replying, possibly replying later, the owner not naming you, or the message not being a task are not reasons to lower participation. Reply or react when interested; skip remains valid when you genuinely have nothing to add, for a mechanical duplicate or status echo, or when asked not to respond. This is not a per-message acknowledgement requirement. Deduplicate task execution, not conversational judgment.',
+  'Select decision=skip only when no Telegram response should be sent; keep text empty.',
+  'The bridge owns transport actions. Never write action, responses, or reason fields.',
+  'mayReply is independent from mayExecute: mayExecute=false forbids tools and state changes, but does not forbid an ordinary conversational reply when mayReply=true.',
   'Do not expose reasoning, tool progress, or partial output.',
 ].join(' ')
 
 export const TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS = [
   'Apply this Telegram output contract only while the latest user input is marked [TG].',
-  'Plain-text commentary is delivered immediately to Telegram as a progress update; keep it concise and user-facing, and never wrap commentary in JSON.',
-  'Only final_answer may contain the Telegram JSON envelope.',
-  'For [TG] input, return one JSON object with exactly action, text, responses, and reason.',
-  'Use action=send and put one Telegram-ready answer in text.',
-  'Use action=react and put exactly one Telegram reaction emoji in text when a reaction to the latest message is better than a written reply.',
-  'Choose exactly one reply form: either put one answer in text and keep responses empty, or set text to an empty string and use responses for selective replies. Never duplicate an answer into both fields.',
-  'Each selective response must contain messageId (the listed Telegram message_id rendered as a string), action (send, react, or dice), text, and isBig (a boolean). It may also contain conversationKey.',
-  'When a batch spans multiple conversations, every selective response must include the listed conversationKey so identical message IDs cannot cross chats. Omitted messages receive nothing.',
-  'Use a targeted response with action=dice and text set to exactly one of 🎲 🎯 🏀 ⚽ 🎳 🎰 to send Telegram animated dice.',
-  'Always include responses; use an empty array when no targeted responses are needed.',
-  'Use action=skip only when no Telegram response should be sent, with a concise reason.',
+  'When using commentary, put a concise, natural progress update in a reply decision. The bridge forwards at most the first commentary update to Telegram and keeps later commentary local.',
+  'Use final_answer for the completed response.',
+  'For [TG] input, return one JSON object with exactly decision, text, and targets. The bridge mechanically creates the transport envelope.',
+  'Use decision=send and put one standalone Telegram-ready message in text, with targets empty.',
+  'Use decision=reply only when intentionally replying to the globally latest Telegram message in the current batch; put the reply in text and keep targets empty.',
+  'Use decision=react when a reaction is better than a written reply. Use exactly one of these Telegram-supported reactions: ❤ 👍 👎 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🙏 👌 🤣 👀 🫡. Keep targets empty.',
+  'Group participation: independently decide whether each conversation interests you or you have something natural to add. Another participant or agent already replying, possibly replying later, the owner not naming you, or the message not being a task are not reasons to lower participation. Reply or react when interested; omission or skip remains valid when you genuinely have nothing to add, for a mechanical duplicate or status echo, or when asked not to respond. This is not a per-message acknowledgement requirement. Deduplicate task execution, not conversational judgment.',
+  'Use decision=targeted with empty text for explicit destinations.',
+  'Each target must contain conversationKey, messageId, decision (send, reply, react, or dice), text, and big (a boolean).',
+  'Use target decision=send with messageId=null to post a standalone message in that approved conversation, including a conversation absent from the current batch.',
+  'Use target decision=reply only when intentionally replying to that exact listed message; messageId must be its Telegram message_id rendered as a string.',
+  'Use the listed conversationKey on every reply, react, or dice target so identical message IDs cannot cross chats. Omitted messages receive nothing.',
+  'Use a target with decision=dice and text set to exactly one of 🎲 🎯 🏀 ⚽ 🎳 🎰 to send Telegram animated dice.',
+  'Always include targets; use an empty array when no targeted responses are needed.',
+  'Use decision=skip only when no Telegram response should be sent; keep text and targets empty.',
+  'Never write action, responses, or reason fields.',
+  'mayReply is independent from mayExecute: mayExecute=false forbids tools and state changes, but does not forbid an ordinary conversational reply when mayReply=true.',
   'If a later user input is unmarked, it came from the terminal: answer it normally in plain text without the Telegram JSON envelope.',
   'Do not expose hidden reasoning or raw tool output. Use commentary only for brief progress and final_answer for the final response.',
 ].join(' ')
@@ -141,113 +145,113 @@ function extractFinal(items) {
   return authoritative?.text ?? ''
 }
 
+const TELEGRAM_DICE = new Set(['🎲', '🎯', '🏀', '⚽', '🎳', '🎰'])
+
+function malformedTelegramOutput() {
+  return {
+    action: 'invalid', skipped: false, invalid: true, finalText: null,
+    responses: [], reason: 'malformed_structured_output',
+  }
+}
+
+function hasOnlyKeys(value, required, optional = []) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const allowed = new Set([...required, ...optional])
+  return required.every(key => Object.hasOwn(value, key))
+    && Object.keys(value).every(key => allowed.has(key))
+}
+
+function normalizeTargets(items, legacy = false) {
+  if (!Array.isArray(items) || items.length === 0 || items.length > 32) return null
+  const required = legacy
+    ? ['messageId', 'action', 'text']
+    : ['conversationKey', 'messageId', 'decision', 'text', 'big']
+  const optional = legacy ? ['conversationKey', 'isBig'] : []
+  const seen = new Set()
+  const responses = []
+  for (const item of items) {
+    if (!hasOnlyKeys(item, required, optional)) return null
+    const action = legacy && item.action === 'send' ? 'reply' : (legacy ? item.action : item.decision)
+    const standalone = !legacy && action === 'send'
+    const validMessageId = standalone
+      ? item.messageId === null
+      : typeof item.messageId === 'string' && /^\d+$/u.test(item.messageId)
+    const key = standalone
+      ? `${item.conversationKey ?? ''}\0send`
+      : `${item.conversationKey ?? ''}\0${item.messageId}`
+    if (
+      !validMessageId
+      || (item.conversationKey !== undefined && (typeof item.conversationKey !== 'string' || !item.conversationKey))
+      || (standalone && typeof item.conversationKey !== 'string')
+      || seen.has(key) || !['send', 'reply', 'react', 'dice'].includes(action)
+      || typeof item.text !== 'string' || !item.text.trim()
+      || (!legacy && typeof item.big !== 'boolean')
+      || (action === 'dice' && !TELEGRAM_DICE.has(item.text))
+    ) return null
+    seen.add(key)
+    responses.push({
+      ...(item.conversationKey === undefined ? {} : { conversationKey: item.conversationKey }),
+      messageId: item.messageId, action, text: item.text,
+      ...((legacy ? item.isBig : item.big) === undefined ? {} : { isBig: legacy ? item.isBig : item.big }),
+    })
+  }
+  return responses
+}
+
+function mapTelegramDecision(value) {
+  if (
+    !hasOnlyKeys(value, ['decision', 'text', 'targets'])
+    || typeof value.text !== 'string'
+    || !Array.isArray(value.targets)
+  ) return null
+  if (value.decision === 'skip' && value.text === '' && value.targets.length === 0) {
+    return { action: 'skip', skipped: true, finalText: null, responses: [], reason: 'model_selected_skip' }
+  }
+  if (['send', 'reply', 'react'].includes(value.decision) && value.text.trim() && value.targets.length === 0) {
+    return {
+      action: value.decision, skipped: false,
+      finalText: value.text, responses: [], reason: `model_selected_${value.decision}`,
+    }
+  }
+  const responses = value.decision === 'targeted' && value.text === ''
+    ? normalizeTargets(value.targets)
+    : null
+  return responses
+    ? { action: 'send', skipped: false, finalText: '', responses, reason: 'model_selected_targeted' }
+    : null
+}
+
+function mapLegacyTelegramEnvelope(value) {
+  if (
+    !hasOnlyKeys(value, ['action', 'text', 'reason'], ['responses'])
+    || typeof value.action !== 'string'
+    || typeof value.text !== 'string'
+    || typeof value.reason !== 'string'
+  ) return null
+  const action = value.action
+  const emptyResponses = value.responses === undefined || (Array.isArray(value.responses) && value.responses.length === 0)
+  if (action === 'skip' && value.text === '' && emptyResponses) {
+    return { action, skipped: true, finalText: null, responses: [], reason: value.reason, legacy: true }
+  }
+  if (['send', 'reply', 'react'].includes(action) && value.text.trim() && emptyResponses) {
+    return { action, skipped: false, finalText: value.text, responses: [], reason: value.reason, legacy: true }
+  }
+  const responses = ['send', 'reply'].includes(action) && value.text === ''
+    ? normalizeTargets(value.responses, true)
+    : null
+  return responses
+    ? { action, skipped: false, finalText: '', responses, reason: value.reason, legacy: true }
+    : null
+}
+
 export function parseTelegramStructuredOutput(text) {
-  const malformed = () => ({
-    action: 'skip',
-    skipped: true,
-    finalText: null,
-    responses: [],
-    reason: 'malformed_structured_output',
-  })
-
-  const normalizeResponses = value => {
-    if (!Array.isArray(value) || value.length === 0 || value.length > 32) return null
-    const seen = new Set()
-    const responses = []
-    for (const response of value) {
-      const rawMessageId = response?.messageId ?? response?.message_id
-      const messageId = typeof rawMessageId === 'number'
-        ? String(rawMessageId)
-        : rawMessageId
-      const action = response?.action === 'send' || response?.action === undefined
-        ? 'reply'
-        : response?.action
-      const rawConversationKey = response?.conversationKey ?? response?.conversation_key
-      const conversationKey = rawConversationKey === undefined
-        ? null
-        : String(rawConversationKey)
-      const responseKey = `${conversationKey ?? ''}\0${messageId}`
-      if (
-        typeof messageId !== 'string'
-        || !/^\d+$/u.test(messageId)
-        || (conversationKey !== null && !conversationKey)
-        || seen.has(responseKey)
-        || !['reply', 'react', 'dice'].includes(action)
-        || typeof response?.text !== 'string'
-        || !response.text.trim()
-      ) return null
-      seen.add(responseKey)
-      responses.push({
-        ...(conversationKey === null ? {} : { conversationKey }),
-        messageId,
-        action,
-        text: response.text,
-        ...(typeof response.isBig === 'boolean' ? { isBig: response.isBig } : {}),
-      })
-    }
-    return responses
-  }
-
-  const parseEnvelope = value => {
-    const parsed = JSON.parse(value)
-    if (parsed?.action === 'skip') {
-      return { action: 'skip', skipped: true, finalText: null, responses: [], reason: String(parsed.reason ?? '') }
-    }
-    if (['send', 'react'].includes(parsed?.action) && typeof parsed.text === 'string') {
-      const hasRootText = Boolean(parsed.text.trim())
-      const responses = hasRootText
-        ? []
-        : normalizeResponses(parsed.responses)
-      if (!hasRootText && (parsed.action === 'react' || responses === null)) return null
-      return {
-        action: parsed.action,
-        skipped: false,
-        finalText: parsed.text,
-        responses,
-        reason: String(parsed.reason ?? ''),
-      }
-    }
-    return null
-  }
-
+  let value
   try {
-    const envelope = parseEnvelope(text)
-    if (envelope) return envelope
-  } catch {}
-
-  const trimmed = text.trimStart()
-  if (trimmed.startsWith('{')) {
-    let depth = 0
-    let inString = false
-    let escaped = false
-    for (let index = 0; index < trimmed.length; index += 1) {
-      const character = trimmed[index]
-      if (inString) {
-        if (escaped) escaped = false
-        else if (character === '\\') escaped = true
-        else if (character === '"') inString = false
-        continue
-      }
-      if (character === '"') inString = true
-      else if (character === '{') depth += 1
-      else if (character === '}') {
-        depth -= 1
-        if (depth !== 0) continue
-        try {
-          const envelope = parseEnvelope(trimmed.slice(0, index + 1))
-          if (envelope) return envelope
-        } catch {}
-        break
-      }
-    }
-    return malformed()
+    value = JSON.parse(text)
+  } catch {
+    return malformedTelegramOutput()
   }
-  if (/^\s*SKIP\s*$/u.test(text)) {
-    return { action: 'skip', skipped: true, finalText: null, responses: [], reason: 'bare_skip_marker' }
-  }
-  const skip = text.match(/^\s*\[SKIP\](?:\s+理由[:：]?)?\s*(.*)$/isu)
-  if (skip) return { action: 'skip', skipped: true, finalText: null, responses: [], reason: skip[1].trim() }
-  return { action: 'send', skipped: false, finalText: text, responses: [], reason: 'unstructured_compatibility_output' }
+  return mapTelegramDecision(value) ?? mapLegacyTelegramEnvelope(value) ?? malformedTelegramOutput()
 }
 
 class TurnCollector {
@@ -431,15 +435,14 @@ export class CodexRunner {
     telegramContext = {},
     clientUserMessageId = null,
   }) {
-    const trust = ownerDm
-      ? TELEGRAM_TRUST.OWNER_DM
-      : classifyTelegramContext(
-          telegramContext,
-          this.#config.ownerUserId,
-          this.#config.privateChatIds,
-          this.#config.repairChatIds,
-        )
-    const instructionSource = isInstructionTrust(trust)
+    const authority = classifyTelegramAuthority(
+      telegramContext,
+      this.#config.ownerUserId,
+      this.#config.privateChatIds,
+      this.#config.repairChatIds,
+    )
+    const trust = ownerDm ? TELEGRAM_TRUST.OWNER_DM : authority.audienceTrust
+    const instructionSource = ownerDm || authority.executable
     this.#startingConversations.add(conversationKey)
     let thread
     try {
@@ -483,6 +486,20 @@ export class CodexRunner {
           telegram: { kind: 'untrusted', value: JSON.stringify(telegramContext) },
           telegram_source: { kind: 'application', value: externalFeedTag(trust) },
           telegram_trust_policy: { kind: 'application', value: TELEGRAM_TRUST_POLICIES[trust] },
+          telegram_capabilities: {
+            kind: 'application',
+            value: JSON.stringify({
+              messages: [{
+                conversationKey: String(conversationKey),
+                ...(telegramContext.messageId === null || telegramContext.messageId === undefined
+                  ? {}
+                  : { messageId: String(telegramContext.messageId) }),
+                audience: trust,
+                mayReply: true,
+                mayExecute: instructionSource,
+              }],
+            }),
+          },
           telegram_output_contract: { kind: 'application', value: TELEGRAM_OUTPUT_INSTRUCTIONS },
         },
         outputSchema: TELEGRAM_OUTPUT_SCHEMA,
@@ -514,7 +531,15 @@ export class CodexRunner {
         const message = completion.turn.error?.message ?? 'turn did not complete successfully'
         throw new CodexTurnFailedError(thread.threadId, turnId, message, completion.turn.status)
       }
-      const output = guardTelegramOutput(parseTelegramStructuredOutput(extractFinal(items)), trust)
+      const parsedOutput = parseTelegramStructuredOutput(extractFinal(items))
+      if (parsedOutput.invalid) {
+        throw new CodexTurnFailedError(
+          thread.threadId,
+          turnId,
+          'malformed Telegram decision output',
+        )
+      }
+      const output = parsedOutput
       const actionIds = [...findActionIds(items.filter(item => item?.type === 'mcpToolCall' && item.server === 'telegram'))]
       return {
         threadId: thread.threadId,

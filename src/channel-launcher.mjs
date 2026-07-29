@@ -200,8 +200,28 @@ export async function main(
         BRIDGE_RELAY_CLOSE_GRACE_MS: String(local.relayCloseGraceMs ?? 2_000),
         CODEX_APPROVAL_POLICY: local.approvalPolicy ?? 'on-request',
         CODEX_SANDBOX_MODE: local.sandboxMode ?? 'workspace-write',
+        ...(local.taskAdmission
+          ? {
+              TASKQ_CLI_PATH: local.taskAdmission.cliPath,
+              TASKQ_DB_PATH: local.taskAdmission.dbPath,
+              TASKQ_AGENT_ID: local.taskAdmission.agentId,
+            }
+          : {}),
+        ...(local.interruptFanout
+          ? {
+              BRIDGE_INTERRUPT_FANOUT_COMMAND: local.interruptFanout.command,
+              BRIDGE_STOP_FLAG_PATH: local.interruptFanout.stopFlagPath,
+            }
+          : {}),
       },
       statusWriter: writeStatus,
+      deliveryAlert: receipt => {
+        const detail = receipt.actions
+          ?.map(action => action.error)
+          .filter(Boolean)
+          .join('; ')
+        process.stderr.write(`\n[Telegram delivery ${receipt.status}] ${detail || receipt.batchId}\n`)
+      },
       reconnectInitialMs: local.reconnectInitialMs ?? 1_000,
       reconnectMaxMs: local.reconnectMaxMs ?? 20_000,
       heartbeatTimeoutMs: local.heartbeatTimeoutMs ?? 20_000,

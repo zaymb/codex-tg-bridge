@@ -75,6 +75,7 @@ test('loads configured topic names for approved groups', async () => {
 
   const config = loadTransportConfig({ ...env, BRIDGE_SESSION_LABEL: 'tg-engage' })
 
+  assert.equal(config.typingIntervalMs, 4_000)
   assert.deepEqual([...config.topicNames], [
     ['-1001234567890123456:77', 'support'],
     ['-1001234567890123456:88', 'lobby'],
@@ -234,6 +235,55 @@ test('loads explicit no-prompt permissions for the local Telegram connector', ()
   env.CODEX_SANDBOX_MODE = 'danger-full-access'
   env.BRIDGE_RELAY_CLOSE_GRACE_MS = '30001'
   assert.throws(() => loadLocalConnectorConfig(env), /BRIDGE_RELAY_CLOSE_GRACE_MS/)
+  env.BRIDGE_RELAY_CLOSE_GRACE_MS = '2000'
+})
+
+test('loads shared task admission only when the complete configuration is present', () => {
+  const env = {
+    TELEGRAM_OWNER_USER_ID: '42',
+    BRIDGE_SESSION_LABEL: 'tg-engage',
+    CODEX_SESSION_ID: 'session-a',
+    APP_SERVER_SOCKET: '/tmp/app.sock',
+    CODEX_CONTRACT_PATH: '/opt/codex-tg-bridge/contract.json',
+    BRIDGE_RELAY_HOST: 'relay.example',
+    BRIDGE_RELAY_SSH_USER: 'ubuntu',
+    BRIDGE_RELAY_IDENTITY_FILE: '/home/alta/.ssh/id_ed25519',
+    TASKQ_CLI_PATH: '/home/alta/taskq/taskq.py',
+    TASKQ_DB_PATH: '/home/alta/.local/share/taskq/tasks.sqlite3',
+    TASKQ_AGENT_ID: 'elio',
+  }
+
+  assert.deepEqual(loadLocalConnectorConfig(env).taskAdmission, {
+    cliPath: '/home/alta/taskq/taskq.py',
+    dbPath: '/home/alta/.local/share/taskq/tasks.sqlite3',
+    agentId: 'elio',
+  })
+
+  delete env.TASKQ_AGENT_ID
+  assert.throws(() => loadLocalConnectorConfig(env), /TASKQ_.*must be configured together/)
+})
+
+test('loads interrupt fanout only when command and shared latch are both configured', () => {
+  const env = {
+    TELEGRAM_OWNER_USER_ID: '42',
+    BRIDGE_SESSION_LABEL: 'tg-engage',
+    CODEX_SESSION_ID: 'session-a',
+    APP_SERVER_SOCKET: '/tmp/app.sock',
+    CODEX_CONTRACT_PATH: '/opt/codex-tg-bridge/contract.json',
+    BRIDGE_RELAY_HOST: 'relay.example',
+    BRIDGE_RELAY_SSH_USER: 'ubuntu',
+    BRIDGE_RELAY_IDENTITY_FILE: '/home/alta/.ssh/id_ed25519',
+    BRIDGE_INTERRUPT_FANOUT_COMMAND: '/home/alta/.local/bin/interrupt-peer',
+    BRIDGE_STOP_FLAG_PATH: '/home/alta/.local/share/taskq/stop.flag',
+  }
+
+  assert.deepEqual(loadLocalConnectorConfig(env).interruptFanout, {
+    command: '/home/alta/.local/bin/interrupt-peer',
+    stopFlagPath: '/home/alta/.local/share/taskq/stop.flag',
+  })
+
+  delete env.BRIDGE_STOP_FLAG_PATH
+  assert.throws(() => loadLocalConnectorConfig(env), /FANOUT_COMMAND.*STOP_FLAG_PATH.*together/u)
 })
 
 test('loads and validates relay coalescing bounds', () => {

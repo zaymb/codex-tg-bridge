@@ -2,14 +2,49 @@
 
 import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { AppServerClient } from './app-server-client.mjs'
 import { AttachmentStore } from './attachment-store.mjs'
 import { loadLocalConnectorConfig } from './config.mjs'
+import { CommandInterruptFanout } from './interrupt-fanout.mjs'
 import { LocalSessionConnector } from './local-session-connector.mjs'
+import { TaskqMessageAdmission } from './message-admission.mjs'
+import { TaskqContextResolver } from './task-context-resolver.mjs'
 import { isMainModule } from './main-module.mjs'
 import { ProcessRelayClient } from './process-relay-client.mjs'
 import { RELAY_JOB_TTL_MS } from './relay-dispatcher.mjs'
+
+const bridgeRoot = dirname(dirname(fileURLToPath(import.meta.url)))
+
+export async function loadConnectorEnv(env = process.env) {
+  const taskqValues = [env.TASKQ_CLI_PATH, env.TASKQ_DB_PATH, env.TASKQ_AGENT_ID]
+  const fanoutValues = [env.BRIDGE_INTERRUPT_FANOUT_COMMAND, env.BRIDGE_STOP_FLAG_PATH]
+  if (taskqValues.some(Boolean) && fanoutValues.some(Boolean)) return env
+
+  const configPath = env.BRIDGE_LOCAL_CONFIG
+    ? resolve(env.BRIDGE_LOCAL_CONFIG)
+    : join(bridgeRoot, '.state', 'local-channel.json')
+  let local
+  try {
+    local = JSON.parse(await readFile(configPath, 'utf8'))
+  } catch (error) {
+    if (error?.code === 'ENOENT') return env
+    throw error
+  }
+  const loaded = { ...env }
+  if (!taskqValues.some(Boolean) && local.taskAdmission) {
+    loaded.TASKQ_CLI_PATH = local.taskAdmission.cliPath
+    loaded.TASKQ_DB_PATH = local.taskAdmission.dbPath
+    loaded.TASKQ_AGENT_ID = local.taskAdmission.agentId
+  }
+  if (!fanoutValues.some(Boolean) && local.interruptFanout) {
+    loaded.BRIDGE_INTERRUPT_FANOUT_COMMAND = local.interruptFanout.command
+    loaded.BRIDGE_STOP_FLAG_PATH = local.interruptFanout.stopFlagPath
+  }
+  return loaded
+}
 
 export function buildRelaySshArgs(config) {
   return [
@@ -58,19 +93,32 @@ export function buildRelayProcessSpec(config, env = process.env) {
 }
 
 export async function main(env = process.env) {
-  const config = loadLocalConnectorConfig(env)
+  const connectorEnv = await loadConnectorEnv(env)
+  const config = loadLocalConnectorConfig(connectorEnv)
   const contract = JSON.parse(await readFile(config.contractPath, 'utf8'))
   const appServerClient = await AppServerClient.connect({
     socketPath: config.appServerSocket,
     contract,
   })
-  const relayProcess = buildRelayProcessSpec(config, env)
+  const relayProcess = buildRelayProcessSpec(config, connectorEnv)
   const relayClient = new ProcessRelayClient({
     ...relayProcess,
     frameMaxBytes: config.frameMaxBytes,
     closeGraceMs: config.relayCloseGraceMs,
   })
   const attachmentStore = await AttachmentStore.open({ root: config.localAttachmentRoot })
+  const executionAdmission = config.taskAdmission
+    ? new TaskqMessageAdmission(config.taskAdmission)
+    : null
+  const taskContextResolver = config.taskAdmission
+    ? new TaskqContextResolver(config.taskAdmission)
+    : null
+  const interruptFanout = config.interruptFanout
+    ? new CommandInterruptFanout({
+        ...config.interruptFanout,
+        timeoutMs: config.relayCloseGraceMs,
+      })
+    : null
   await attachmentStore.pruneOlderThan(Date.now() - RELAY_JOB_TTL_MS)
   const connector = new LocalSessionConnector({
     appServerClient,
@@ -80,12 +128,16 @@ export async function main(env = process.env) {
     codexSessionId: config.codexSessionId,
     threadId: config.threadId,
     heartbeatIntervalMs: config.heartbeatIntervalMs,
+    closeGraceMs: config.relayCloseGraceMs,
     approvalPolicy: config.approvalPolicy,
     sandboxPolicy: config.sandboxPolicy,
     ownerUserId: config.ownerUserId,
     privateChatIds: config.privateChatIds,
     repairChatIds: config.repairChatIds,
     attachmentStore,
+    executionAdmission,
+    interruptFanout,
+    taskContextResolver,
   })
   const controller = new AbortController()
   const shutdown = () => controller.abort()
@@ -116,6 +168,20 @@ export async function main(env = process.env) {
         level: 'info',
         event: 'local_connector_heartbeat',
         remoteNowMs: status.remoteNowMs ?? null,
+      }))
+    })
+    connector.on('deliveryReceipt', receipt => {
+      console.log(JSON.stringify({
+        level: receipt.status === 'sent' ? 'info' : 'error',
+        event: 'local_connector_delivery',
+        receipt,
+      }))
+    })
+    connector.on('legacyOutput', output => {
+      console.log(JSON.stringify({
+        level: 'warn',
+        event: 'local_connector_legacy_output',
+        ...output,
       }))
     })
     await Promise.race([connector.start(), failure])

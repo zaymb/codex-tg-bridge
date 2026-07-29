@@ -42,6 +42,24 @@ test('long polls with a durable offset and an explicit allowed_updates surface',
   assert.deepEqual(body, { offset: '10', timeout: 50, allowed_updates: ALLOWED_UPDATES })
 })
 
+test('aborts a stuck long poll at its client-side deadline', async () => {
+  const { client } = clientWith((url, options) => new Promise((resolve, reject) => {
+    options.signal.addEventListener('abort', () => {
+      reject(options.signal.reason)
+    }, { once: true })
+  }))
+
+  await assert.rejects(
+    client.getUpdates({ timeoutSec: 50, requestTimeoutMs: 20 }),
+    error => {
+      assert.equal(error.name, 'TelegramTransportError')
+      assert.equal(error.method, 'getUpdates')
+      assert.match(error.cause.message, /client deadline/)
+      return true
+    },
+  )
+})
+
 test('reads the bot identity for mention and self-message routing', async () => {
   const { client, calls } = clientWith(() => jsonResponse({
     ok: true,
@@ -187,6 +205,13 @@ test('validates and sends one non-paid reaction', async () => {
     reaction: [{ type: 'emoji', emoji: '👍' }],
     is_big: false,
   })
+  await client.react({ chatId: '-100123', messageId: '56', reaction: { type: 'emoji', emoji: '❤️' } })
+  assert.deepEqual(JSON.parse(calls[1].options.body), {
+    chat_id: '-100123',
+    message_id: '56',
+    reaction: [{ type: 'emoji', emoji: '❤️' }],
+    is_big: false,
+  })
 
   await assert.rejects(
     client.react({ chatId: '-100123', messageId: '55', reaction: { type: 'paid' } }),
@@ -196,6 +221,11 @@ test('validates and sends one non-paid reaction', async () => {
     client.react({ chatId: '-100123', messageId: '55', reaction: [{ type: 'emoji', emoji: '👍' }] }),
     /exactly one reaction object/,
   )
+  await assert.rejects(
+    client.react({ chatId: '-100123', messageId: '55', reaction: { type: 'emoji', emoji: '✅' } }),
+    /not supported by Telegram ReactionTypeEmoji/,
+  )
+  assert.equal(calls.length, 2, 'unsupported emoji must fail before any Telegram request')
 })
 
 test('gets Telegram file metadata and downloads bytes without leaking the token in errors', async () => {

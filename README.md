@@ -21,32 +21,46 @@ both split-host and same-host deployments.
   controlling terminal. Only the Codex TUI inherits terminal stdio.
 - A Telegram job is claimed only while the target Codex thread is idle. Local
   TUI turns take priority.
-- One queued batch can produce one reply or reaction, or multiple targeted
-  replies, reactions, and animated dice to selected messages from that batch.
-  `reply`, `react`, and `skip` are peer model outcomes; reactions and dice do
-  not require an MCP tool call.
+- An optional shared task admission gate can grant one agent execution
+  ownership for an otherwise authorized Telegram message. Other agents still
+  receive the message, but their copy is downgraded to read-only permissions.
+- One queued batch can produce a standalone send, an intentional reply or
+  reaction, or multiple targeted actions. A targeted standalone send may name
+  any conversation in the durable approved-chat registry, even when that
+  conversation is absent from the current batch. Targeted replies, reactions,
+  and animated dice remain limited to exact messages in the current batch.
+  The model selects `send`, `reply`, `react`, `skip`, or `targeted`; the
+  connector mechanically generates the transport envelope.
 - Pending conversations share one bounded quiet interval and are delivered in
   one source-grouped batch. Each conversation contributes only its first
   contiguous authenticated-sender partition. Owner-DM slash commands bypass
   the wait and remain isolated from ordinary messages.
-- Commentary can produce best-effort progress messages. A final result
-  atomically cancels any undelivered progress so stale status text cannot arrive
-  after the answer.
+- Commentary can produce best-effort progress messages. `send` remains
+  standalone; only an explicit `reply` decision binds progress to a message.
+  A final result atomically cancels any undelivered progress so stale status
+  text cannot arrive after the answer.
 - Telegram attachments cross split-host relays in bounded, hashed frames.
   Supported image content is verified by magic bytes before becoming a native
   Codex image input; other files remain explicit local-path references.
-- A pure Telegram batch uses a structured envelope whose `responses` field is
-  always present; ordinary replies and skips use an empty array. The shared
-  session does not force this with `response_format`, because a local TUI steer
-  can join the active turn and must still receive a normal terminal answer.
+- A pure Telegram batch uses a fixed `decision`, `text`, and `targets` schema.
+  Models never hand-write transport `action`, `responses`, or `reason` fields.
+  Missing or malformed final decisions fail the accepted job visibly instead
+  of being recorded as an intentional skip.
+- Rolling deployment temporarily accepts the previous well-formed JSON action
+  envelope and logs each use as `local_connector_legacy_output`. Remove that
+  compatibility parser after seven consecutive production days with zero such
+  events; malformed JSON, field aliases, prose markers, and trailing text are
+  not compatibility inputs.
 - Every injected Telegram message is prefixed with `[TG]` and its automatic
   `conversation_key`; an unmarked user turn came from the terminal or another
   local Codex client.
-- Telegram reply targets are isolated by `conversation_key`: a DM or group uses
+- Telegram destinations are isolated by `conversation_key`: a DM or group uses
   its `chatId`, while a forum topic uses `chatId:threadId`. A batch may span
-  several conversations, but selective responses require both
-  `conversationKey` and `messageId`; an unqualified ambiguous target fails
-  closed. A root reply goes only to the globally latest message.
+  several conversations. Selective replies require both `conversationKey` and
+  `messageId`; an unqualified ambiguous target fails closed. A root `reply`
+  goes only to the globally latest message. A root `send` uses the latest
+  conversation without a reply target. A targeted `send` requires
+  `messageId=null` and a registered approved conversation.
 - Replies are bound to the channel that started the turn. If a local TUI steer
   joins a Telegram-owned turn, the connector fails closed and does not send the
   mixed final answer to Telegram.
@@ -111,6 +125,23 @@ SSH/process relay to exit, escalating from TERM to KILL after the configured
 grace period. Its supervisor records `disengaged` and does not reconnect. The
 shared Codex TUI and app-server stay open locally.
 
+An authenticated admin can send exact `/stop` (including a matching bot
+mention), exact `stop` (case-insensitive), or exact `停` from any chat. The
+transport records the request before replying and sends it over the control
+channel even while an ordinary relay job is active. The local connector then
+calls `turn/interrupt` for the attached thread. With an interrupt fanout
+configured, the same control also latches the shared stopped state and signals
+the verified peer runtime. Exact `/continue`, `continue`, or `继续` clears that
+latch over the same out-of-band path. Longer text such as `停一下` or
+`continue working` remains ordinary conversation input.
+
+`/stop elio` interrupts only the local Codex turn and replies `Elio stopped.`.
+`/stop laurie` invokes only the verified peer fanout and emits no receipt from
+this bridge; Laurie's plugin replies `Laurie stopped.` itself. Bare `/stop`
+keeps the all-agent interrupt behavior, but this bridge acknowledges only
+Elio; Laurie's plugin emits its own receipt. Target names are exact; unknown
+names are not executed.
+
 Re-engage is deliberately two explicit operations, remote first and local
 second:
 
@@ -145,6 +176,46 @@ Then send a protocol `hello` frame with `acceptingJobs=false` and confirm a
 Local machine settings live in the ignored file
 `.state/local-channel.json`. It contains infrastructure paths and SSH
 coordinates, never the Telegram token.
+
+To coordinate execution with another agent, both connectors must use the same
+taskq database and distinct agent IDs:
+
+```json
+{
+  "taskAdmission": {
+    "cliPath": "/absolute/path/to/taskq.py",
+    "dbPath": "/absolute/path/to/tasks.sqlite3",
+    "agentId": "elio"
+  }
+}
+```
+
+The launcher exports all three admission settings together. Partial
+configuration fails closed at startup. The admission key is the immutable
+`conversationKey + messageId`; command failure or malformed output removes
+execution authority from that message instead of falling back to prompt-level
+coordination.
+
+An optional local interrupt fanout gives one authenticated stop control the
+same effect across cooperating runtimes without exposing another user
+interface:
+
+```json
+{
+  "interruptFanout": {
+    "command": "/absolute/path/to/verified-interrupt-helper",
+    "stopFlagPath": "/absolute/path/to/shared-stop.flag"
+  }
+}
+```
+
+Both values are required together. The connector runs the command directly
+without a shell, passes `stop|continue`, request ID, conversation key, and the
+validated target as arguments, and uses the existing relay shutdown grace
+budget as its timeout.
+While the shared flag exists, heartbeats advertise that ordinary jobs are not
+accepted; control frames continue to pass so `continue` cannot deadlock behind
+the latch.
 
 Start or resume a Codex session through the channel launcher:
 
@@ -204,12 +275,17 @@ For owner DM, no group configuration is needed. Before group acceptance:
 - A local-turn race returns the unaccepted job to the queue.
 - Telegram rate limits defer the outbound row. Ambiguous sends are never
   automatically repeated.
+- Telegram API failures and relay-side result rejection both return a typed
+  failed-delivery receipt to the local connector. The launcher records it in
+  channel status and prints one terminal alert; successful delivery stays
+  quiet apart from durable status.
 - Final relay result and outbound actions commit in one SQLite transaction.
 - Successful bot reactions are captured in a durable, idempotent event outbox
   for side-channel consumers and never extend engagement cooldown.
 - Approval callbacks are authorized only in the configured owner's DM and fail
   closed when expired, cancelled, or detached from the active Codex session.
-- The current structured model path is `SEND/REACT/SKIP`; Telegram action tools,
+- The current structured model path is
+  `send/reply/react/skip/targeted(send|reply|react|dice)`; Telegram action tools,
   attachments, `/stop`, and durable remote approvals use the same outbox and
   routing boundaries.
 
@@ -236,11 +312,15 @@ For owner DM, no group configuration is needed. Before group acceptance:
   `telegram_authorization.authorizedMessages` manifest. Only listed
   `conversationKey + messageId` pairs may authorize work. Other messages remain
   conversation data, and authority never transfers between messages or sources.
+- The connector also emits typed `mayReply` and `mayExecute` capabilities per
+  message. They are independent: an untrusted message may allow a normal social
+  reply while still denying every tool call and state change.
 - Ordinary group slash commands are stored as context and never execute bridge
-  control actions. `/new`, `/stop`, and approval callback resolution require
-  the terminal or owner DM. The transport-only `/away` and `/disengage`
-  commands are the narrow exception: they bypass the model and require the
-  authenticated admin sender, independent of conversation trust. Ordinary tool
+  control actions. `/new` and approval callback resolution require the terminal
+  or owner DM. The transport-only `/away`, `/disengage`, exact stop controls,
+  and exact continue controls are the narrow exception: they bypass the model
+  and require the authenticated admin sender, independent of conversation
+  trust. Ordinary tool
   work requested by an authorized repair message still follows the manifest
   rule above.
 - Batches with no authorized message run with `readOnly`, network disabled,

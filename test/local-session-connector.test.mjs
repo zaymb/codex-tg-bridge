@@ -21,6 +21,7 @@ class FakeAppServer extends EventEmitter {
       if (this.failTurnStart) throw this.failTurnStart
       return { turn: { id: 'turn-tg' } }
     }
+    if (method === 'turn/interrupt') return {}
     throw new Error(`unexpected app-server request: ${method}`)
   }
 
@@ -32,6 +33,7 @@ class FakeAppServer extends EventEmitter {
 class FakeRelay extends EventEmitter {
   frames = []
   hello = null
+  closed = false
 
   async connect(hello) {
     this.hello = hello
@@ -41,15 +43,21 @@ class FakeRelay extends EventEmitter {
     this.frames.push(frame)
   }
 
-  async close() {}
+  async close() {
+    this.closed = true
+  }
 }
 
 function fixture({
   heartbeatIntervalMs = 60_000,
+  closeGraceMs = 2_000,
   privateChatIds = new Set(),
   repairChatIds = new Set(),
   attachmentStore = null,
   runtimeFingerprint = 'runtime-a',
+  executionAdmission = null,
+  interruptFanout = null,
+  taskContextResolver = null,
 } = {}) {
   const app = new FakeAppServer()
   const relay = new FakeRelay()
@@ -61,6 +69,7 @@ function fixture({
     codexSessionId: 'session-a',
     threadId: 'thread-a',
     heartbeatIntervalMs,
+    closeGraceMs,
     approvalPolicy: 'never',
     sandboxPolicy: { type: 'dangerFullAccess' },
     ownerUserId: '42',
@@ -68,6 +77,9 @@ function fixture({
     repairChatIds,
     attachmentStore,
     runtimeFingerprint,
+    executionAdmission,
+    interruptFanout,
+    taskContextResolver,
   })
   return { app, relay, connector }
 }
@@ -316,6 +328,8 @@ async function waitFor(predicate, timeoutMs = 500) {
 
 test('injects one ordered Codex turn for a Telegram batch and returns one batch result', async t => {
   const setup = fixture()
+  const legacyOutputs = []
+  setup.connector.on('legacyOutput', output => legacyOutputs.push(output))
   t.after(() => setup.connector.close())
   await setup.connector.start()
   assert.deepEqual(setup.relay.hello.capabilities, [])
@@ -337,7 +351,7 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
   assert.equal('cwd' in started.params, false)
   assert.equal(started.params.approvalPolicy, 'never')
   assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
-  assert.equal('outputSchema' in started.params, false)
+  assert.equal(started.params.outputSchema.properties.decision.enum.join(','), 'send,reply,react,skip,targeted')
   assert.deepEqual(JSON.parse(started.params.additionalContext.telegram.value), {
     source: 'telegram',
     transportStatus: 'connected',
@@ -359,7 +373,7 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
   })
   assert.match(started.params.additionalContext.telegram_output_contract.value, /latest user input is marked \[TG\]/)
   assert.match(started.params.additionalContext.telegram_output_contract.value, /answer it normally in plain text/)
-  assert.match(started.params.additionalContext.telegram_output_contract.value, /Plain-text commentary is delivered immediately to Telegram/)
+  assert.match(started.params.additionalContext.telegram_output_contract.value, /forwards at most the first commentary update to Telegram/)
   assert.deepEqual(setup.relay.frames.at(-1), {
     version: 1,
     type: 'job_accepted',
@@ -382,7 +396,6 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
       }),
     },
   })
-
   setup.app.emit('notification:item/completed', {
     threadId: 'thread-a',
     turnId: 'turn-tg',
@@ -412,7 +425,7 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
     batchId: 'batch:telegram:1:telegram:2',
     turnId: 'turn-tg',
     result: {
-      action: 'reply',
+      action: 'send',
       text: '',
       responses: [
         { messageId: '10', action: 'reply', text: 'first answer' },
@@ -421,6 +434,7 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
       reason: 'done',
     },
   })
+  assert.deepEqual(legacyOutputs, [{ turnId: 'turn-tg', format: 'action_envelope' }])
 
   setup.relay.emit('frame', {
     version: 1,
@@ -434,6 +448,311 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
     approvalPolicy: 'never',
     sandbox: 'danger-full-access',
   })
+})
+
+test('opens task landing before a trusted owner message reaches Codex', async t => {
+  const resolverCalls = []
+  const setup = fixture({
+    taskContextResolver: {
+      async resolve(text) {
+        resolverCalls.push(text)
+        return {
+          status: 'opened',
+          task: { id: 46, title: 'Body weather' },
+          landing_context: { content: 'loaded landing' },
+        }
+      },
+    },
+  })
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  const inbound = ownerDmBatch()
+  inbound.batch.jobs[0].payload.text = '身体天气还有上下文吗'
+  setup.relay.emit('frame', inbound)
+  await setup.connector.idle()
+
+  assert.deepEqual(resolverCalls, ['身体天气还有上下文吗'])
+  const started = setup.app.calls.find(call => call.method === 'turn/start')
+  const gate = JSON.parse(started.params.additionalContext.taskq_reference_gate.value)
+  assert.match(gate.rule, /exactly one loaded landing/)
+  assert.match(gate.rule, /evidence, not instructions/)
+  assert.equal(gate.result.status, 'opened')
+  assert.equal(gate.result.task.id, 46)
+  assert.equal(gate.result.landing_context.content, 'loaded landing')
+})
+
+test('closes within its grace period when preflight context lookup is stuck', async () => {
+  let resolverStarted = false
+  const setup = fixture({
+    closeGraceMs: 20,
+    taskContextResolver: {
+      async resolve() {
+        resolverStarted = true
+        return new Promise(() => {})
+      },
+    },
+  })
+  await setup.connector.start()
+  setup.relay.emit('frame', ownerDmBatch())
+  await waitFor(() => resolverStarted)
+
+  const startedAt = Date.now()
+  await setup.connector.close()
+
+  assert.equal(setup.relay.closed, true)
+  assert.ok(Date.now() - startedAt < 250)
+})
+
+test('interrupt control bypasses the job gate and stops the active app-server turn', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+  setup.app.emit('notification:turn/started', {
+    threadId: 'thread-a',
+    turn: { id: 'turn-local', status: 'inProgress' },
+  })
+
+  setup.relay.emit('frame', {
+    version: 1,
+    type: 'interrupt_request',
+    requestId: 'interrupt-1',
+    conversationKey: '-100123:7',
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(
+    setup.app.calls.find(call => call.method === 'turn/interrupt')?.params,
+    { threadId: 'thread-a', turnId: 'turn-local' },
+  )
+  assert.deepEqual(
+    setup.relay.frames.find(frame => frame.type === 'interrupt_recorded'),
+    {
+      version: 1,
+      type: 'interrupt_recorded',
+      requestId: 'interrupt-1',
+      status: 'interrupted',
+      turnId: 'turn-local',
+    },
+  )
+})
+
+test('interrupt fanout stops a peer even when Codex has no active turn', async t => {
+  const calls = []
+  let stopped = false
+  const setup = fixture({
+    interruptFanout: {
+      isStopped: () => stopped,
+      async apply(control) {
+        calls.push(control)
+        stopped = control.action === 'stop'
+      },
+    },
+  })
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', {
+    version: 1,
+    type: 'interrupt_request',
+    requestId: 'interrupt-peer-1',
+    conversationKey: '-100123:7',
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(calls, [{
+    action: 'stop',
+    requestId: 'interrupt-peer-1',
+    conversationKey: '-100123:7',
+  }])
+  assert.deepEqual(setup.relay.frames.find(frame => (
+    frame.type === 'interrupt_recorded' && frame.requestId === 'interrupt-peer-1'
+  )), {
+    version: 1,
+    type: 'interrupt_recorded',
+    requestId: 'interrupt-peer-1',
+    status: 'no_active_turn',
+  })
+})
+
+test('Elio-only stop interrupts the local turn without invoking peer fanout', async t => {
+  const calls = []
+  const setup = fixture({
+    interruptFanout: {
+      isStopped: () => false,
+      async apply(control) { calls.push(control) },
+    },
+  })
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+  setup.app.emit('notification:turn/started', {
+    threadId: 'thread-a',
+    turn: { id: 'turn-local', status: 'inProgress' },
+  })
+
+  setup.relay.emit('frame', {
+    version: 1,
+    type: 'interrupt_request',
+    requestId: 'interrupt-elio-1',
+    conversationKey: '-100123:7',
+    target: 'elio',
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(calls, [])
+  assert.deepEqual(
+    setup.app.calls.find(call => call.method === 'turn/interrupt')?.params,
+    { threadId: 'thread-a', turnId: 'turn-local' },
+  )
+})
+
+test('Laurie-only stop invokes peer fanout without interrupting the local turn', async t => {
+  const calls = []
+  const setup = fixture({
+    interruptFanout: {
+      isStopped: () => false,
+      async apply(control) { calls.push(control) },
+    },
+  })
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+  setup.app.emit('notification:turn/started', {
+    threadId: 'thread-a',
+    turn: { id: 'turn-local', status: 'inProgress' },
+  })
+
+  setup.relay.emit('frame', {
+    version: 1,
+    type: 'interrupt_request',
+    requestId: 'interrupt-laurie-1',
+    conversationKey: '-100123:7',
+    target: 'laurie',
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(calls, [{
+    action: 'stop',
+    requestId: 'interrupt-laurie-1',
+    conversationKey: '-100123:7',
+    target: 'laurie',
+  }])
+  assert.equal(setup.app.calls.some(call => call.method === 'turn/interrupt'), false)
+  assert.deepEqual(setup.relay.frames.find(frame => (
+    frame.type === 'interrupt_recorded' && frame.requestId === 'interrupt-laurie-1'
+  )), {
+    version: 1,
+    type: 'interrupt_recorded',
+    requestId: 'interrupt-laurie-1',
+    status: 'peer_interrupted',
+  })
+})
+
+test('continue clears the shared latch and resumes connector intake', async t => {
+  const calls = []
+  let stopped = true
+  const setup = fixture({
+    interruptFanout: {
+      isStopped: () => stopped,
+      async apply(control) {
+        calls.push(control)
+        stopped = control.action !== 'continue'
+      },
+    },
+  })
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', {
+    version: 1,
+    type: 'interrupt_request',
+    requestId: 'resume-peer-1',
+    conversationKey: '-100123:7',
+    action: 'continue',
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(calls, [{
+    action: 'continue',
+    requestId: 'resume-peer-1',
+    conversationKey: '-100123:7',
+  }])
+  assert.deepEqual(setup.relay.frames.slice(-2), [{
+    version: 1,
+    type: 'interrupt_recorded',
+    requestId: 'resume-peer-1',
+    status: 'resumed',
+  }, {
+    version: 1,
+    type: 'heartbeat',
+    acceptingJobs: true,
+  }])
+})
+
+test('a new owner turn clears a stale shared stop latch before authority is calculated', async t => {
+  const calls = []
+  let stopped = true
+  const setup = fixture({
+    privateChatIds: new Set(['-100123']),
+    repairChatIds: new Set(['-100123']),
+    interruptFanout: {
+      isStopped: () => stopped,
+      async apply(control) {
+        calls.push(control)
+        if (control.action === 'continue') stopped = false
+      },
+    },
+  })
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  assert.equal(setup.relay.hello.acceptingJobs, true)
+
+  setup.relay.emit('frame', repairGroupBatch())
+  await setup.connector.idle()
+
+  const started = setup.app.calls.find(call => call.method === 'turn/start')
+  assert.ok(started)
+  assert.deepEqual(calls, [{
+    action: 'continue',
+    requestId: 'implicit-resume:batch:telegram:repair-group:owner',
+    conversationKey: '-100123',
+  }])
+  assert.deepEqual(
+    JSON.parse(started.params.additionalContext.telegram_authorization.value).authorizedMessages,
+    [{ conversationKey: '-100123', messageId: '14' }],
+  )
+  assert.match(
+    started.params.additionalContext.telegram_stop_state.value,
+    /previous stop.*released.*new trusted owner message/iu,
+  )
+  assert.equal(started.params.approvalPolicy, 'never')
+  assert.deepEqual(started.params.sandboxPolicy, { type: 'dangerFullAccess' })
+})
+
+test('a peer turn cannot clear the shared stop latch', async t => {
+  const calls = []
+  const setup = fixture({
+    privateChatIds: new Set(['-100123']),
+    repairChatIds: new Set(['-100123']),
+    interruptFanout: {
+      isStopped: () => true,
+      async apply(control) { calls.push(control) },
+    },
+  })
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', repairGroupBatch({ peer: true }))
+  await setup.connector.idle()
+
+  const started = setup.app.calls.find(call => call.method === 'turn/start')
+  assert.deepEqual(calls, [])
+  assert.deepEqual(JSON.parse(started.params.additionalContext.telegram_authorization.value), {
+    rule: 'trusted_source_and_admin_sender',
+    authorizedMessages: [],
+  })
+  assert.equal(started.params.approvalPolicy, 'never')
+  assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
 })
 
 test('shows the stable topic name beside its conversation key', async t => {
@@ -476,6 +795,7 @@ test('forwards plain commentary immediately without treating it as the final ans
     batchId: 'batch:telegram:1:telegram:2',
     turnId: 'turn-tg',
     progressId: 'commentary-envelope',
+    action: 'send',
     text: 'work is in progress',
   })
 
@@ -487,11 +807,160 @@ test('forwards plain commentary immediately without treating it as the final ans
 
   assert.deepEqual(setup.relay.frames.at(-1), {
     version: 1,
-    type: 'job_result',
+    type: 'job_failed',
     batchId: 'batch:telegram:1:telegram:2',
     turnId: 'turn-tg',
-    result: { action: 'skip', reason: 'missing_final_answer' },
+    error: 'Telegram turn completed without a final decision',
   })
+})
+
+test('forwards only the first structured commentary decision as progress', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', batch())
+  await setup.connector.idle()
+  for (const [id, text] of [
+    ['commentary-first', 'I will inspect the active connector and its tests first.'],
+    ['commentary-second', 'The connector has a dedicated progress path.'],
+  ]) {
+    setup.app.emit('notification:item/completed', {
+      threadId: 'thread-a',
+      turnId: 'turn-tg',
+      item: {
+        id,
+        type: 'agentMessage',
+        phase: 'commentary',
+        text: JSON.stringify({
+          decision: 'targeted',
+          text: '',
+          targets: [{
+            conversationKey: '42',
+            messageId: '11',
+            decision: 'reply',
+            text,
+            big: false,
+          }],
+        }),
+      },
+    })
+    await setup.connector.idle()
+  }
+
+  assert.deepEqual(
+    setup.relay.frames.filter(frame => frame.type === 'job_progress'),
+    [{
+      version: 1,
+      type: 'job_progress',
+      batchId: 'batch:telegram:1:telegram:2',
+      turnId: 'turn-tg',
+      progressId: 'commentary-first',
+      action: 'reply',
+      text: 'I will inspect the active connector and its tests first.',
+    }],
+  )
+})
+
+test('fails closed when final output omits one of several unforwarded commentary targets', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', batch())
+  await setup.connector.idle()
+  setup.app.emit('notification:item/completed', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: {
+      id: 'commentary-multi-target',
+      type: 'agentMessage',
+      phase: 'commentary',
+      text: JSON.stringify({
+        decision: 'targeted',
+        text: '',
+        targets: [
+          { conversationKey: '42', messageId: '10', decision: 'reply', text: 'first draft', big: false },
+          { conversationKey: '42', messageId: '11', decision: 'reply', text: 'second draft', big: false },
+        ],
+      }),
+    },
+  })
+  setup.app.emit('notification:item/completed', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: {
+      id: 'final-one-target',
+      type: 'agentMessage',
+      phase: 'final_answer',
+      text: JSON.stringify({
+        decision: 'targeted',
+        text: '',
+        targets: [
+          { conversationKey: '42', messageId: '11', decision: 'reply', text: 'second final', big: false },
+        ],
+      }),
+    },
+  })
+  setup.app.emit('notification:turn/completed', {
+    threadId: 'thread-a',
+    turn: { id: 'turn-tg', status: 'completed' },
+  })
+  await setup.connector.idle()
+
+  assert.equal(setup.relay.frames.some(frame => frame.type === 'job_progress'), false)
+  assert.deepEqual(setup.relay.frames.at(-1), {
+    version: 1,
+    type: 'job_failed',
+    batchId: 'batch:telegram:1:telegram:2',
+    turnId: 'turn-tg',
+    error: 'final Telegram decision omitted targeted responses from unforwarded commentary',
+  })
+})
+
+test('accepts final output that preserves every unforwarded commentary target', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', batch())
+  await setup.connector.idle()
+  const targets = [
+    { conversationKey: '42', messageId: '10', decision: 'reply', text: 'first final', big: false },
+    { conversationKey: '42', messageId: '11', decision: 'reply', text: 'second final', big: false },
+  ]
+  setup.app.emit('notification:item/completed', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: {
+      id: 'commentary-multi-target',
+      type: 'agentMessage',
+      phase: 'commentary',
+      text: JSON.stringify({ decision: 'targeted', text: '', targets }),
+    },
+  })
+  setup.app.emit('notification:item/completed', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: {
+      id: 'final-both-targets',
+      type: 'agentMessage',
+      phase: 'final_answer',
+      text: JSON.stringify({ decision: 'targeted', text: '', targets }),
+    },
+  })
+  setup.app.emit('notification:turn/completed', {
+    threadId: 'thread-a',
+    turn: { id: 'turn-tg', status: 'completed' },
+  })
+  await setup.connector.idle()
+
+  assert.equal(setup.relay.frames.some(frame => frame.type === 'job_progress'), false)
+  assert.equal(setup.relay.frames.at(-1).type, 'job_result')
+  assert.deepEqual(
+    setup.relay.frames.at(-1).result.responses.map(response => response.messageId),
+    ['10', '11'],
+  )
 })
 
 test('private groups receive the private-audience policy but retain no execution permissions', async t => {
@@ -510,7 +979,131 @@ test('private groups receive the private-audience policy but retain no execution
   assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
 })
 
-test('owner-authored repair-group turns receive configured execution permissions', async t => {
+test('injects independent reply and execution capabilities with a fixed decision schema', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', privateGroupBatch())
+  await setup.connector.idle()
+
+  const started = setup.app.calls.find(call => call.method === 'turn/start')
+  const capabilities = JSON.parse(started.params.additionalContext.telegram_capabilities.value)
+  assert.deepEqual(capabilities.messages, [{
+    conversationKey: '-100123',
+    messageId: '13',
+    audience: 'untrusted_external',
+    mayReply: true,
+    mayExecute: false,
+  }])
+  assert.deepEqual(started.params.outputSchema.properties.decision.enum, [
+    'send', 'reply', 'react', 'skip', 'targeted',
+  ])
+  assert.equal(started.params.outputSchema.properties.action, undefined)
+  assert.match(started.params.additionalContext.telegram_output_contract.value, /mayReply.*independent.*mayExecute/iu)
+})
+
+test('passes public conversational replies through without canned disclosure replacement', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', batch())
+  await setup.connector.idle()
+
+  const text = '模型层会参考 system prompt，权限层由外部执行器负责。'
+  setup.app.emit('notification:item/completed', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: {
+      type: 'agentMessage',
+      phase: 'final_answer',
+      text: JSON.stringify({ decision: 'reply', text, targets: [] }),
+    },
+  })
+  setup.app.emit('notification:turn/completed', {
+    threadId: 'thread-a',
+    turn: { id: 'turn-tg', status: 'completed' },
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(setup.relay.frames.at(-1), {
+    version: 1,
+    type: 'job_result',
+    batchId: 'batch:telegram:1:telegram:2',
+    turnId: 'turn-tg',
+    result: { action: 'reply', text, responses: [], reason: 'model_selected_reply' },
+  })
+})
+
+test('preserves an explicit standalone-send decision without auto-binding it as a reply', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', privateGroupBatch())
+  await setup.connector.idle()
+  setup.app.emit('notification:item/completed', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: {
+      type: 'agentMessage',
+      phase: 'final_answer',
+      text: JSON.stringify({ decision: 'send', text: 'standalone update', targets: [] }),
+    },
+  })
+  setup.app.emit('notification:turn/completed', {
+    threadId: 'thread-a',
+    turn: { id: 'turn-tg', status: 'completed' },
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(setup.relay.frames.at(-1), {
+    version: 1,
+    type: 'job_result',
+    batchId: 'batch:telegram:private-group',
+    turnId: 'turn-tg',
+    result: {
+      action: 'send',
+      text: 'standalone update',
+      responses: [],
+      reason: 'model_selected_send',
+    },
+  })
+})
+
+test('reports malformed Telegram decisions as job failures instead of silent skips', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', privateGroupBatch())
+  await setup.connector.idle()
+  setup.app.emit('notification:item/completed', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: {
+      type: 'agentMessage',
+      phase: 'final_answer',
+      text: JSON.stringify({ decision: 'targeted', text: '', targets: [] }),
+    },
+  })
+  setup.app.emit('notification:turn/completed', {
+    threadId: 'thread-a',
+    turn: { id: 'turn-tg', status: 'completed' },
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(setup.relay.frames.at(-1), {
+    version: 1,
+    type: 'job_failed',
+    batchId: 'batch:telegram:private-group',
+    turnId: 'turn-tg',
+    error: 'malformed Telegram decision output',
+  })
+})
+
+test('owner-authored family-group turns receive configured execution permissions', async t => {
   const setup = fixture({
     privateChatIds: new Set(['-100123']),
     repairChatIds: new Set(['-100123']),
@@ -524,14 +1117,79 @@ test('owner-authored repair-group turns receive configured execution permissions
   const started = setup.app.calls.find(call => call.method === 'turn/start')
   assert.match(started.params.input[0].text, /\[trust=trusted\]/)
   assert.match(started.params.input[0].text, /\[sender=Owner\]\[admin\]/)
+  assert.equal(
+    JSON.parse(started.params.additionalContext.telegram.value).messages[0].trust,
+    'family_group',
+  )
   assert.deepEqual(JSON.parse(started.params.additionalContext.telegram_authorization.value).authorizedMessages, [
     { conversationKey: '-100123', messageId: '14' },
+  ])
+  assert.deepEqual(started.params.outputSchema.properties.decision.enum, [
+    'send', 'reply', 'react', 'skip', 'targeted',
   ])
   assert.equal(started.params.approvalPolicy, 'never')
   assert.deepEqual(started.params.sandboxPolicy, { type: 'dangerFullAccess' })
 })
 
-test('peer-bot turns in a repair group remain non-authoritative and read-only', async t => {
+test('family-group owner messages may skip when there is genuinely nothing to add', async t => {
+  const setup = fixture({ repairChatIds: new Set(['-100123']) })
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', repairGroupBatch())
+  await setup.connector.idle()
+  setup.app.emit('notification:item/completed', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: {
+      type: 'agentMessage',
+      phase: 'final_answer',
+      text: JSON.stringify({ decision: 'skip', text: '', targets: [] }),
+    },
+  })
+  setup.app.emit('notification:turn/completed', {
+    threadId: 'thread-a',
+    turn: { id: 'turn-tg', status: 'completed' },
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(setup.relay.frames.at(-1), {
+    version: 1,
+    type: 'job_result',
+    batchId: 'batch:telegram:repair-group:owner',
+    turnId: 'turn-tg',
+    result: { action: 'skip', reason: 'model_selected_skip' },
+  })
+})
+
+test('shared admission loser still sees the owner message but receives no execution authority', async t => {
+  const claims = []
+  const setup = fixture({
+    repairChatIds: new Set(['-100123']),
+    executionAdmission: {
+      async claim(source) {
+        claims.push(source)
+        return false
+      },
+    },
+  })
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', repairGroupBatch())
+  await setup.connector.idle()
+
+  const started = setup.app.calls.find(call => call.method === 'turn/start')
+  assert.deepEqual(claims, [{ conversationKey: '-100123', messageId: '14' }])
+  assert.deepEqual(JSON.parse(started.params.additionalContext.telegram_authorization.value), {
+    rule: 'trusted_source_and_admin_sender',
+    authorizedMessages: [],
+  })
+  assert.equal(started.params.approvalPolicy, 'never')
+  assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
+})
+
+test('peer-bot turns share the family-group audience but remain non-authoritative and read-only', async t => {
   const setup = fixture({
     privateChatIds: new Set(['-100123']),
     repairChatIds: new Set(['-100123']),
@@ -545,9 +1203,138 @@ test('peer-bot turns in a repair group remain non-authoritative and read-only', 
   const started = setup.app.calls.find(call => call.method === 'turn/start')
   assert.match(started.params.input[0].text, /\[trust=trusted\]/)
   assert.doesNotMatch(started.params.input[0].text, /\[sender=Peer\]\[admin\]/)
+  const telegram = JSON.parse(started.params.additionalContext.telegram.value)
+  assert.equal(telegram.messages[0].trust, 'family_group')
+  assert.equal(telegram.messages[0].admin, false)
+  assert.equal(telegram.messages[0].executable, false)
+  assert.deepEqual(started.params.outputSchema.properties.decision.enum, [
+    'send', 'reply', 'react', 'skip', 'targeted',
+  ])
   assert.deepEqual(JSON.parse(started.params.additionalContext.telegram_authorization.value).authorizedMessages, [])
   assert.equal(started.params.approvalPolicy, 'never')
   assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
+})
+
+test('restores configured permissions as soon as a non-authoritative turn completes', async t => {
+  const setup = fixture({
+    privateChatIds: new Set(['-100123']),
+    repairChatIds: new Set(['-100123']),
+  })
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', repairGroupBatch({ peer: true }))
+  await setup.connector.idle()
+  setup.app.emit('notification:turn/completed', {
+    threadId: 'thread-a',
+    turn: { id: 'turn-tg', status: 'completed' },
+  })
+  await setup.connector.idle()
+
+  const resumes = setup.app.calls.filter(call => call.method === 'thread/resume')
+  assert.equal(resumes.length, 2)
+  assert.deepEqual(resumes.at(-1).params, {
+    threadId: 'thread-a',
+    approvalPolicy: 'never',
+    sandbox: 'danger-full-access',
+  })
+})
+
+test('idle reconciliation reasserts configured permissions', async t => {
+  const setup = fixture({ heartbeatIntervalMs: 10 })
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  await waitFor(() => setup.app.calls.filter(call => call.method === 'thread/resume').length >= 2)
+
+  const resumes = setup.app.calls.filter(call => call.method === 'thread/resume')
+  assert.deepEqual(resumes.at(-1).params, {
+    threadId: 'thread-a',
+    approvalPolicy: 'never',
+    sandbox: 'danger-full-access',
+  })
+})
+
+test('preserves a concrete peer-work question instead of rewriting it to a canned prompt', async t => {
+  const setup = fixture({
+    privateChatIds: new Set(['-100123']),
+    repairChatIds: new Set(['-100123']),
+  })
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', repairGroupBatch({ peer: true }))
+  await setup.connector.idle()
+
+  setup.app.emit('notification:item/completed', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: {
+      type: 'agentMessage',
+      phase: 'final_answer',
+      text: JSON.stringify({
+        action: 'send',
+        text: '酪建议把 recall 写进 directive，现在加吗？',
+        responses: [],
+        reason: 'request_owner_authorization',
+      }),
+    },
+  })
+  setup.app.emit('notification:turn/completed', {
+    threadId: 'thread-a',
+    turn: { id: 'turn-tg', status: 'completed' },
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(setup.relay.frames.at(-1), {
+    version: 1,
+    type: 'job_result',
+    batchId: 'batch:telegram:repair-group:peer',
+    turnId: 'turn-tg',
+    result: {
+      action: 'send',
+      text: '酪建议把 recall 写进 directive，现在加吗？',
+      responses: [],
+      reason: 'request_owner_authorization',
+    },
+  })
+})
+
+test('does not request authorization for peer status from an untrusted chat', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+
+  setup.relay.emit('frame', repairGroupBatch({ peer: true }))
+  await setup.connector.idle()
+
+  setup.app.emit('notification:item/completed', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: {
+      type: 'agentMessage',
+      phase: 'final_answer',
+      text: JSON.stringify({
+        action: 'skip',
+        text: '',
+        responses: [],
+        reason: 'peer_status_only_no_authorized_request',
+      }),
+    },
+  })
+  setup.app.emit('notification:turn/completed', {
+    threadId: 'thread-a',
+    turn: { id: 'turn-tg', status: 'completed' },
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(setup.relay.frames.at(-1), {
+    version: 1,
+    type: 'job_result',
+    batchId: 'batch:telegram:repair-group:peer',
+    turnId: 'turn-tg',
+    result: { action: 'skip', reason: 'peer_status_only_no_authorized_request' },
+  })
 })
 
 test('trusts only the authenticated owner DM and preserves its configured permissions', async t => {
@@ -931,6 +1718,82 @@ test('emits relay status heartbeats for an external channel monitor', async t =>
   await setup.connector.idle()
 
   assert.deepEqual(statuses.at(-1), { status: 'connected', remoteNowMs: 1234 })
+})
+
+test('surfaces and acknowledges Telegram delivery receipts', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  const receipts = []
+  setup.connector.on('deliveryReceipt', receipt => receipts.push(receipt))
+  await setup.connector.start()
+
+  setup.relay.emit('frame', {
+    version: 1,
+    type: 'delivery_receipt',
+    receiptId: 'relay-delivery:batch-a',
+    batchId: 'batch-a',
+    jobIds: ['telegram:1'],
+    status: 'failed',
+    actions: [{
+      actionId: 'relay-batch:batch-a:0000',
+      status: 'failed',
+      telegramMessageId: null,
+      error: 'Telegram rejected the message',
+    }],
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(receipts, [{
+    receiptId: 'relay-delivery:batch-a',
+    batchId: 'batch-a',
+    jobIds: ['telegram:1'],
+    status: 'failed',
+    actions: [{
+      actionId: 'relay-batch:batch-a:0000',
+      status: 'failed',
+      telegramMessageId: null,
+      error: 'Telegram rejected the message',
+    }],
+  }])
+  assert.deepEqual(setup.relay.frames.at(-1), {
+    version: 1,
+    type: 'delivery_recorded',
+    receiptId: 'relay-delivery:batch-a',
+  })
+})
+
+test('surfaces a relay-rejected result as a failed delivery receipt', async t => {
+  const setup = fixture()
+  t.after(() => setup.connector.close())
+  const receipts = []
+  setup.connector.on('deliveryReceipt', receipt => receipts.push(receipt))
+  await setup.connector.start()
+
+  setup.relay.emit('frame', privateGroupBatch())
+  await setup.connector.idle()
+  setup.relay.emit('frame', {
+    version: 1,
+    type: 'job_recorded',
+    batchId: 'batch:telegram:private-group',
+    jobIds: ['telegram:private-group'],
+    status: 'failed',
+    error: 'job result standalone target is not an approved conversation',
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(receipts, [{
+    receiptId: 'relay-result:batch:telegram:private-group',
+    batchId: 'batch:telegram:private-group',
+    jobIds: ['telegram:private-group'],
+    status: 'failed',
+    actions: [{
+      actionId: 'relay-result:0',
+      conversationKey: '-100123',
+      status: 'failed',
+      telegramMessageId: null,
+      error: 'job result standalone target is not an approved conversation',
+    }],
+  }])
 })
 
 test('surfaces a transport disengage without touching the standalone Codex session', async t => {

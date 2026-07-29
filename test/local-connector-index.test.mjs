@@ -1,7 +1,78 @@
 import assert from 'node:assert/strict'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 
-import { buildRelayProcessSpec, buildRelaySshArgs } from '../src/local-connector-index.mjs'
+import {
+  buildRelayProcessSpec,
+  buildRelaySshArgs,
+  loadConnectorEnv,
+} from '../src/local-connector-index.mjs'
+
+test('loads task admission from the launcher config for a hot connector restart', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'connector-config-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const configPath = join(root, 'local-channel.json')
+  await writeFile(configPath, JSON.stringify({
+    taskAdmission: {
+      cliPath: '/opt/taskq/taskq.py',
+      dbPath: '/var/lib/taskq/tasks.sqlite3',
+      agentId: 'elio',
+    },
+    interruptFanout: {
+      command: '/opt/local/interrupt-peer',
+      stopFlagPath: '/var/run/local/stop.flag',
+    },
+  }))
+
+  const loaded = await loadConnectorEnv({ BRIDGE_LOCAL_CONFIG: configPath })
+
+  assert.equal(loaded.TASKQ_CLI_PATH, '/opt/taskq/taskq.py')
+  assert.equal(loaded.TASKQ_DB_PATH, '/var/lib/taskq/tasks.sqlite3')
+  assert.equal(loaded.TASKQ_AGENT_ID, 'elio')
+  assert.equal(loaded.BRIDGE_INTERRUPT_FANOUT_COMMAND, '/opt/local/interrupt-peer')
+  assert.equal(loaded.BRIDGE_STOP_FLAG_PATH, '/var/run/local/stop.flag')
+})
+
+test('explicit task admission environment wins over the launcher config', async () => {
+  const env = {
+    TASKQ_CLI_PATH: '/explicit/taskq.py',
+    TASKQ_DB_PATH: '/explicit/tasks.sqlite3',
+    TASKQ_AGENT_ID: 'explicit-agent',
+    BRIDGE_INTERRUPT_FANOUT_COMMAND: '/explicit/interrupt-peer',
+    BRIDGE_STOP_FLAG_PATH: '/explicit/stop.flag',
+  }
+
+  assert.equal(await loadConnectorEnv(env), env)
+})
+
+test('loads only the missing local connector settings without overriding explicit values', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'connector-config-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const configPath = join(root, 'local-channel.json')
+  await writeFile(configPath, JSON.stringify({
+    taskAdmission: {
+      cliPath: '/opt/taskq/taskq.py',
+      dbPath: '/var/lib/taskq/tasks.sqlite3',
+      agentId: 'elio',
+    },
+    interruptFanout: {
+      command: '/opt/local/interrupt-peer',
+      stopFlagPath: '/var/run/local/stop.flag',
+    },
+  }))
+  const loaded = await loadConnectorEnv({
+    BRIDGE_LOCAL_CONFIG: configPath,
+    TASKQ_CLI_PATH: '/explicit/taskq.py',
+    TASKQ_DB_PATH: '/explicit/tasks.sqlite3',
+    TASKQ_AGENT_ID: 'explicit-agent',
+  })
+
+  assert.equal(loaded.TASKQ_CLI_PATH, '/explicit/taskq.py')
+  assert.equal(loaded.BRIDGE_INTERRUPT_FANOUT_COMMAND, '/opt/local/interrupt-peer')
+  assert.equal(loaded.BRIDGE_STOP_FLAG_PATH, '/var/run/local/stop.flag')
+})
 
 test('builds a non-interactive SSH relay command without Telegram credentials', () => {
   const args = buildRelaySshArgs({

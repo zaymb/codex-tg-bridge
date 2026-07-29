@@ -8,7 +8,6 @@ function defaultSleep(ms, signal) {
       return
     }
     const timer = setTimeout(resolve, ms)
-    timer.unref?.()
     signal?.addEventListener('abort', () => {
       clearTimeout(timer)
       resolve()

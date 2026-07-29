@@ -10,6 +10,10 @@ import {
   AWAY_INVALID_REPLY,
   DISENGAGE_ACK_PREFIX,
   DISENGAGE_REPLY,
+  INTERRUPT_ACK_PREFIX,
+  RESUME_ACK_PREFIX,
+  RESUME_REPLY,
+  interruptReply,
   isAwayReleaseMention,
   parseTransportCommand,
 } from './transport-control.mjs'
@@ -349,6 +353,33 @@ export class RelayDispatcher {
       }
       this.#state.completeUpdate({ updateId: row.updateId, workerId: this.#workerId, nowMs: this.#clock() })
       return { status: 'completed', action: accepted ? 'disengage_pending' : 'disengage_duplicate' }
+    }
+    if (command.kind === 'interrupt' || command.kind === 'resume') {
+      const action = command.kind === 'resume' ? 'continue' : 'stop'
+      const requestId = `${command.kind}:${row.updateId}`
+      const { accepted } = this.#control.requestInterrupt({
+        requestId,
+        conversationKey: update.conversationKey,
+        action,
+        target: command.target ?? 'all',
+        nowMs,
+      })
+      if (accepted && !(action === 'stop' && command.target === 'laurie')) {
+        this.#queueControlReply(
+          update,
+          `${action === 'stop' ? INTERRUPT_ACK_PREFIX : RESUME_ACK_PREFIX}${row.updateId}`,
+          action === 'stop' ? interruptReply(command.target) : RESUME_REPLY,
+        )
+      }
+      this.#state.completeUpdate({
+        updateId: row.updateId,
+        workerId: this.#workerId,
+        nowMs: this.#clock(),
+      })
+      return {
+        status: 'completed',
+        action: accepted ? `${command.kind}_pending` : `${command.kind}_duplicate`,
+      }
     }
     throw new Error(`unsupported transport command: ${command.kind}`)
   }

@@ -127,6 +127,21 @@ function mapRelayApproval(row) {
   }
 }
 
+function mapRelayDeliveryReceipt(row) {
+  if (!row) return null
+  return {
+    receiptId: row.receipt_id,
+    sessionLabel: row.session_label,
+    codexSessionId: row.codex_session_id,
+    batchId: row.batch_id,
+    jobIds: parse(row.job_ids_json),
+    actionIds: parse(row.action_ids_json),
+    deliveredAtMs: row.delivered_at_ms,
+    createdAtMs: row.created_at_ms,
+    updatedAtMs: row.updated_at_ms,
+  }
+}
+
 function mapWake(row) {
   if (!row) return null
   return {
@@ -393,6 +408,22 @@ export class StateStore {
         ON relay_approvals(session_label, codex_session_id, delivered_at_ms, state, updated_at_ms);
       CREATE INDEX IF NOT EXISTS relay_approvals_expiry
         ON relay_approvals(state, expires_at_ms);
+
+      CREATE TABLE IF NOT EXISTS relay_delivery_receipts (
+        receipt_id TEXT PRIMARY KEY,
+        session_label TEXT NOT NULL,
+        codex_session_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        job_ids_json TEXT NOT NULL,
+        action_ids_json TEXT NOT NULL,
+        delivered_at_ms INTEGER,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS relay_delivery_receipts_pending
+        ON relay_delivery_receipts(
+          session_label, codex_session_id, delivered_at_ms, created_at_ms
+        );
 
       CREATE TABLE IF NOT EXISTS wake_requests (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -947,6 +978,20 @@ export class StateStore {
     `).run(nowMs, actionId, nowMs).changes === 1
   }
 
+  replaceSendingOutboundAction(actionId, { actionType, payload }, nowMs = Date.now()) {
+    if (typeof actionType !== 'string' || !actionType) {
+      throw new Error('replacement outbound action type is required')
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      throw new Error('replacement outbound action payload is required')
+    }
+    return this.#db.prepare(`
+      UPDATE outbound_actions
+      SET action_type = ?, payload_json = ?, updated_at_ms = ?
+      WHERE action_id = ? AND status = 'sending'
+    `).run(actionType, stringify(payload), nowMs, actionId).changes === 1
+  }
+
   markOutboundSent(actionId, {
     telegramChatId = null,
     telegramMessageId = null,
@@ -1280,6 +1325,102 @@ export class StateStore {
     `).run(nowMs, nowMs, approvalId).changes === 1
   }
 
+  createRelayDeliveryReceipt({
+    receiptId,
+    sessionLabel,
+    codexSessionId,
+    batchId,
+    jobIds,
+    actionIds,
+    nowMs = Date.now(),
+  }) {
+    if (
+      !receiptId
+      || !sessionLabel
+      || !codexSessionId
+      || !batchId
+      || !Array.isArray(jobIds)
+      || jobIds.length === 0
+      || !Array.isArray(actionIds)
+      || actionIds.length === 0
+    ) throw new Error('relay delivery receipt identity fields are required')
+    this.#db.prepare(`
+      INSERT OR IGNORE INTO relay_delivery_receipts(
+        receipt_id, session_label, codex_session_id, batch_id,
+        job_ids_json, action_ids_json, created_at_ms, updated_at_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      String(receiptId),
+      String(sessionLabel),
+      String(codexSessionId),
+      String(batchId),
+      stringify(jobIds.map(String)),
+      stringify(actionIds.map(String)),
+      nowMs,
+      nowMs,
+    )
+    return mapRelayDeliveryReceipt(this.#db.prepare(`
+      SELECT * FROM relay_delivery_receipts WHERE receipt_id = ?
+    `).get(String(receiptId)))
+  }
+
+  nextRelayDeliveryReceipt({ sessionLabel, codexSessionId }) {
+    const receipts = this.#db.prepare(`
+      SELECT * FROM relay_delivery_receipts
+      WHERE session_label = ? AND codex_session_id = ? AND delivered_at_ms IS NULL
+      ORDER BY created_at_ms, receipt_id
+      LIMIT 64
+    `).all(String(sessionLabel), String(codexSessionId)).map(mapRelayDeliveryReceipt)
+    for (const receipt of receipts) {
+      const actions = receipt.actionIds.map(actionId => this.getOutboundAction(actionId))
+      const missing = actions.findIndex(action => action === null)
+      if (missing !== -1) {
+        return {
+          ...receipt,
+          status: 'failed',
+          actions: receipt.actionIds.map((actionId, index) => index === missing
+            ? {
+                actionId,
+                conversationKey: null,
+                status: 'failed',
+                telegramMessageId: null,
+                error: 'outbound action is missing',
+              }
+            : {
+                actionId,
+                conversationKey: actions[index]?.conversationKey ?? null,
+                status: actions[index]?.status ?? 'failed',
+                telegramMessageId: actions[index]?.telegramMessageId ?? null,
+              }),
+        }
+      }
+      const ambiguous = actions.some(action => action.status === 'ambiguous')
+      const failed = actions.some(action => action.status === 'failed' && action.nextAttemptAtMs === null)
+      const sent = actions.every(action => action.status === 'sent')
+      if (!ambiguous && !failed && !sent) continue
+      const status = ambiguous ? 'ambiguous' : failed ? 'failed' : 'sent'
+      return {
+        ...receipt,
+        status,
+        actions: actions.map(action => ({
+          actionId: action.actionId,
+          conversationKey: action.conversationKey,
+          status: action.status,
+          telegramMessageId: action.telegramMessageId,
+          ...(action.lastError ? { error: action.lastError } : {}),
+        })),
+      }
+    }
+    return null
+  }
+
+  markRelayDeliveryReceiptDelivered(receiptId, nowMs = Date.now()) {
+    return this.#db.prepare(`
+      UPDATE relay_delivery_receipts SET delivered_at_ms = ?, updated_at_ms = ?
+      WHERE receipt_id = ? AND delivered_at_ms IS NULL
+    `).run(nowMs, nowMs, String(receiptId)).changes === 1
+  }
+
   enqueueRelayJob({
     jobId,
     sourceType,
@@ -1317,6 +1458,41 @@ export class StateStore {
 
   getRelayJob(jobId) {
     return mapRelayJob(this.#db.prepare('SELECT * FROM relay_jobs WHERE job_id = ?').get(String(jobId)))
+  }
+
+  listAcceptedRelayTypingTargets(sessionLabel, nowMs = Date.now()) {
+    const rows = this.#db.prepare(`
+      SELECT conversation_key, payload_json, turn_id, updated_at_ms, job_id
+      FROM relay_jobs
+      WHERE session_label = ?
+        AND source_type = 'telegram'
+        AND status = 'accepted'
+        AND expires_at_ms > ?
+      ORDER BY updated_at_ms DESC, job_id DESC
+    `).all(String(sessionLabel), nowMs)
+    const seen = new Set()
+    const targets = []
+    for (const row of rows) {
+      if (seen.has(row.conversation_key)) continue
+      const context = parse(row.payload_json)?.telegramContext
+      if (
+        !context
+        || String(context.conversationKey ?? '') !== row.conversation_key
+        || context.chatId === null
+        || context.chatId === undefined
+        || !row.turn_id
+      ) continue
+      seen.add(row.conversation_key)
+      targets.push({
+        conversationKey: row.conversation_key,
+        chatId: String(context.chatId),
+        threadId: context.threadId === null || context.threadId === undefined
+          ? null
+          : String(context.threadId),
+        turnId: row.turn_id,
+      })
+    }
+    return targets.sort((left, right) => left.conversationKey.localeCompare(right.conversationKey))
   }
 
   expireRelayJobs(nowMs = Date.now()) {
@@ -1613,6 +1789,7 @@ export class StateStore {
     result,
     outboundActions = [],
     supersedeActionIds = [],
+    deliveryBatchId = null,
     nowMs = Date.now(),
   }) {
     if (!Array.isArray(jobIds) || jobIds.length === 0 || new Set(jobIds).size !== jobIds.length) {
@@ -1630,6 +1807,18 @@ export class StateStore {
         nowMs,
       })
       for (const action of outboundActions) this.createOutboundAction({ ...action, nowMs })
+      if (deliveryBatchId && outboundActions.length > 0) {
+        const firstJob = this.getRelayJob(jobIds[0])
+        this.createRelayDeliveryReceipt({
+          receiptId: `relay-delivery:${deliveryBatchId}`,
+          sessionLabel: firstJob.sessionLabel,
+          codexSessionId: firstJob.codexSessionId,
+          batchId: deliveryBatchId,
+          jobIds,
+          actionIds: outboundActions.map(action => action.actionId),
+          nowMs,
+        })
+      }
       return true
     })
     try {
@@ -1698,6 +1887,13 @@ export class StateStore {
     return transaction()
   }
 
+  ownsRelaySession({ sessionLabel, connectorId }) {
+    return this.#db.prepare(`
+      SELECT 1 FROM relay_sessions
+      WHERE session_label = ? AND connector_id = ? AND status = 'online'
+    `).get(String(sessionLabel), String(connectorId)) !== undefined
+  }
+
   registerRelaySession({
     sessionLabel,
     connectorId,
@@ -1712,7 +1908,20 @@ export class StateStore {
       this.ensureRelaySession(sessionLabel, nowMs)
       const current = this.getRelaySession(sessionLabel, nowMs)
       if (current.status === 'online' && current.connectorId !== connectorId) {
-        return { registered: false, reason: 'already_connected', session: current }
+        if (current.codexSessionId !== String(codexSessionId)) {
+          return { registered: false, reason: 'session_mismatch', session: current }
+        }
+        this.#db.prepare(`
+          UPDATE relay_jobs
+          SET status = CASE WHEN expires_at_ms <= ? THEN 'expired' ELSE 'pending' END,
+              lease_owner = NULL, lease_expires_at_ms = NULL, updated_at_ms = ?
+          WHERE session_label = ? AND status = 'leased' AND lease_owner = ?
+        `).run(
+          nowMs,
+          nowMs,
+          String(sessionLabel),
+          String(current.connectorId),
+        )
       }
       this.#db.prepare(`
         UPDATE relay_sessions
@@ -1728,7 +1937,13 @@ export class StateStore {
         nowMs,
         String(sessionLabel),
       )
-      return { registered: true, session: this.getRelaySession(sessionLabel, nowMs) }
+      return {
+        registered: true,
+        ...(current.status === 'online' && current.connectorId !== connectorId
+          ? { replacedConnectorId: current.connectorId }
+          : {}),
+        session: this.getRelaySession(sessionLabel, nowMs),
+      }
     })
     return transaction()
   }

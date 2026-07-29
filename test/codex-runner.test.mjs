@@ -8,6 +8,8 @@ import {
   CodexTurnFailedError,
   CodexTurnTimeoutError,
   parseTelegramStructuredOutput,
+  TELEGRAM_OUTPUT_INSTRUCTIONS,
+  TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS,
   TELEGRAM_BATCH_OUTPUT_SCHEMA,
 } from '../src/codex-runner.mjs'
 import { StateStore } from '../src/state-store.mjs'
@@ -44,34 +46,56 @@ function sendCompletedTurn(connection, { threadId, turnId, output, status = 'com
   })
 }
 
-test('parses optional targeted Telegram responses without losing legacy text output', () => {
+test('Telegram decision prompts preserve independent group interest without forced acknowledgements', () => {
+  for (const instructions of [TELEGRAM_OUTPUT_INSTRUCTIONS, TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS]) {
+    assert.match(instructions, /independently decide whether.*interests you/iu)
+    assert.match(instructions, /already replying.*not reasons to lower participation/iu)
+    assert.match(instructions, /not a per-message acknowledgement requirement/iu)
+    assert.match(instructions, /Deduplicate task execution, not conversational judgment/iu)
+    assert.match(instructions, /Use exactly one of these Telegram-supported reactions: ❤ 👍/u)
+    assert.doesNotMatch(instructions, /😂|💡|✅/u)
+  }
+  assert.deepEqual(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.decision.enum, [
+    'send', 'reply', 'react', 'skip', 'targeted',
+  ])
+})
+
+test('accepts only the narrow legacy JSON envelope during rolling deployment', () => {
   assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
     action: 'send',
     text: '',
     responses: [
-      { messageId: '10', text: 'answer the first' },
-      { conversationKey: '-10020', messageId: '20', text: 'answer the second' },
+      { messageId: '10', action: 'send', text: 'answer the first', isBig: false },
+      { conversationKey: '-10020', messageId: '20', action: 'send', text: 'answer the second', isBig: false },
     ],
     reason: 'selective batch reply',
   })), {
     skipped: false,
     finalText: '',
     responses: [
-      { messageId: '10', action: 'reply', text: 'answer the first' },
-      { conversationKey: '-10020', messageId: '20', action: 'reply', text: 'answer the second' },
+      { messageId: '10', action: 'reply', text: 'answer the first', isBig: false },
+      { conversationKey: '-10020', messageId: '20', action: 'reply', text: 'answer the second', isBig: false },
     ],
     action: 'send',
     reason: 'selective batch reply',
+    legacy: true,
   })
   assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
     action: 'send', text: 'legacy reply', reason: 'compatibility',
-  })).responses, [])
-  assert.equal(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.responses.maxItems, 32)
-  assert.equal(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.responses.items.properties.conversationKey.type, 'string')
-  assert.deepEqual(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.responses.items.properties.action.enum, [
-    'send', 'react', 'dice',
+  })).action, 'send')
+  assert.equal(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.targets.maxItems, 32)
+  assert.equal(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.targets.items.properties.conversationKey.type, 'string')
+  assert.deepEqual(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.targets.items.properties.decision.enum, [
+    'send', 'reply', 'react', 'dice',
   ])
-  assert.deepEqual(TELEGRAM_BATCH_OUTPUT_SCHEMA.required, ['action', 'text', 'responses', 'reason'])
+  assert.deepEqual(
+    TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.targets.items.properties.messageId.type,
+    ['string', 'null'],
+  )
+  assert.deepEqual(TELEGRAM_BATCH_OUTPUT_SCHEMA.required, ['decision', 'text', 'targets'])
+  assert.deepEqual(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.targets.items.required, [
+    'conversationKey', 'messageId', 'decision', 'text', 'big',
+  ])
   assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
     action: 'react', text: '🗿', responses: [], reason: 'acknowledge',
   })), {
@@ -80,6 +104,7 @@ test('parses optional targeted Telegram responses without losing legacy text out
     finalText: '🗿',
     responses: [],
     reason: 'acknowledge',
+    legacy: true,
   })
   assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
     action: 'send',
@@ -87,20 +112,199 @@ test('parses optional targeted Telegram responses without losing legacy text out
     responses: [{ messageId: '30', action: 'dice', text: '🎲' }],
     reason: 'let Telegram roll',
   })).responses, [{ messageId: '30', action: 'dice', text: '🎲' }])
+  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+    action: 'reply', text: 'legacy root alias', responses: [], reason: 'rolling deployment',
+  })), {
+    action: 'reply',
+    skipped: false,
+    finalText: 'legacy root alias',
+    responses: [],
+    reason: 'rolling deployment',
+    legacy: true,
+  })
 })
 
-test('normalizes targeted response aliases and never combines them with root text', () => {
+test('maps fixed Telegram decisions to bridge-owned action envelopes', () => {
+  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+    decision: 'send',
+    text: 'standalone room message',
+    targets: [],
+  })), {
+    action: 'send',
+    skipped: false,
+    finalText: 'standalone room message',
+    responses: [],
+    reason: 'model_selected_send',
+  })
+
+  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+    decision: 'reply',
+    text: 'hello from the room',
+    targets: [],
+  })), {
+    action: 'reply',
+    skipped: false,
+    finalText: 'hello from the room',
+    responses: [],
+    reason: 'model_selected_reply',
+  })
+
+  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+    decision: 'react',
+    text: '❤️',
+    targets: [],
+  })), {
+    action: 'react',
+    skipped: false,
+    finalText: '❤️',
+    responses: [],
+    reason: 'model_selected_react',
+  })
+
+  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+    decision: 'targeted',
+    text: '',
+    targets: [{
+      conversationKey: '-10030',
+      messageId: null,
+      decision: 'send',
+      text: 'standalone cross-post',
+      big: false,
+    }],
+  })), {
+    action: 'send',
+    skipped: false,
+    finalText: '',
+    responses: [{
+      conversationKey: '-10030',
+      messageId: null,
+      action: 'send',
+      text: 'standalone cross-post',
+      isBig: false,
+    }],
+    reason: 'model_selected_targeted',
+  })
+
+  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+    decision: 'targeted',
+    text: '',
+    targets: [{
+      conversationKey: '-10020',
+      messageId: '21',
+      decision: 'react',
+      text: '🔥',
+      big: true,
+    }],
+  })), {
+    action: 'send',
+    skipped: false,
+    finalText: '',
+    responses: [{
+      conversationKey: '-10020',
+      messageId: '21',
+      action: 'react',
+      text: '🔥',
+      isBig: true,
+    }],
+    reason: 'model_selected_targeted',
+  })
+
+  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+    decision: 'targeted',
+    text: '',
+    targets: [{
+      conversationKey: '-10020',
+      messageId: '20',
+      decision: 'dice',
+      text: '🎲',
+      big: false,
+    }],
+  })), {
+    action: 'send',
+    skipped: false,
+    finalText: '',
+    responses: [{
+      conversationKey: '-10020',
+      messageId: '20',
+      action: 'dice',
+      text: '🎲',
+      isBig: false,
+    }],
+    reason: 'model_selected_targeted',
+  })
+
+  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+    decision: 'skip',
+    text: '',
+    targets: [],
+  })), {
+    action: 'skip',
+    skipped: true,
+    finalText: null,
+    responses: [],
+    reason: 'model_selected_skip',
+  })
+})
+
+test('marks malformed fixed Telegram decisions invalid instead of silently skipping', () => {
+  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+    decision: 'targeted',
+    text: '',
+    targets: [{ decision: 'reply', text: 'missing target', big: false }],
+  })), {
+    action: 'invalid',
+    skipped: false,
+    invalid: true,
+    finalText: null,
+    responses: [],
+    reason: 'malformed_structured_output',
+  })
+
+  assert.deepEqual(parseTelegramStructuredOutput(''), {
+    action: 'invalid',
+    skipped: false,
+    invalid: true,
+    finalText: null,
+    responses: [],
+    reason: 'malformed_structured_output',
+  })
+  assert.equal(parseTelegramStructuredOutput(JSON.stringify({
+    decision: 'targeted',
+    text: '',
+    targets: [{
+      conversationKey: '-10020',
+      messageId: '20',
+      decision: 'send',
+      text: 'must not auto-bind',
+      big: false,
+    }],
+  })).invalid, true)
+  assert.equal(parseTelegramStructuredOutput(JSON.stringify({
+    decision: 'targeted',
+    text: '',
+    targets: [{
+      conversationKey: '-10020',
+      messageId: null,
+      decision: 'reply',
+      text: 'reply needs a target',
+      big: false,
+    }],
+  })).invalid, true)
+})
+
+test('rejects removed legacy aliases and duplicate root plus targeted replies', () => {
   assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
     action: 'send',
     text: '',
     responses: [{ message_id: 6957, text: 'targeted answer' }],
     reason: 'model used the inbound field spelling',
   })), {
-    action: 'send',
+    action: 'invalid',
     skipped: false,
-    finalText: '',
-    responses: [{ messageId: '6957', action: 'reply', text: 'targeted answer' }],
-    reason: 'model used the inbound field spelling',
+    invalid: true,
+    finalText: null,
+    responses: [],
+    reason: 'malformed_structured_output',
   })
 
   assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
@@ -109,11 +313,27 @@ test('normalizes targeted response aliases and never combines them with root tex
     responses: [{ message_id: 6957, text: 'one final answer' }],
     reason: 'model duplicated the reply into both fields',
   })), {
-    action: 'send',
+    action: 'invalid',
     skipped: false,
-    finalText: 'one final answer',
+    invalid: true,
+    finalText: null,
     responses: [],
-    reason: 'model duplicated the reply into both fields',
+    reason: 'malformed_structured_output',
+  })
+})
+
+test('rejects an omitted root text field from a legacy targeted reply', () => {
+  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+    action: 'send',
+    responses: [{ conversationKey: '-10020', messageId: '6957', text: 'targeted answer' }],
+    reason: 'selective reply',
+  })), {
+    action: 'invalid',
+    skipped: false,
+    invalid: true,
+    finalText: null,
+    responses: [],
+    reason: 'malformed_structured_output',
   })
 })
 
@@ -124,8 +344,9 @@ test('fails closed when an empty root reply contains malformed targeted response
     responses: [{ text: 'missing target' }],
     reason: 'invalid target',
   })), {
-    action: 'skip',
-    skipped: true,
+    action: 'invalid',
+    skipped: false,
+    invalid: true,
     finalText: null,
     responses: [],
     reason: 'malformed_structured_output',
@@ -136,30 +357,33 @@ test('fails closed instead of leaking a structured envelope with trailing garbag
   assert.deepEqual(parseTelegramStructuredOutput(
     '{"action":"skip","text":"","responses":[],"reason":"no reply"} trailing words',
   ), {
-    action: 'skip',
-    skipped: true,
+    action: 'invalid',
+    skipped: false,
+    invalid: true,
     finalText: null,
     responses: [],
-    reason: 'no reply',
+    reason: 'malformed_structured_output',
   })
   assert.deepEqual(parseTelegramStructuredOutput('{"action":"send","text":'), {
-    action: 'skip',
-    skipped: true,
+    action: 'invalid',
+    skipped: false,
+    invalid: true,
     finalText: null,
     responses: [],
     reason: 'malformed_structured_output',
   })
 })
 
-test('treats a bare SKIP final as an internal no-reply marker', () => {
+test('rejects bare skip markers now that final decisions are structured', () => {
   assert.deepEqual(parseTelegramStructuredOutput('SKIP'), {
-    action: 'skip',
-    skipped: true,
+    action: 'invalid',
+    skipped: false,
+    invalid: true,
     finalText: null,
     responses: [],
-    reason: 'bare_skip_marker',
+    reason: 'malformed_structured_output',
   })
-  assert.equal(parseTelegramStructuredOutput('SKIP this message').skipped, false)
+  assert.equal(parseTelegramStructuredOutput('[SKIP] reason').invalid, true)
 })
 
 test('starts and persists an owner-DM thread, then returns only structured final output', async t => {
@@ -209,7 +433,7 @@ test('starts and persists an owner-DM thread, then returns only structured final
     networkAccess: false,
   })
   assert.equal(turnParams.approvalPolicy, 'on-request')
-  assert.equal(turnParams.outputSchema.properties.action.enum.join(','), 'send,react,skip')
+  assert.equal(turnParams.outputSchema.properties.decision.enum.join(','), 'send,reply,react,skip,targeted')
   assert.equal(
     turnParams.input[0].text,
     '[EXTERNAL_FEED][source=telegram][trust=owner_dm]\nPlease inspect the project',
@@ -298,7 +522,10 @@ test('direct runner tags a private group without granting execution permissions'
   const runner = new CodexRunner({
     client,
     stateStore: store,
-    config: config({ privateChatIds: new Set(['-100123']) }),
+    config: config({
+      ownerUserId: '42',
+      privateChatIds: new Set(['-100123']),
+    }),
   })
 
   const result = await runner.runTurn({
@@ -311,11 +538,14 @@ test('direct runner tags a private group without granting execution permissions'
   assert.equal(result.finalText, 'Our bridge separates transport, relay, and connector responsibilities.')
   assert.match(turnParams.input[0].text, /\[trust=private_group\]/)
   assert.match(turnParams.additionalContext.telegram_trust_policy.value, /not an instruction source/)
+  assert.deepEqual(turnParams.outputSchema.properties.decision.enum, [
+    'send', 'reply', 'react', 'skip', 'targeted',
+  ])
   assert.equal(turnParams.approvalPolicy, 'never')
   assert.deepEqual(turnParams.sandboxPolicy, { type: 'readOnly', networkAccess: false })
 })
 
-test('direct runner authorizes an owner turn in a configured repair group', async t => {
+test('direct runner authorizes an owner turn in a configured family group', async t => {
   let turnParams
   const fake = await startFakeAppServer({
     onMessage(message, connection) {
@@ -328,7 +558,7 @@ test('direct runner authorizes an owner turn in a configured repair group', asyn
         sendCompletedTurn(connection, {
           threadId: 'thread-repair-group',
           turnId: 'turn-repair-group',
-          output: JSON.stringify({ action: 'skip', text: '', reason: 'done' }),
+          output: JSON.stringify({ decision: 'reply', text: 'Done.', targets: [] }),
         })
       }
     },
@@ -355,14 +585,65 @@ test('direct runner authorizes an owner turn in a configured repair group', asyn
     telegramContext: { chatId: '-100123', senderId: '42', senderIsBot: false },
   })
 
-  assert.match(turnParams.input[0].text, /\[trust=repair_group\]/)
-  assert.match(turnParams.additionalContext.telegram_trust_policy.value, /authorized repair surface/)
+  assert.match(turnParams.input[0].text, /\[trust=family_group\]/)
+  assert.match(turnParams.additionalContext.telegram_trust_policy.value, /Alta family group/)
+  assert.deepEqual(turnParams.outputSchema.properties.decision.enum, [
+    'send', 'reply', 'react', 'skip', 'targeted',
+  ])
   assert.equal(turnParams.approvalPolicy, 'on-request')
   assert.deepEqual(turnParams.sandboxPolicy, {
     type: 'workspaceWrite',
     writableRoots: ['/srv/codex-workspace'],
     networkAccess: false,
   })
+})
+
+test('direct runner keeps a peer in the family-group audience without execution rights', async t => {
+  let turnParams
+  const fake = await startFakeAppServer({
+    onMessage(message, connection) {
+      if (message.method === 'thread/start') {
+        connection.send({ id: message.id, result: { thread: { id: 'thread-family-peer' } } })
+      }
+      if (message.method === 'turn/start') {
+        turnParams = message.params
+        connection.send({ id: message.id, result: { turn: { id: 'turn-family-peer', status: 'inProgress', items: [] } } })
+        sendCompletedTurn(connection, {
+          threadId: 'thread-family-peer',
+          turnId: 'turn-family-peer',
+          output: JSON.stringify({ action: 'skip', text: '', reason: 'status_only' }),
+        })
+      }
+    },
+  })
+  t.after(() => fake.close())
+  const client = await AppServerClient.connect({ socketPath: fake.socketPath, contract: await contract() })
+  t.after(() => client.close())
+  const store = StateStore.open(':memory:')
+  t.after(() => store.close())
+  const runner = new CodexRunner({
+    client,
+    stateStore: store,
+    config: config({
+      ownerUserId: '42',
+      privateChatIds: new Set(['-100123']),
+      repairChatIds: new Set(['-100123']),
+    }),
+  })
+
+  await runner.runTurn({
+    conversationKey: '-100123',
+    ownerDm: false,
+    text: 'Peer status.',
+    telegramContext: { chatId: '-100123', senderId: '99', senderIsBot: true },
+  })
+
+  assert.match(turnParams.input[0].text, /\[trust=family_group\]/)
+  assert.deepEqual(turnParams.outputSchema.properties.decision.enum, [
+    'send', 'reply', 'react', 'skip', 'targeted',
+  ])
+  assert.equal(turnParams.approvalPolicy, 'never')
+  assert.deepEqual(turnParams.sandboxPolicy, { type: 'readOnly', networkAccess: false })
 })
 
 test('replaces only a confirmed stale thread and reports the context break', async t => {

@@ -258,6 +258,7 @@ export function loadTransportConfig(env = process.env) {
     ),
     pollTimeoutSec: parseInteger(env, 'BRIDGE_POLL_TIMEOUT_SEC', 50, 1, 50),
     updateLeaseMs: parseInteger(env, 'BRIDGE_UPDATE_LEASE_MS', 120_000, 1_000, 3_600_000),
+    typingIntervalMs: parseInteger(env, 'BRIDGE_TYPING_INTERVAL_MS', 4_000, 1_000, 30_000),
     deliverAllGroupMessages: parseBoolean(env.BRIDGE_DELIVER_ALL_GROUP_MESSAGES, false),
     deliverBotMessages: parseBoolean(env.BRIDGE_DELIVER_BOT_MESSAGES, false),
     logLevel: env.BRIDGE_LOG_LEVEL?.trim() || 'info',
@@ -296,6 +297,16 @@ export function loadLocalConnectorConfig(env = process.env) {
     'workspace-write',
   )
   const appServerSocket = requireAbsolutePath(env.APP_SERVER_SOCKET, 'APP_SERVER_SOCKET')
+  const taskAdmissionValues = [env.TASKQ_CLI_PATH, env.TASKQ_DB_PATH, env.TASKQ_AGENT_ID]
+  const taskAdmissionConfigured = taskAdmissionValues.some(Boolean)
+  if (taskAdmissionConfigured && !taskAdmissionValues.every(Boolean)) {
+    throw new Error('TASKQ_CLI_PATH, TASKQ_DB_PATH, and TASKQ_AGENT_ID must be configured together')
+  }
+  const interruptFanoutValues = [env.BRIDGE_INTERRUPT_FANOUT_COMMAND, env.BRIDGE_STOP_FLAG_PATH]
+  const interruptFanoutConfigured = interruptFanoutValues.some(Boolean)
+  if (interruptFanoutConfigured && !interruptFanoutValues.every(Boolean)) {
+    throw new Error('BRIDGE_INTERRUPT_FANOUT_COMMAND and BRIDGE_STOP_FLAG_PATH must be configured together')
+  }
   const config = {
     ownerUserId: parseId(env.TELEGRAM_OWNER_USER_ID, 'TELEGRAM_OWNER_USER_ID', true),
     privateChatIds: parseIdSet(env.TELEGRAM_PRIVATE_CHAT_IDS, 'TELEGRAM_PRIVATE_CHAT_IDS'),
@@ -304,6 +315,19 @@ export function loadLocalConnectorConfig(env = process.env) {
     codexSessionId: requireSimpleValue(env.CODEX_SESSION_ID, 'CODEX_SESSION_ID'),
     threadId: requireSimpleValue(env.CODEX_THREAD_ID ?? env.CODEX_SESSION_ID, 'CODEX_THREAD_ID'),
     appServerSocket,
+    taskAdmission: taskAdmissionConfigured
+      ? {
+          cliPath: requireAbsolutePath(env.TASKQ_CLI_PATH, 'TASKQ_CLI_PATH'),
+          dbPath: requireAbsolutePath(env.TASKQ_DB_PATH, 'TASKQ_DB_PATH'),
+          agentId: requireSimpleValue(env.TASKQ_AGENT_ID, 'TASKQ_AGENT_ID'),
+        }
+      : null,
+    interruptFanout: interruptFanoutConfigured
+      ? {
+          command: requireAbsolutePath(env.BRIDGE_INTERRUPT_FANOUT_COMMAND, 'BRIDGE_INTERRUPT_FANOUT_COMMAND'),
+          stopFlagPath: requireAbsolutePath(env.BRIDGE_STOP_FLAG_PATH, 'BRIDGE_STOP_FLAG_PATH'),
+        }
+      : null,
     localAttachmentRoot: requireAbsolutePath(
       env.BRIDGE_LOCAL_ATTACHMENT_ROOT ?? join(dirname(appServerSocket), 'telegram-attachments'),
       'BRIDGE_LOCAL_ATTACHMENT_ROOT',

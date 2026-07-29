@@ -9,12 +9,12 @@ import { seedApprovedChats } from './runtime.mjs'
 import { StateStore } from './state-store.mjs'
 import { TelegramClient } from './telegram-client.mjs'
 import { DisengagedError, TransportControl } from './transport-control.mjs'
+import { TypingPulse } from './typing-pulse.mjs'
 
 function idle(ms, signal) {
   return new Promise(resolve => {
     if (signal?.aborted) return resolve()
     const timer = setTimeout(resolve, ms)
-    timer.unref?.()
     signal?.addEventListener('abort', () => {
       clearTimeout(timer)
       resolve()
@@ -87,6 +87,12 @@ export async function createTransportRuntime({
       stateStore,
       pollTimeoutSec: config.pollTimeoutSec,
     })
+    const typing = new TypingPulse({
+      stateStore,
+      telegramClient,
+      sessionLabel: config.sessionLabel,
+      intervalMs: config.typingIntervalMs,
+    })
 
     const runtime = {
       stateStore,
@@ -94,6 +100,7 @@ export async function createTransportRuntime({
       dispatcher,
       outbound,
       poller,
+      typing,
       bot,
       transportControl,
       async run({ signal } = {}) {
@@ -128,8 +135,11 @@ export async function createTransportRuntime({
             }
             const inbound = await dispatcher.drainOnce()
             const sent = await outbound.drainOnce()
+            const typed = await typing.drainOnce()
             stateStore.expireRelayJobs()
-            if (inbound.claimed === 0 && sent === 0) await idle(workerIdleMs, controller.signal)
+            if (inbound.claimed === 0 && sent === 0 && typed === 0) {
+              await idle(workerIdleMs, controller.signal)
+            }
           }
         }
         const poll = transportControl.isDisengaged()

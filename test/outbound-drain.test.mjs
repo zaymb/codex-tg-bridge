@@ -3,11 +3,12 @@ import test from 'node:test'
 
 import { OutboundDrain } from '../src/outbound-drain.mjs'
 import { StateStore } from '../src/state-store.mjs'
-import { RateLimitError, TelegramTransportError } from '../src/telegram-client.mjs'
+import { RateLimitError, TelegramApiError, TelegramTransportError } from '../src/telegram-client.mjs'
 
 class FakeTelegram {
   calls = []
   failure = null
+  reactionFailure = null
 
   async reply(payload) {
     this.calls.push({ method: 'reply', payload })
@@ -31,6 +32,11 @@ class FakeTelegram {
 
   async react(payload) {
     this.calls.push({ method: 'react', payload })
+    if (this.reactionFailure) {
+      const error = this.reactionFailure
+      this.reactionFailure = null
+      throw error
+    }
     return true
   }
 
@@ -105,6 +111,44 @@ test('captures a successful outbound bot reaction for side-channel consumers', a
     reaction: { type: 'emoji', emoji: '👍' },
     extendsCooldown: false,
   }])
+})
+
+test('does not turn a rejected reaction into a visible emoji reply', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  setup.telegram.reactionFailure = new TelegramApiError(
+    'Telegram setMessageReaction failed (400): Bad Request: REACTION_INVALID',
+    { method: 'setMessageReaction', code: 400 },
+  )
+  setup.state.createOutboundAction({
+    actionId: 'react:invalid',
+    conversationKey: '-100123:99',
+    actionType: 'react',
+    payload: {
+      chatId: '-100123',
+      threadId: '99',
+      messageId: '55',
+      reaction: { type: 'emoji', emoji: '✅' },
+    },
+    nowMs: 1_000,
+  })
+
+  assert.equal(await setup.drain.drainOnce(), 1)
+  assert.deepEqual(setup.telegram.calls, [{
+    method: 'react',
+    payload: {
+      chatId: '-100123',
+      threadId: '99',
+      messageId: '55',
+      reaction: { type: 'emoji', emoji: '✅' },
+    },
+  }])
+  const action = setup.state.getOutboundAction('react:invalid')
+  assert.equal(action.status, 'failed')
+  assert.equal(action.actionType, 'react')
+  assert.match(action.lastError, /REACTION_INVALID/u)
+  assert.equal(action.telegramMessageId, null)
+  assert.deepEqual(setup.state.listBotReactionEvents({ afterEventId: 0 }), [])
 })
 
 test('sends and records a durable Telegram dice action', async t => {

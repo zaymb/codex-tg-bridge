@@ -714,6 +714,56 @@ test('relay jobs expire silently before acceptance and complete only the accepte
   assert.equal(store.getRelayJob('telegram:complete').result.text, 'done')
 })
 
+test('lists one typing target per conversation only while a Telegram turn is accepted', async t => {
+  const { store } = await openStore()
+  t.after(() => store.close())
+  for (const [id, conversationKey, context] of [
+    ['1', '-1001:7', { conversationKey: '-1001:7', chatId: '-1001', threadId: '7' }],
+    ['2', '-1001:7', { conversationKey: '-1001:7', chatId: '-1001', threadId: '7' }],
+    ['3', '42', { conversationKey: '42', chatId: '42', threadId: null }],
+  ]) {
+    store.enqueueRelayJob({
+      jobId: `telegram:${id}`,
+      sourceType: 'telegram',
+      sourceId: id,
+      conversationKey,
+      sessionLabel: 'tg-engage',
+      payload: { text: `message ${id}`, telegramContext: context },
+      expiresAtMs: 10_000,
+      nowMs: 100 + Number(id),
+    })
+  }
+  assert.deepEqual(store.listAcceptedRelayTypingTargets('tg-engage', 199), [])
+
+  const batch = store.claimRelayJobBatch({
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-a',
+    maxBatchBytes: 100_000,
+    nowMs: 200,
+  })
+  assert.equal(store.acceptRelayJobBatch({
+    jobIds: batch.map(job => job.jobId),
+    connectorId: 'connector-a',
+    codexSessionId: 'session-a',
+    threadId: 'thread-a',
+    turnId: 'turn-a',
+    nowMs: 210,
+  }), true)
+  assert.deepEqual(store.listAcceptedRelayTypingTargets('tg-engage', 210), [
+    { conversationKey: '-1001:7', chatId: '-1001', threadId: '7', turnId: 'turn-a' },
+    { conversationKey: '42', chatId: '42', threadId: null, turnId: 'turn-a' },
+  ])
+  assert.deepEqual(store.listAcceptedRelayTypingTargets('tg-engage', 10_000), [])
+
+  assert.equal(store.finalizeRelayJobBatch({
+    jobIds: batch.map(job => job.jobId),
+    turnId: 'turn-a',
+    result: { action: 'skip' },
+    nowMs: 220,
+  }), true)
+  assert.deepEqual(store.listAcceptedRelayTypingTargets('tg-engage', 221), [])
+})
+
 test('claims, accepts, and finalizes every ready conversation in one batch atomically', async t => {
   const { store } = await openStore()
   t.after(() => store.close())
@@ -879,7 +929,7 @@ test('releases every unaccepted job in a deferred batch without crossing convers
   assert.deepEqual(batch.map(job => store.getRelayJob(job.jobId).status), ['pending', 'pending'])
 })
 
-test('relay session leases reject a second connector and scope offline notices by epoch', async t => {
+test('relay session takeover fences the old connector and releases its pre-accept lease', async t => {
   const { store } = await openStore()
   t.after(() => store.close())
 
@@ -919,19 +969,52 @@ test('relay session leases reject a second connector and scope offline notices b
     leaseMs: 100,
     nowMs: 250,
   }).registered, false)
+  store.enqueueRelayJob({
+    jobId: 'telegram:takeover',
+    sourceType: 'telegram',
+    sourceId: 'takeover',
+    conversationKey: '42',
+    sessionLabel: 'tg-engage',
+    payload: { text: 'take over this delivery' },
+    expiresAtMs: 10_000,
+    nowMs: 251,
+  })
+  assert.equal(store.claimRelayJobs({
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-a',
+    leaseMs: 120_000,
+    nowMs: 252,
+  })[0].status, 'leased')
+
+  const takeover = store.registerRelaySession({
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-b',
+    codexSessionId: 'session-1',
+    leaseMs: 100,
+    nowMs: 260,
+  })
+  assert.equal(takeover.registered, true)
+  assert.equal(takeover.replacedConnectorId, 'connector-a')
+  assert.equal(store.getRelayJob('telegram:takeover').status, 'pending')
   assert.equal(store.heartbeatRelaySession({
     sessionLabel: 'tg-engage',
     connectorId: 'connector-a',
     leaseMs: 100,
-    nowMs: 250,
+    nowMs: 261,
+  }), false)
+  assert.equal(store.heartbeatRelaySession({
+    sessionLabel: 'tg-engage',
+    connectorId: 'connector-b',
+    leaseMs: 100,
+    nowMs: 261,
   }), true)
-  assert.equal(store.getRelaySession('tg-engage', 349).status, 'online')
-  const offline = store.getRelaySession('tg-engage', 350)
+  assert.equal(store.getRelaySession('tg-engage', 360).status, 'online')
+  const offline = store.getRelaySession('tg-engage', 361)
   assert.equal(offline.status, 'offline')
   assert.equal(offline.offlineEpoch, 2)
   assert.equal(store.claimOfflineNotice({
     sessionLabel: 'tg-engage',
     conversationKey: '42',
-    nowMs: 360,
+    nowMs: 362,
   }), true)
 })

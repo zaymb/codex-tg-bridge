@@ -45,10 +45,33 @@ function isInternalSkipMarker(value) {
   return typeof value === 'string' && /^\s*(?:SKIP|\[SKIP\])\s*$/u.test(value)
 }
 
-function outboundActions(batchId, jobs, result, nowMs) {
+function approvedStandaloneContext(stateStore, conversationKey) {
+  const approved = stateStore.getApprovedChat(conversationKey)
+  if (!approved) invalidResult('job result standalone target is not an approved conversation')
+  let threadId = null
+  if (approved.kind === 'forum_topic') {
+    const prefix = `${approved.telegramChatId}:`
+    if (!conversationKey.startsWith(prefix)) {
+      invalidResult('approved forum topic does not match its Telegram chat')
+    }
+    const rawThreadId = conversationKey.slice(prefix.length)
+    if (!/^\d+$/u.test(rawThreadId) || Number(rawThreadId) <= 0) {
+      invalidResult('approved forum topic has an invalid thread ID')
+    }
+    threadId = rawThreadId
+  }
+  return {
+    conversationKey,
+    chatId: approved.telegramChatId,
+    threadId,
+    messageId: null,
+  }
+}
+
+function outboundActions(stateStore, batchId, jobs, result, nowMs) {
   if (result.action === 'skip') return []
-  if (!['reply', 'react'].includes(result.action) || typeof result.text !== 'string') {
-    invalidResult('job result must be a reply, react, or skip')
+  if (!['send', 'reply', 'react'].includes(result.action) || typeof result.text !== 'string') {
+    invalidResult('job result must be a send, reply, react, or skip')
   }
   const contexts = jobs.map(job => job.payload?.telegramContext)
   if (contexts.some(context => !context?.chatId || !context?.conversationKey)) {
@@ -80,6 +103,31 @@ function outboundActions(batchId, jobs, result, nowMs) {
   const seen = new Set()
   const selected = (targeted.length > 0
       ? targeted.map(response => {
+        const action = response.action ?? 'reply'
+        if (!['send', 'reply', 'react', 'dice'].includes(action)) {
+          invalidResult('job result targeted action must be send, reply, react, or dice')
+        }
+        if (action === 'send') {
+          if (
+            typeof response.conversationKey !== 'string'
+            || !response.conversationKey
+            || response.messageId !== null
+          ) {
+            invalidResult('job result standalone target requires conversationKey and messageId=null')
+          }
+          const targetKey = `${response.conversationKey}\0send`
+          if (seen.has(targetKey)) invalidResult('job result contains a duplicate standalone target')
+          seen.add(targetKey)
+          if (typeof response.text !== 'string' || !response.text.trim()) {
+            invalidResult('job result targeted response text must be non-empty')
+          }
+          return {
+            context: approvedStandaloneContext(stateStore, response.conversationKey),
+            text: response.text,
+            action,
+            isBig: response.isBig === true,
+          }
+        }
         const messageId = typeof response?.messageId === 'string' ? response.messageId : ''
         const conversationKey = typeof response?.conversationKey === 'string'
           ? response.conversationKey
@@ -98,13 +146,15 @@ function outboundActions(batchId, jobs, result, nowMs) {
         if (typeof response.text !== 'string' || !response.text.trim()) {
           invalidResult('job result targeted response text must be non-empty')
         }
-        const action = response.action ?? 'reply'
-        if (!['reply', 'react', 'dice'].includes(action)) {
-          invalidResult('job result targeted action must be reply, react, or dice')
-        }
         return { context, text: response.text, action, isBig: response.isBig === true }
       })
-    : [{ context: contexts.at(-1), text: result.text, action: result.action }])
+    : [{
+        context: result.action === 'send'
+          ? { ...contexts.at(-1), messageId: null }
+          : contexts.at(-1),
+        text: result.text,
+        action: result.action,
+      }])
     .filter(response => response.action !== 'reply' || !isInternalSkipMarker(response.text))
   if (selected.length === 0) return []
   if (selected.some(response => !response.text.trim())) {
@@ -121,6 +171,7 @@ function outboundActions(batchId, jobs, result, nowMs) {
         actionType: 'react',
         payload: {
           chatId: response.context.chatId,
+          threadId: response.context.threadId ?? null,
           messageId: response.context.messageId,
           reaction: { type: 'emoji', emoji: response.text.trim() },
           isBig: response.isBig === true,
@@ -188,6 +239,8 @@ export class RelayProtocolSession {
   #inflightAttachmentPaths = []
   #inflightProgressActionIds = new Set()
   #inflightApprovalId = null
+  #inflightInterruptId = null
+  #inflightDeliveryReceiptId = null
   #acceptingJobs = false
   #capabilities = new Set()
   #closed = false
@@ -259,6 +312,8 @@ export class RelayProtocolSession {
     if (frame.type === 'approval_request') return this.#handleApprovalRequest(frame)
     if (frame.type === 'approval_recorded') return this.#handleApprovalRecorded(frame)
     if (frame.type === 'approval_cancel') return this.#handleApprovalCancel(frame)
+    if (frame.type === 'interrupt_recorded') return this.#handleInterruptRecorded(frame)
+    if (frame.type === 'delivery_recorded') return this.#handleDeliveryRecorded(frame)
     throw new Error(`unsupported relay frame type: ${frame.type}`)
   }
 
@@ -296,6 +351,21 @@ export class RelayProtocolSession {
 
   async claimOnce() {
     if (!this.ready) return false
+    if (this.#inflightBatch) {
+      const jobs = this.#inflightBatch.jobs.map(job => this.#state.getRelayJob(job.jobId))
+      const nowMs = this.#clock()
+      if (jobs.every(job => (
+        job?.status === 'leased'
+        && job.leaseOwner === this.#connectorId
+        && job.leaseExpiresAtMs <= nowMs
+      ))) {
+        throw new Error('relay pre-acceptance job lease expired')
+      }
+    }
+    if (!this.#state.ownsRelaySession({
+      sessionLabel: this.#sessionLabel,
+      connectorId: this.#connectorId,
+    })) throw new Error('relay session lease was lost')
     const disengageReadyAt = this.#transportControl?.disengageReadyAt() ?? null
     if (disengageReadyAt !== null) {
       if (this.#disengageNotified) return false
@@ -304,6 +374,40 @@ export class RelayProtocolSession {
       this.#acceptingJobs = false
       return true
     }
+    if (!this.#inflightInterruptId) {
+      const interrupt = this.#transportControl?.nextInterrupt() ?? null
+      if (interrupt) {
+        this.#inflightInterruptId = interrupt.requestId
+        await this.#write({
+          type: 'interrupt_request',
+          requestId: interrupt.requestId,
+          conversationKey: interrupt.conversationKey,
+          ...(interrupt.action ? { action: interrupt.action } : {}),
+          ...(interrupt.target ? { target: interrupt.target } : {}),
+        })
+        return true
+      }
+    }
+    if (this.#inflightInterruptId) return false
+    if (!this.#inflightDeliveryReceiptId) {
+      const receipt = this.#state.nextRelayDeliveryReceipt({
+        sessionLabel: this.#sessionLabel,
+        codexSessionId: this.#codexSessionId,
+      })
+      if (receipt) {
+        this.#inflightDeliveryReceiptId = receipt.receiptId
+        await this.#write({
+          type: 'delivery_receipt',
+          receiptId: receipt.receiptId,
+          batchId: receipt.batchId,
+          jobIds: receipt.jobIds,
+          status: receipt.status,
+          actions: receipt.actions,
+        })
+        return true
+      }
+    }
+    if (this.#inflightDeliveryReceiptId) return false
     if (!this.#inflightApprovalId) {
       const approval = this.#state.nextRelayApprovalResponse({
         sessionLabel: this.#sessionLabel,
@@ -447,9 +551,10 @@ export class RelayProtocolSession {
       .digest('hex')
       .slice(0, 32)
     const actions = outboundActions(
+      this.#state,
       `${batch.batchId}:progress:${progressKey}`,
       jobs,
-      { action: 'reply', text },
+      { action: frame.action ?? 'reply', text },
       this.#clock(),
     )
     for (const action of actions) {
@@ -468,7 +573,7 @@ export class RelayProtocolSession {
     }
     let actions
     try {
-      actions = outboundActions(batch.batchId, jobs, frame.result ?? {}, this.#clock())
+      actions = outboundActions(this.#state, batch.batchId, jobs, frame.result ?? {}, this.#clock())
     } catch (error) {
       if (!(error instanceof InvalidJobResultError)) throw error
       if (!this.#state.failRelayJobBatch({
@@ -489,6 +594,8 @@ export class RelayProtocolSession {
         type: 'job_recorded',
         batchId: batch.batchId,
         jobIds: jobs.map(job => job.jobId),
+        status: 'failed',
+        error: error.message,
       })
       return
     }
@@ -498,6 +605,7 @@ export class RelayProtocolSession {
       result: frame.result,
       outboundActions: actions,
       supersedeActionIds: [...this.#inflightProgressActionIds],
+      deliveryBatchId: batch.batchId,
       nowMs: this.#clock(),
     })) throw new Error('relay result could not be recorded')
     this.#inflightProgressActionIds.clear()
@@ -507,6 +615,7 @@ export class RelayProtocolSession {
       type: 'job_recorded',
       batchId: batch.batchId,
       jobIds: jobs.map(job => job.jobId),
+      status: 'completed',
     })
   }
 
@@ -534,6 +643,8 @@ export class RelayProtocolSession {
       type: 'job_recorded',
       batchId: batch.batchId,
       jobIds: jobs.map(job => job.jobId),
+      status: 'failed',
+      error,
     })
   }
 
@@ -615,6 +726,31 @@ export class RelayProtocolSession {
       throw new Error('relay approval response could not be recorded')
     }
     this.#inflightApprovalId = null
+  }
+
+  #handleInterruptRecorded(frame) {
+    const requestId = requireText(frame.requestId, 'requestId')
+    if (requestId !== this.#inflightInterruptId) {
+      throw new Error('interrupt acknowledgement does not match inflight request')
+    }
+    if (!['interrupted', 'peer_interrupted', 'no_active_turn', 'resumed'].includes(frame.status)) {
+      throw new Error('interrupt acknowledgement has an invalid status')
+    }
+    if (!this.#transportControl?.completeInterrupt(requestId, this.#clock())) {
+      throw new Error('interrupt request could not be completed')
+    }
+    this.#inflightInterruptId = null
+  }
+
+  #handleDeliveryRecorded(frame) {
+    const receiptId = requireText(frame.receiptId, 'receiptId')
+    if (receiptId !== this.#inflightDeliveryReceiptId) {
+      throw new Error('delivery acknowledgement does not match inflight receipt')
+    }
+    if (!this.#state.markRelayDeliveryReceiptDelivered(receiptId, this.#clock())) {
+      throw new Error('delivery receipt could not be recorded')
+    }
+    this.#inflightDeliveryReceiptId = null
   }
 
   #handleApprovalCancel(frame) {

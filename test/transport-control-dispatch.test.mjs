@@ -14,18 +14,29 @@ import {
   AWAY_INVALID_REPLY,
   DISENGAGE_ACK_PREFIX,
   DISENGAGE_REPLY,
+  INTERRUPT_ACK_PREFIX,
+  INTERRUPT_REPLY,
+  RESUME_ACK_PREFIX,
+  RESUME_REPLY,
   TransportControl,
 } from '../src/transport-control.mjs'
 
-function rawMessage(updateId, { text = 'hello', senderId = 42 } = {}) {
+function rawMessage(updateId, {
+  text = 'hello',
+  senderId = 42,
+  chatId = 42,
+  chatType = 'private',
+  threadId = null,
+} = {}) {
   return {
     update_id: updateId,
     message: {
       message_id: updateId * 10,
       date: 1,
-      chat: { id: 42, type: 'private' },
+      chat: { id: chatId, type: chatType },
       from: { id: senderId, is_bot: false, first_name: 'Owner' },
       text,
+      ...(threadId === null ? {} : { message_thread_id: threadId }),
     },
   }
 }
@@ -168,6 +179,94 @@ test('/disengage stops fresh intake immediately, even while pending', async t =>
   assert.equal(control.isDisengaged(), true)
   assert.equal((await dispatcher.drainOnce()).claimed, 0)
   assert.equal(state.getRelayJob('telegram:12'), null)
+})
+
+test('admin group /stop bypasses model policy and queues an out-of-band interrupt', async t => {
+  const { state, control, dispatcher, seed } = fixture()
+  t.after(() => state.close())
+
+  seed(17, {
+    text: '/stop',
+    chatId: -100123,
+    chatType: 'supergroup',
+    threadId: 7,
+  })
+  const result = await dispatcher.drainOnce()
+
+  assert.equal(result.processed, 1)
+  assert.equal(state.getOutboundAction(`${INTERRUPT_ACK_PREFIX}17`).payload.text, INTERRUPT_REPLY)
+  assert.deepEqual(control.nextInterrupt(), {
+    requestId: 'interrupt:17',
+    conversationKey: '-100123:7',
+    requestedAtMs: 1_000,
+  })
+  assert.equal(state.getRelayJob('telegram:17'), null)
+})
+
+test('admin group /stop elio queues an Elio-only interrupt and receipt', async t => {
+  const { state, control, dispatcher, seed } = fixture()
+  t.after(() => state.close())
+
+  seed(19, {
+    text: '/stop elio',
+    chatId: -100123,
+    chatType: 'supergroup',
+    threadId: 7,
+  })
+  const result = await dispatcher.drainOnce()
+
+  assert.equal(result.processed, 1)
+  assert.equal(state.getOutboundAction(`${INTERRUPT_ACK_PREFIX}19`).payload.text, 'Elio stopped.')
+  assert.deepEqual(control.nextInterrupt(), {
+    requestId: 'interrupt:19',
+    conversationKey: '-100123:7',
+    target: 'elio',
+    requestedAtMs: 1_000,
+  })
+})
+
+test('admin group /stop laurie queues a Laurie-only interrupt without impersonating its receipt', async t => {
+  const { state, control, dispatcher, seed } = fixture()
+  t.after(() => state.close())
+
+  seed(20, {
+    text: '/stop laurie',
+    chatId: -100123,
+    chatType: 'supergroup',
+    threadId: 7,
+  })
+  await dispatcher.drainOnce()
+
+  assert.equal(state.getOutboundAction(`${INTERRUPT_ACK_PREFIX}20`), null)
+  assert.deepEqual(control.nextInterrupt(), {
+    requestId: 'interrupt:20',
+    conversationKey: '-100123:7',
+    target: 'laurie',
+    requestedAtMs: 1_000,
+  })
+})
+
+test('admin group continue bypasses model policy and queues an out-of-band resume', async t => {
+  const { state, control, dispatcher, seed } = fixture()
+  t.after(() => state.close())
+
+  seed(18, {
+    text: 'continue',
+    chatId: -100123,
+    chatType: 'supergroup',
+    threadId: 7,
+  })
+  const result = await dispatcher.drainOnce()
+
+  assert.equal(result.processed, 1)
+  assert.equal(state.getOutboundAction(`${RESUME_ACK_PREFIX}18`).payload.text, RESUME_REPLY)
+  assert.deepEqual(control.nextInterrupt(), {
+    requestId: 'resume:18',
+    conversationKey: '-100123:7',
+    action: 'continue',
+    requestedAtMs: 1_000,
+  })
+  assert.equal(state.getRelayJob('telegram:18'), null)
 })
 
 test('runtime quiesces and leaves via DisengagedError after a confirmed farewell', async t => {

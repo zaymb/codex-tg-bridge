@@ -44,10 +44,12 @@ export class ConnectorSupervisor {
   #reconnectInitialMs
   #reconnectMaxMs
   #heartbeatTimeoutMs
+  #deliveryAlert
   #child = null
   #statusChain = Promise.resolve()
   #disengaged = false
   #engageResolve = null
+  #lastDelivery = null
 
   constructor({
     command,
@@ -60,6 +62,7 @@ export class ConnectorSupervisor {
     reconnectInitialMs = 1_000,
     reconnectMaxMs = 20_000,
     heartbeatTimeoutMs = 20_000,
+    deliveryAlert = () => {},
   }) {
     this.#command = command
     this.#args = args
@@ -71,6 +74,7 @@ export class ConnectorSupervisor {
     this.#reconnectInitialMs = reconnectInitialMs
     this.#reconnectMaxMs = reconnectMaxMs
     this.#heartbeatTimeoutMs = heartbeatTimeoutMs
+    this.#deliveryAlert = deliveryAlert
   }
 
   #writeStatus(status, fields = {}) {
@@ -78,6 +82,7 @@ export class ConnectorSupervisor {
       source: 'telegram',
       status,
       updatedAtMs: this.#clock(),
+      ...(this.#lastDelivery ? { lastDelivery: this.#lastDelivery } : {}),
       ...fields,
     }
     this.#statusChain = this.#statusChain.then(() => this.#statusWriter(value))
@@ -102,6 +107,20 @@ export class ConnectorSupervisor {
       if (event?.event === 'local_connector_disengaged') {
         disengaged = true
         clearTimeout(heartbeatTimer)
+        return
+      }
+      if (event?.event === 'local_connector_delivery' && event.receipt) {
+        this.#lastDelivery = event.receipt
+        this.#writeStatus(connected ? 'connected' : 'connecting', {
+          connectorPid: child.pid ?? null,
+          ...(lastHeartbeatAtMs === null
+            ? {}
+            : {
+                lastHeartbeatAtMs,
+                heartbeatExpiresAtMs: lastHeartbeatAtMs + this.#heartbeatTimeoutMs,
+              }),
+        })
+        if (event.receipt.status !== 'sent') this.#deliveryAlert(event.receipt)
         return
       }
       if (!['local_connector_ready', 'local_connector_heartbeat'].includes(event?.event)) return

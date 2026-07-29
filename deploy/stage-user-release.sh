@@ -99,6 +99,10 @@ fi
 staged_release=${work_dir}/release
 mkdir -p "${staged_release}"
 tar \
+  --exclude='./.git' \
+  --exclude='./AGENTS.md' \
+  --exclude='./docs' \
+  --exclude='./scripts/restart-local-connector.sh' \
   --exclude='./node_modules' \
   --exclude='./.state' \
   --exclude='./.env' \

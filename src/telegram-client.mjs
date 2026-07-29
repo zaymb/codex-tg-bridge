@@ -52,12 +52,48 @@ function compact(value) {
   return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== null && item !== undefined))
 }
 
+function deadlineSignal(parentSignal, timeoutMs) {
+  const controller = new AbortController()
+  const abortFromParent = () => controller.abort(parentSignal?.reason)
+  if (parentSignal?.aborted) abortFromParent()
+  else parentSignal?.addEventListener('abort', abortFromParent, { once: true })
+  const timer = setTimeout(() => {
+    controller.abort(new Error(`Telegram request exceeded its ${timeoutMs} ms client deadline`))
+  }, timeoutMs)
+  return {
+    signal: controller.signal,
+    close() {
+      clearTimeout(timer)
+      parentSignal?.removeEventListener('abort', abortFromParent)
+    },
+  }
+}
+
+// Telegram Bot API ReactionTypeEmoji values:
+// https://core.telegram.org/bots/api#reactiontypeemoji
+const SUPPORTED_REACTION_EMOJI = new Set([
+  '❤', '👍', '👎', '🔥', '🥰', '👏', '😁', '🤔', '🤯', '😱', '🤬', '😢',
+  '🎉', '🤩', '🤮', '💩', '🙏', '👌', '🕊', '🤡', '🥱', '🥴', '😍', '🐳',
+  '❤‍🔥', '🌚', '🌭', '💯', '🤣', '⚡', '🍌', '🏆', '💔', '🤨', '😐',
+  '🍓', '🍾', '💋', '🖕', '😈', '😴', '😭', '🤓', '👻', '👨‍💻', '👀',
+  '🎃', '🙈', '😇', '😨', '🤝', '✍', '🤗', '🫡', '🎅', '🎄', '☃',
+  '💅', '🤪', '🗿', '🆒', '💘', '🙉', '🦄', '😘', '💊', '🙊', '😎',
+  '👾', '🤷‍♂', '🤷', '🤷‍♀', '😡',
+])
+
+function normalizeReactionEmoji(value) {
+  return value.replaceAll('\uFE0F', '')
+}
+
 function validateReaction(reaction) {
   if (!reaction || Array.isArray(reaction) || typeof reaction !== 'object') {
     throw new Error('Telegram requires exactly one reaction object')
   }
   if (reaction.type === 'paid') throw new Error('paid reactions are not supported')
   if (reaction.type === 'emoji' && typeof reaction.emoji === 'string' && reaction.emoji) {
+    if (!SUPPORTED_REACTION_EMOJI.has(normalizeReactionEmoji(reaction.emoji))) {
+      throw new Error('emoji is not supported by Telegram ReactionTypeEmoji')
+    }
     return { type: 'emoji', emoji: reaction.emoji }
   }
   if (reaction.type === 'custom_emoji' && typeof reaction.customEmojiId === 'string' && reaction.customEmojiId) {
@@ -126,12 +162,28 @@ export class TelegramClient {
     throw new TelegramApiError(message, optionsForError)
   }
 
-  getUpdates({ offset = null, timeoutSec = 50, allowedUpdates = ALLOWED_UPDATES, signal } = {}) {
-    return this.#request('getUpdates', {
-      offset,
-      timeout: timeoutSec,
-      allowed_updates: allowedUpdates,
-    }, { signal })
+  async getUpdates({
+    offset = null,
+    timeoutSec = 50,
+    allowedUpdates = ALLOWED_UPDATES,
+    signal,
+    requestTimeoutMs = Math.max(1_000, timeoutSec * 2_000),
+  } = {}) {
+    if (!Number.isFinite(requestTimeoutMs) || requestTimeoutMs <= 0) {
+      throw new Error('Telegram getUpdates requestTimeoutMs must be positive')
+    }
+    // The client deadline is twice the Bot API long-poll window by default:
+    // one window for Telegram, one for network and response overhead.
+    const deadline = deadlineSignal(signal, requestTimeoutMs)
+    try {
+      return await this.#request('getUpdates', {
+        offset,
+        timeout: timeoutSec,
+        allowed_updates: allowedUpdates,
+      }, { signal: deadline.signal })
+    } finally {
+      deadline.close()
+    }
   }
 
   getMe() {

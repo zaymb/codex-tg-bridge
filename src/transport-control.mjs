@@ -3,13 +3,26 @@ const ERROR_KEY = 'transport_control_error'
 
 const AWAY_MIN_MINUTES = 1
 const AWAY_MAX_MINUTES = 60
+const INTERRUPT_TARGETS = new Set(['all', 'elio', 'laurie'])
 
 export const AWAY_ACK_PREFIX = 'transport-control:away:'
 export const AWAY_INVALID_PREFIX = 'transport-control:away-invalid:'
 export const DISENGAGE_ACK_PREFIX = 'transport-control:disengage:'
+export const INTERRUPT_ACK_PREFIX = 'transport-control:interrupt:'
+export const RESUME_ACK_PREFIX = 'transport-control:resume:'
 
 export const AWAY_INVALID_REPLY = 'Invalid request. Use /away 1m–60m.'
 export const DISENGAGE_REPLY = 'Until next time.'
+export const INTERRUPT_REPLY = 'Elio stopped.'
+export const ELIO_INTERRUPT_REPLY = 'Elio stopped.'
+export const LAURIE_INTERRUPT_REPLY = 'Laurie stopped.'
+export const RESUME_REPLY = 'Continue requested.'
+
+export function interruptReply(target = 'all') {
+  if (target === 'elio') return ELIO_INTERRUPT_REPLY
+  if (target === 'laurie') return LAURIE_INTERRUPT_REPLY
+  return INTERRUPT_REPLY
+}
 
 export class DisengagedError extends Error {
   constructor(message = 'transport disengaged by admin command') {
@@ -46,7 +59,17 @@ export function parseTransportCommand(update, { ownerUserId, botUsername = null 
   if (update.type !== 'message') return null
   if (!isAdmin(update, ownerUserId)) return null
   const raw = update.message?.text
-  if (typeof raw !== 'string' || !raw.trimStart().startsWith('/')) return null
+  if (typeof raw !== 'string') return null
+  const exactText = raw.trim()
+  if (exactText === '停') return { kind: 'interrupt' }
+  const plainStop = exactText.match(/^stop(?:\s+(elio|laurie))?$/iu)
+  if (plainStop) {
+    return plainStop[1]
+      ? { kind: 'interrupt', target: plainStop[1].toLowerCase() }
+      : { kind: 'interrupt' }
+  }
+  if (exactText === '继续' || /^continue$/iu.test(exactText)) return { kind: 'resume' }
+  if (!raw.trimStart().startsWith('/')) return null
   const { text, foreignMention } = normalizeCommandText(raw, botUsername)
   if (foreignMention) return null
 
@@ -61,6 +84,13 @@ export function parseTransportCommand(update, { ownerUserId, botUsername = null 
     return { kind: 'away_invalid' }
   }
   if (/^\/disengage$/iu.test(text)) return { kind: 'disengage' }
+  const stop = text.match(/^\/stop(?:\s+(elio|laurie))?$/iu)
+  if (stop) {
+    return stop[1]
+      ? { kind: 'interrupt', target: stop[1].toLowerCase() }
+      : { kind: 'interrupt' }
+  }
+  if (/^\/continue$/iu.test(text)) return { kind: 'resume' }
   return null
 }
 
@@ -95,12 +125,16 @@ export class TransportControl {
 
   read() {
     const raw = this.#state.getSetting(STATE_KEY)
-    if (!raw) return { away: null, disengage: null }
+    if (!raw) return { away: null, disengage: null, interrupts: [] }
     try {
       const parsed = JSON.parse(raw)
-      return { away: parsed.away ?? null, disengage: parsed.disengage ?? null }
+      return {
+        away: parsed.away ?? null,
+        disengage: parsed.disengage ?? null,
+        interrupts: Array.isArray(parsed.interrupts) ? parsed.interrupts : [],
+      }
     } catch {
-      return { away: null, disengage: null }
+      return { away: null, disengage: null, interrupts: [] }
     }
   }
 
@@ -151,6 +185,45 @@ export class TransportControl {
     if (state.disengage) return { accepted: false }
     this.#write({ ...state, disengage: { phase: 'pending', ackActionId } }, nowMs)
     return { accepted: true }
+  }
+
+  requestInterrupt({ requestId, conversationKey, action = 'stop', target = 'all', nowMs = this.#clock() }) {
+    if (!['stop', 'continue'].includes(action)) {
+      throw new Error('interrupt action must be stop or continue')
+    }
+    if (!INTERRUPT_TARGETS.has(target)) {
+      throw new Error('interrupt target must be all, elio, or laurie')
+    }
+    const state = this.read()
+    if (state.interrupts.some(entry => entry.requestId === requestId)) {
+      return { accepted: false }
+    }
+    this.#write({
+      ...state,
+      interrupts: [
+        ...state.interrupts,
+        {
+          requestId,
+          conversationKey,
+          ...(action === 'continue' ? { action } : {}),
+          ...(target === 'all' ? {} : { target }),
+          requestedAtMs: nowMs,
+        },
+      ],
+    }, nowMs)
+    return { accepted: true }
+  }
+
+  nextInterrupt() {
+    return this.read().interrupts[0] ?? null
+  }
+
+  completeInterrupt(requestId, nowMs = this.#clock()) {
+    const state = this.read()
+    const remaining = state.interrupts.filter(entry => entry.requestId !== requestId)
+    if (remaining.length === state.interrupts.length) return false
+    this.#write({ ...state, interrupts: remaining }, nowMs)
+    return true
   }
 
   // Admin @bot mention: clears away entirely (pending or active). A still

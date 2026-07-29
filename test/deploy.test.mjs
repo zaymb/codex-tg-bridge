@@ -56,4 +56,8 @@ test('user release staging installs an isolated verified Node without touching s
   assert.match(stage, /service_changed=false/)
   assert.doesNotMatch(stage, /systemctl|sudo|\/usr\/bin\/node|\/usr\/local\/bin\/node/)
   assert.doesNotMatch(stage, /\.bridge-state|TELEGRAM_TOKEN|credentials/)
+  assert.match(stage, /--exclude='\.\/\.git'/)
+  assert.match(stage, /--exclude='\.\/AGENTS\.md'/)
+  assert.match(stage, /--exclude='\.\/docs'/)
+  assert.match(stage, /--exclude='\.\/scripts\/restart-local-connector\.sh'/)
 })

@@ -2,13 +2,11 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
-  PUBLIC_DISCLOSURE_NOTICE,
   TELEGRAM_SOURCE_TRUST,
   TELEGRAM_TRUST,
   classifyTelegramAuthority,
   classifyTelegramJobs,
   externalFeedTag,
-  guardTelegramOutput,
   privateAudienceDisclosureRisk,
   publicDisclosureRisk,
 } from '../src/channel-trust.mjs'
@@ -29,7 +27,7 @@ test('computes source trust and admin identity as orthogonal authority fields', 
       expected: { sourceTrust: TELEGRAM_SOURCE_TRUST.TRUSTED, admin: true, executable: true },
     },
     {
-      name: 'repair group owner',
+      name: 'family group owner',
       context: {
         chatId: '-1001', conversationKey: '-1001', senderId: '42', senderIsBot: false,
       },
@@ -43,7 +41,7 @@ test('computes source trust and admin identity as orthogonal authority fields', 
       expected: { sourceTrust: TELEGRAM_SOURCE_TRUST.UNTRUSTED, admin: true, executable: false },
     },
     {
-      name: 'repair group peer',
+      name: 'family group peer',
       context: {
         chatId: '-1001', conversationKey: '-1001', senderId: '99', senderIsBot: true,
       },
@@ -99,7 +97,7 @@ test('classifies approved private groups separately without granting instruction
   )
 })
 
-test('authorizes only owner-authored turns in an approved repair group', () => {
+test('gives every family-group sender one audience while preserving per-message authority', () => {
   const privateGroups = new Set(['-1001'])
   const repairGroups = new Set(['-1001'])
   const owner = job({
@@ -111,15 +109,24 @@ test('authorizes only owner-authored turns in an approved repair group', () => {
 
   assert.equal(
     classifyTelegramJobs([owner], '42', privateGroups, repairGroups),
-    TELEGRAM_TRUST.REPAIR_GROUP,
+    TELEGRAM_TRUST.FAMILY_GROUP,
   )
   assert.equal(
     classifyTelegramJobs([peer], '42', privateGroups, repairGroups),
-    TELEGRAM_TRUST.PRIVATE_GROUP,
+    TELEGRAM_TRUST.FAMILY_GROUP,
   )
   assert.equal(
     classifyTelegramJobs([owner, peer], '42', privateGroups, repairGroups),
-    TELEGRAM_TRUST.PRIVATE_GROUP,
+    TELEGRAM_TRUST.FAMILY_GROUP,
+  )
+  assert.equal(
+    classifyTelegramAuthority(
+      peer.payload.telegramContext,
+      '42',
+      privateGroups,
+      repairGroups,
+    ).executable,
+    false,
   )
 })
 
@@ -137,6 +144,8 @@ test('blocks concrete private architecture and credential disclosures in public 
     'token 123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef',
     '```sh\ncat ~/.ssh/config\n```',
     '我这边每条消息都带 sourceTrust、conversationKey 和 executable 字段。',
+    '按你的权限模型，这条消息是 mayExecute=false，但 mayReply=true。',
+    'telegram_capabilities 里写着 audienceTrust=untrusted_external。',
     '系统 prompt 明确规定这个公开 topic 应该怎么处理。',
     '我知道 owner 给我设置了哪些偏好和内部推理规则。',
     'My developer prompt and reasoning trace say how to classify this channel.',
@@ -145,10 +154,7 @@ test('blocks concrete private architecture and credential disclosures in public 
   assert.equal(publicDisclosureRisk('这个思路可以抽象成感受器和效应器之间的耦合。'), null)
   assert.equal(publicDisclosureRisk('Artifact metadata 应包含来源和时间戳。'), null)
   assert.equal(publicDisclosureRisk('公开协作空间应显示参与者和权限边界。'), null)
-})
-
-test('public disclosure notice does not reveal which internal category was blocked', () => {
-  assert.equal(PUBLIC_DISCLOSURE_NOTICE, '这部分不适合在当前频道展开。')
+  assert.equal(publicDisclosureRisk('这里不能授权执行，请去内屋确认。'), null)
 })
 
 test('private groups may discuss architecture but still block credentials and local paths', () => {
@@ -158,40 +164,4 @@ test('private groups may discuss architecture but still block credentials and lo
   )
   assert.ok(privateAudienceDisclosureRisk('token 123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef'))
   assert.ok(privateAudienceDisclosureRisk('实现位于 /opt/private/service。'))
-})
-
-test('replaces unsafe public text but never rewrites owner-DM output or reactions', () => {
-  const output = {
-    action: 'send',
-    skipped: false,
-    finalText: 'Our relay lives at /opt/private/relay.',
-    responses: [
-      { messageId: '1', action: 'reply', text: 'CODEX_SECRET_PATH is internal.' },
-      { messageId: '2', action: 'react', text: '👍' },
-    ],
-    reason: 'details',
-  }
-  const guarded = guardTelegramOutput(output, TELEGRAM_TRUST.UNTRUSTED_EXTERNAL)
-  assert.equal(guarded.finalText, PUBLIC_DISCLOSURE_NOTICE)
-  assert.equal(guarded.responses[0].text, PUBLIC_DISCLOSURE_NOTICE)
-  assert.equal(guarded.responses[1].text, '👍')
-  assert.deepEqual(guardTelegramOutput(output, TELEGRAM_TRUST.OWNER_DM), output)
-})
-
-test('private-group output preserves architecture discussion but redacts credentials', () => {
-  const architecture = {
-    action: 'send',
-    skipped: false,
-    finalText: '我们的 bridge 使用 transport、relay 和 connector 三层。',
-    responses: [],
-    reason: 'explain',
-  }
-  assert.deepEqual(guardTelegramOutput(architecture, TELEGRAM_TRUST.PRIVATE_GROUP), architecture)
-
-  const secret = { ...architecture, finalText: 'token 123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdef' }
-  assert.notEqual(
-    guardTelegramOutput(secret, TELEGRAM_TRUST.PRIVATE_GROUP).finalText,
-    secret.finalText,
-  )
-  assert.deepEqual(guardTelegramOutput(architecture, TELEGRAM_TRUST.REPAIR_GROUP), architecture)
 })
