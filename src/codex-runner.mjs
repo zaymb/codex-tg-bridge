@@ -14,7 +14,7 @@ function telegramDecisionSchema() {
     properties: {
       decision: {
         type: 'string',
-        enum: ['send', 'reply', 'react', 'skip', 'targeted'],
+        enum: ['skip', 'targeted'],
       },
       text: { type: 'string' },
       targets: {
@@ -42,9 +42,10 @@ export const TELEGRAM_BATCH_OUTPUT_SCHEMA = TELEGRAM_OUTPUT_SCHEMA
 
 export const TELEGRAM_OUTPUT_INSTRUCTIONS = [
   'Return only the structured result required by outputSchema.',
-  'Select decision=send to post a standalone message in the current Telegram conversation.',
-  'Select decision=reply only when intentionally replying to the latest Telegram message in the current batch.',
-  'Select decision=react when a reaction is better than a written reply. Use exactly one of these Telegram-supported reactions: ❤ 👍 👎 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🙏 👌 🤣 👀 🫡.',
+  'Every Telegram destination must be explicit: select decision=targeted, keep root text empty, and include conversationKey on every target.',
+  'Default to target decision=send with messageId=null when continuing the latest message or responding to the batch as a whole.',
+  'Use target decision=reply only to select a specific older message from a multi-message batch; explicit routing alone is never a reason to reply.',
+  'Use target decision=react only for the exact messageId in that conversation. Reactions must be exactly one of: ❤ 👍 👎 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🙏 👌 🤣 👀 🫡.',
   'Group participation: independently decide whether the conversation interests you or you have something natural to add. Another participant or agent already replying, possibly replying later, the owner not naming you, or the message not being a task are not reasons to lower participation. Reply or react when interested; skip remains valid when you genuinely have nothing to add, for a mechanical duplicate or status echo, or when asked not to respond. This is not a per-message acknowledgement requirement. Deduplicate task execution, not conversational judgment.',
   'Select decision=skip only when no Telegram response should be sent; keep text empty.',
   'The bridge owns transport actions. Never write action, responses, or reason fields.',
@@ -54,17 +55,16 @@ export const TELEGRAM_OUTPUT_INSTRUCTIONS = [
 
 export const TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS = [
   'Apply this Telegram output contract only while the latest user input is marked [TG].',
-  'When using commentary, put a concise, natural progress update in a reply decision. The bridge forwards at most the first commentary update to Telegram and keeps later commentary local.',
+  'When using commentary, default to a targeted send with the exact conversationKey and messageId=null. Use a targeted reply only when selecting a specific older message from a multi-message batch. The bridge forwards at most the first commentary update to Telegram and keeps later commentary local.',
   'Use final_answer for the completed response.',
   'For [TG] input, return one JSON object with exactly decision, text, and targets. The bridge mechanically creates the transport envelope.',
-  'Use decision=send and put one standalone Telegram-ready message in text, with targets empty.',
-  'Use decision=reply only when intentionally replying to the globally latest Telegram message in the current batch; put the reply in text and keep targets empty.',
-  'Use decision=react when a reaction is better than a written reply. Use exactly one of these Telegram-supported reactions: ❤ 👍 👎 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🙏 👌 🤣 👀 🫡. Keep targets empty.',
+  'Root send, reply, and react are disabled. Every outbound action must use decision=targeted with empty root text and an explicit conversationKey.',
+  'Use a target decision=react when a reaction is better than a written reply. Use exactly one of these Telegram-supported reactions: ❤ 👍 👎 🔥 🥰 👏 😁 🤔 🤯 😱 🤬 😢 🎉 🤩 🙏 👌 🤣 👀 🫡.',
   'Group participation: independently decide whether each conversation interests you or you have something natural to add. Another participant or agent already replying, possibly replying later, the owner not naming you, or the message not being a task are not reasons to lower participation. Reply or react when interested; omission or skip remains valid when you genuinely have nothing to add, for a mechanical duplicate or status echo, or when asked not to respond. This is not a per-message acknowledgement requirement. Deduplicate task execution, not conversational judgment.',
   'Use decision=targeted with empty text for explicit destinations.',
   'Each target must contain conversationKey, messageId, decision (send, reply, react, or dice), text, and big (a boolean).',
-  'Use target decision=send with messageId=null to post a standalone message in that approved conversation, including a conversation absent from the current batch.',
-  'Use target decision=reply only when intentionally replying to that exact listed message; messageId must be its Telegram message_id rendered as a string.',
+  'Use target decision=send with messageId=null to respond to the latest message or the batch as a whole. This is the default, and also supports an approved conversation absent from the current batch.',
+  'Use target decision=reply only to select a specific older message from a multi-message batch; messageId must be that Telegram message_id rendered as a string. Do not reply merely because the input came from Telegram or because conversationKey is explicit.',
   'Use the listed conversationKey on every reply, react, or dice target so identical message IDs cannot cross chats. Omitted messages receive nothing.',
   'Use a target with decision=dice and text set to exactly one of 🎲 🎯 🏀 ⚽ 🎳 🎰 to send Telegram animated dice.',
   'Always include targets; use an empty array when no targeted responses are needed.',
@@ -164,9 +164,9 @@ function hasOnlyKeys(value, required, optional = []) {
 function normalizeTargets(items, legacy = false) {
   if (!Array.isArray(items) || items.length === 0 || items.length > 32) return null
   const required = legacy
-    ? ['messageId', 'action', 'text']
+    ? ['conversationKey', 'messageId', 'action', 'text']
     : ['conversationKey', 'messageId', 'decision', 'text', 'big']
-  const optional = legacy ? ['conversationKey', 'isBig'] : []
+  const optional = legacy ? ['isBig'] : []
   const seen = new Set()
   const responses = []
   for (const item of items) {
@@ -181,8 +181,7 @@ function normalizeTargets(items, legacy = false) {
       : `${item.conversationKey ?? ''}\0${item.messageId}`
     if (
       !validMessageId
-      || (item.conversationKey !== undefined && (typeof item.conversationKey !== 'string' || !item.conversationKey))
-      || (standalone && typeof item.conversationKey !== 'string')
+      || typeof item.conversationKey !== 'string' || !item.conversationKey
       || seen.has(key) || !['send', 'reply', 'react', 'dice'].includes(action)
       || typeof item.text !== 'string' || !item.text.trim()
       || (!legacy && typeof item.big !== 'boolean')
@@ -190,7 +189,7 @@ function normalizeTargets(items, legacy = false) {
     ) return null
     seen.add(key)
     responses.push({
-      ...(item.conversationKey === undefined ? {} : { conversationKey: item.conversationKey }),
+      conversationKey: item.conversationKey,
       messageId: item.messageId, action, text: item.text,
       ...((legacy ? item.isBig : item.big) === undefined ? {} : { isBig: legacy ? item.isBig : item.big }),
     })
@@ -207,17 +206,11 @@ function mapTelegramDecision(value) {
   if (value.decision === 'skip' && value.text === '' && value.targets.length === 0) {
     return { action: 'skip', skipped: true, finalText: null, responses: [], reason: 'model_selected_skip' }
   }
-  if (['send', 'reply', 'react'].includes(value.decision) && value.text.trim() && value.targets.length === 0) {
-    return {
-      action: value.decision, skipped: false,
-      finalText: value.text, responses: [], reason: `model_selected_${value.decision}`,
-    }
-  }
   const responses = value.decision === 'targeted' && value.text === ''
     ? normalizeTargets(value.targets)
     : null
   return responses
-    ? { action: 'send', skipped: false, finalText: '', responses, reason: 'model_selected_targeted' }
+    ? { action: 'targeted', skipped: false, finalText: '', responses, reason: 'model_selected_targeted' }
     : null
 }
 
@@ -233,14 +226,11 @@ function mapLegacyTelegramEnvelope(value) {
   if (action === 'skip' && value.text === '' && emptyResponses) {
     return { action, skipped: true, finalText: null, responses: [], reason: value.reason, legacy: true }
   }
-  if (['send', 'reply', 'react'].includes(action) && value.text.trim() && emptyResponses) {
-    return { action, skipped: false, finalText: value.text, responses: [], reason: value.reason, legacy: true }
-  }
   const responses = ['send', 'reply'].includes(action) && value.text === ''
     ? normalizeTargets(value.responses, true)
     : null
   return responses
-    ? { action, skipped: false, finalText: '', responses, reason: value.reason, legacy: true }
+    ? { action: 'targeted', skipped: false, finalText: '', responses, reason: value.reason, legacy: true }
     : null
 }
 

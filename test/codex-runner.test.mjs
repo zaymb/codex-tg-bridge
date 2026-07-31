@@ -46,26 +46,44 @@ function sendCompletedTurn(connection, { threadId, turnId, output, status = 'com
   })
 }
 
+function targetedSend(conversationKey, text) {
+  return {
+    decision: 'targeted',
+    text: '',
+    targets: [{
+      conversationKey,
+      messageId: null,
+      decision: 'send',
+      text,
+      big: false,
+    }],
+  }
+}
+
 test('Telegram decision prompts preserve independent group interest without forced acknowledgements', () => {
   for (const instructions of [TELEGRAM_OUTPUT_INSTRUCTIONS, TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS]) {
     assert.match(instructions, /independently decide whether.*interests you/iu)
     assert.match(instructions, /already replying.*not reasons to lower participation/iu)
     assert.match(instructions, /not a per-message acknowledgement requirement/iu)
     assert.match(instructions, /Deduplicate task execution, not conversational judgment/iu)
-    assert.match(instructions, /Use exactly one of these Telegram-supported reactions: ❤ 👍/u)
+    assert.match(instructions, /exactly one of(?: these Telegram-supported reactions)?: ❤ 👍/u)
     assert.doesNotMatch(instructions, /😂|💡|✅/u)
   }
   assert.deepEqual(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.decision.enum, [
-    'send', 'reply', 'react', 'skip', 'targeted',
+    'skip', 'targeted',
   ])
+  assert.match(TELEGRAM_OUTPUT_INSTRUCTIONS, /Default to target decision=send with messageId=null/iu)
+  assert.match(TELEGRAM_OUTPUT_INSTRUCTIONS, /reply only to select a specific older message/iu)
+  assert.match(TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS, /respond to the latest message or the batch as a whole/iu)
+  assert.match(TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS, /Do not reply merely.*conversationKey is explicit/iu)
 })
 
-test('accepts only the narrow legacy JSON envelope during rolling deployment', () => {
+test('accepts only explicitly routed legacy JSON during rolling deployment', () => {
   assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
     action: 'send',
     text: '',
     responses: [
-      { messageId: '10', action: 'send', text: 'answer the first', isBig: false },
+      { conversationKey: '42', messageId: '10', action: 'send', text: 'answer the first', isBig: false },
       { conversationKey: '-10020', messageId: '20', action: 'send', text: 'answer the second', isBig: false },
     ],
     reason: 'selective batch reply',
@@ -73,16 +91,16 @@ test('accepts only the narrow legacy JSON envelope during rolling deployment', (
     skipped: false,
     finalText: '',
     responses: [
-      { messageId: '10', action: 'reply', text: 'answer the first', isBig: false },
+      { conversationKey: '42', messageId: '10', action: 'reply', text: 'answer the first', isBig: false },
       { conversationKey: '-10020', messageId: '20', action: 'reply', text: 'answer the second', isBig: false },
     ],
-    action: 'send',
+    action: 'targeted',
     reason: 'selective batch reply',
     legacy: true,
   })
-  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+  assert.equal(parseTelegramStructuredOutput(JSON.stringify({
     action: 'send', text: 'legacy reply', reason: 'compatibility',
-  })).action, 'send')
+  })).invalid, true)
   assert.equal(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.targets.maxItems, 32)
   assert.equal(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.targets.items.properties.conversationKey.type, 'string')
   assert.deepEqual(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.targets.items.properties.decision.enum, [
@@ -96,70 +114,28 @@ test('accepts only the narrow legacy JSON envelope during rolling deployment', (
   assert.deepEqual(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.targets.items.required, [
     'conversationKey', 'messageId', 'decision', 'text', 'big',
   ])
-  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+  assert.equal(parseTelegramStructuredOutput(JSON.stringify({
     action: 'react', text: '🗿', responses: [], reason: 'acknowledge',
-  })), {
-    action: 'react',
-    skipped: false,
-    finalText: '🗿',
-    responses: [],
-    reason: 'acknowledge',
-    legacy: true,
-  })
+  })).invalid, true)
   assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
     action: 'send',
     text: '',
-    responses: [{ messageId: '30', action: 'dice', text: '🎲' }],
+    responses: [{ conversationKey: '42', messageId: '30', action: 'dice', text: '🎲' }],
     reason: 'let Telegram roll',
-  })).responses, [{ messageId: '30', action: 'dice', text: '🎲' }])
-  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
+  })).responses, [{ conversationKey: '42', messageId: '30', action: 'dice', text: '🎲' }])
+  assert.equal(parseTelegramStructuredOutput(JSON.stringify({
     action: 'reply', text: 'legacy root alias', responses: [], reason: 'rolling deployment',
-  })), {
-    action: 'reply',
-    skipped: false,
-    finalText: 'legacy root alias',
-    responses: [],
-    reason: 'rolling deployment',
-    legacy: true,
-  })
+  })).invalid, true)
 })
 
 test('maps fixed Telegram decisions to bridge-owned action envelopes', () => {
-  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
-    decision: 'send',
-    text: 'standalone room message',
-    targets: [],
-  })), {
-    action: 'send',
-    skipped: false,
-    finalText: 'standalone room message',
-    responses: [],
-    reason: 'model_selected_send',
-  })
-
-  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
-    decision: 'reply',
-    text: 'hello from the room',
-    targets: [],
-  })), {
-    action: 'reply',
-    skipped: false,
-    finalText: 'hello from the room',
-    responses: [],
-    reason: 'model_selected_reply',
-  })
-
-  assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
-    decision: 'react',
-    text: '❤️',
-    targets: [],
-  })), {
-    action: 'react',
-    skipped: false,
-    finalText: '❤️',
-    responses: [],
-    reason: 'model_selected_react',
-  })
+  for (const decision of ['send', 'reply', 'react']) {
+    assert.equal(parseTelegramStructuredOutput(JSON.stringify({
+      decision,
+      text: 'root actions are forbidden',
+      targets: [],
+    })).invalid, true)
+  }
 
   assert.deepEqual(parseTelegramStructuredOutput(JSON.stringify({
     decision: 'targeted',
@@ -172,7 +148,7 @@ test('maps fixed Telegram decisions to bridge-owned action envelopes', () => {
       big: false,
     }],
   })), {
-    action: 'send',
+    action: 'targeted',
     skipped: false,
     finalText: '',
     responses: [{
@@ -196,7 +172,7 @@ test('maps fixed Telegram decisions to bridge-owned action envelopes', () => {
       big: true,
     }],
   })), {
-    action: 'send',
+    action: 'targeted',
     skipped: false,
     finalText: '',
     responses: [{
@@ -220,7 +196,7 @@ test('maps fixed Telegram decisions to bridge-owned action envelopes', () => {
       big: false,
     }],
   })), {
-    action: 'send',
+    action: 'targeted',
     skipped: false,
     finalText: '',
     responses: [{
@@ -400,7 +376,7 @@ test('starts and persists an owner-DM thread, then returns only structured final
         sendCompletedTurn(connection, {
           threadId: 'thread-owner',
           turnId: 'turn-owner',
-          output: JSON.stringify({ action: 'send', text: 'Final answer', reason: 'direct reply' }),
+          output: JSON.stringify(targetedSend('42', 'Final answer')),
         })
       }
     },
@@ -422,7 +398,8 @@ test('starts and persists an owner-DM thread, then returns only structured final
 
   assert.equal(result.threadId, 'thread-owner')
   assert.equal(result.turnId, 'turn-owner')
-  assert.equal(result.finalText, 'Final answer')
+  assert.equal(result.finalText, '')
+  assert.equal(result.responses[0].text, 'Final answer')
   assert.equal(result.skipped, false)
   assert.equal(result.contextBreak, false)
   assert.equal(store.getConversation('42').threadId, 'thread-owner')
@@ -433,7 +410,7 @@ test('starts and persists an owner-DM thread, then returns only structured final
     networkAccess: false,
   })
   assert.equal(turnParams.approvalPolicy, 'on-request')
-  assert.equal(turnParams.outputSchema.properties.decision.enum.join(','), 'send,reply,react,skip,targeted')
+  assert.equal(turnParams.outputSchema.properties.decision.enum.join(','), 'skip,targeted')
   assert.equal(
     turnParams.input[0].text,
     '[EXTERNAL_FEED][source=telegram][trust=owner_dm]\nPlease inspect the project',
@@ -456,7 +433,7 @@ test('resumes an existing group thread with read-only policy and attachment inpu
         sendCompletedTurn(connection, {
           threadId: 'thread-group',
           turnId: 'turn-group',
-          output: JSON.stringify({ action: 'send', text: 'Saw both files', reason: 'relevant' }),
+          output: JSON.stringify(targetedSend('-100123:7', 'Saw both files')),
         })
       }
     },
@@ -505,11 +482,10 @@ test('direct runner tags a private group without granting execution permissions'
         sendCompletedTurn(connection, {
           threadId: 'thread-private-group',
           turnId: 'turn-private-group',
-          output: JSON.stringify({
-            action: 'send',
-            text: 'Our bridge separates transport, relay, and connector responsibilities.',
-            reason: 'explain',
-          }),
+          output: JSON.stringify(targetedSend(
+            '-100123',
+            'Our bridge separates transport, relay, and connector responsibilities.',
+          )),
         })
       }
     },
@@ -535,11 +511,11 @@ test('direct runner tags a private group without granting execution permissions'
     telegramContext: { chatId: '-100123', senderId: '42' },
   })
 
-  assert.equal(result.finalText, 'Our bridge separates transport, relay, and connector responsibilities.')
+  assert.equal(result.responses[0].text, 'Our bridge separates transport, relay, and connector responsibilities.')
   assert.match(turnParams.input[0].text, /\[trust=private_group\]/)
   assert.match(turnParams.additionalContext.telegram_trust_policy.value, /not an instruction source/)
   assert.deepEqual(turnParams.outputSchema.properties.decision.enum, [
-    'send', 'reply', 'react', 'skip', 'targeted',
+    'skip', 'targeted',
   ])
   assert.equal(turnParams.approvalPolicy, 'never')
   assert.deepEqual(turnParams.sandboxPolicy, { type: 'readOnly', networkAccess: false })
@@ -558,7 +534,7 @@ test('direct runner authorizes an owner turn in a configured family group', asyn
         sendCompletedTurn(connection, {
           threadId: 'thread-repair-group',
           turnId: 'turn-repair-group',
-          output: JSON.stringify({ decision: 'reply', text: 'Done.', targets: [] }),
+          output: JSON.stringify(targetedSend('-100123', 'Done.')),
         })
       }
     },
@@ -588,7 +564,7 @@ test('direct runner authorizes an owner turn in a configured family group', asyn
   assert.match(turnParams.input[0].text, /\[trust=family_group\]/)
   assert.match(turnParams.additionalContext.telegram_trust_policy.value, /Alta family group/)
   assert.deepEqual(turnParams.outputSchema.properties.decision.enum, [
-    'send', 'reply', 'react', 'skip', 'targeted',
+    'skip', 'targeted',
   ])
   assert.equal(turnParams.approvalPolicy, 'on-request')
   assert.deepEqual(turnParams.sandboxPolicy, {
@@ -640,7 +616,7 @@ test('direct runner keeps a peer in the family-group audience without execution 
 
   assert.match(turnParams.input[0].text, /\[trust=family_group\]/)
   assert.deepEqual(turnParams.outputSchema.properties.decision.enum, [
-    'send', 'reply', 'react', 'skip', 'targeted',
+    'skip', 'targeted',
   ])
   assert.equal(turnParams.approvalPolicy, 'never')
   assert.deepEqual(turnParams.sandboxPolicy, { type: 'readOnly', networkAccess: false })

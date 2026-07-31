@@ -70,8 +70,8 @@ function approvedStandaloneContext(stateStore, conversationKey) {
 
 function outboundActions(stateStore, batchId, jobs, result, nowMs) {
   if (result.action === 'skip') return []
-  if (!['send', 'reply', 'react'].includes(result.action) || typeof result.text !== 'string') {
-    invalidResult('job result must be a send, reply, react, or skip')
+  if (result.action !== 'targeted' || result.text !== '') {
+    invalidResult('job result must be targeted with empty root text, or skip')
   }
   const contexts = jobs.map(job => job.payload?.telegramContext)
   if (contexts.some(context => !context?.chatId || !context?.conversationKey)) {
@@ -88,24 +88,23 @@ function outboundActions(stateStore, batchId, jobs, result, nowMs) {
     }
   }
   const byTarget = new Map()
-  const byMessageId = new Map()
+  const latestMessageIdByConversation = new Map()
   for (const context of contexts.filter(context => context.messageId)) {
     const messageId = String(context.messageId)
     byTarget.set(`${context.conversationKey}\0${messageId}`, context)
-    const matches = byMessageId.get(messageId) ?? []
-    matches.push(context)
-    byMessageId.set(messageId, matches)
+    latestMessageIdByConversation.set(context.conversationKey, messageId)
   }
   const targeted = Array.isArray(result.responses) ? result.responses : []
-  if (targeted.length > 0 && result.text.trim()) {
-    invalidResult('job result cannot combine text with targeted responses')
-  }
+  if (targeted.length === 0) invalidResult('targeted job result requires at least one response')
   const seen = new Set()
   const selected = (targeted.length > 0
       ? targeted.map(response => {
-        const action = response.action ?? 'reply'
+        const action = response.action
         if (!['send', 'reply', 'react', 'dice'].includes(action)) {
           invalidResult('job result targeted action must be send, reply, react, or dice')
+        }
+        if (typeof response.conversationKey !== 'string' || !response.conversationKey) {
+          invalidResult('job result targeted response requires conversationKey')
         }
         if (action === 'send') {
           if (
@@ -129,17 +128,12 @@ function outboundActions(stateStore, batchId, jobs, result, nowMs) {
           }
         }
         const messageId = typeof response?.messageId === 'string' ? response.messageId : ''
-        const conversationKey = typeof response?.conversationKey === 'string'
-          ? response.conversationKey
-          : null
-        const matches = byMessageId.get(messageId) ?? []
-        if (!conversationKey && matches.length > 1) {
-          invalidResult('job result response conversationKey is required for an ambiguous message target')
-        }
-        const context = conversationKey
-          ? byTarget.get(`${conversationKey}\0${messageId}`)
-          : matches[0]
+        const conversationKey = response.conversationKey
+        const context = byTarget.get(`${conversationKey}\0${messageId}`)
         if (!context) invalidResult('job result response target is not in the current batch')
+        if (action === 'reply' && latestMessageIdByConversation.get(conversationKey) === messageId) {
+          invalidResult('job result must send to continue the latest message; reply is only for an older batch message')
+        }
         const targetKey = `${context.conversationKey}\0${messageId}`
         if (seen.has(targetKey)) invalidResult('job result contains a duplicate response target')
         seen.add(targetKey)
@@ -148,13 +142,7 @@ function outboundActions(stateStore, batchId, jobs, result, nowMs) {
         }
         return { context, text: response.text, action, isBig: response.isBig === true }
       })
-    : [{
-        context: result.action === 'send'
-          ? { ...contexts.at(-1), messageId: null }
-          : contexts.at(-1),
-        text: result.text,
-        action: result.action,
-      }])
+    : [])
     .filter(response => response.action !== 'reply' || !isInternalSkipMarker(response.text))
   if (selected.length === 0) return []
   if (selected.some(response => !response.text.trim())) {
@@ -554,7 +542,18 @@ export class RelayProtocolSession {
       this.#state,
       `${batch.batchId}:progress:${progressKey}`,
       jobs,
-      { action: frame.action ?? 'reply', text },
+      {
+        action: 'targeted',
+        text: '',
+        responses: [{
+          conversationKey: requireText(frame.conversationKey, 'conversationKey'),
+          action: frame.action ?? 'reply',
+          messageId: frame.action === 'send'
+            ? null
+            : requireText(frame.messageId, 'messageId'),
+          text,
+        }],
+      },
       this.#clock(),
     )
     for (const action of actions) {

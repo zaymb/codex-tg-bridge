@@ -47,7 +47,17 @@ test('runs Telegram to Codex to Telegram and resumes the thread after runtime re
           id: `item-${turnCounter}`,
           type: 'agentMessage',
           phase: 'final_answer',
-          text: JSON.stringify({ action: 'send', text: `answer-${turnCounter}`, reason: 'test' }),
+          text: JSON.stringify({
+            decision: 'targeted',
+            text: '',
+            targets: [{
+              conversationKey: '42',
+              messageId: null,
+              decision: 'send',
+              text: `answer-${turnCounter}`,
+              big: false,
+            }],
+          }),
         }
         queueMicrotask(() => {
           connection.send({ method: 'item/agentMessage/delta', params: { threadId: 'persistent-thread', turnId, delta: 'partial' } })

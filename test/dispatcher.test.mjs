@@ -76,12 +76,22 @@ class FakeTelegram {
 
   async sendText(payload) {
     this.calls.push({ method: 'sendText', payload })
+    if (this.failNextReply) {
+      const error = this.failNextReply
+      this.failNextReply = null
+      throw error
+    }
     return { message_id: 900 + this.calls.length, chat: { id: payload.chatId } }
   }
 
   async react(payload) {
     this.calls.push({ method: 'react', payload })
     return true
+  }
+
+  async sendDice(payload) {
+    this.calls.push({ method: 'sendDice', payload })
+    return { message_id: 900 + this.calls.length, chat: { id: payload.chatId } }
   }
 
   async downloadFile(fileId) {
@@ -96,7 +106,9 @@ class FakeRunner {
   result = {
     threadId: 'thread-1',
     turnId: 'turn-1',
-    finalText: 'final answer',
+    action: 'targeted',
+    finalText: '',
+    responses: null,
     skipped: false,
     reason: 'reply',
     sentActionIds: [],
@@ -106,7 +118,17 @@ class FakeRunner {
 
   async runTurn(job) {
     this.jobs.push(job)
-    return { ...this.result }
+    const result = { ...this.result }
+    if (!result.skipped && result.action === 'targeted' && result.responses === null) {
+      result.responses = [{
+        conversationKey: job.conversationKey,
+        messageId: null,
+        action: 'send',
+        text: 'final answer',
+        isBig: false,
+      }]
+    }
+    return result
   }
 
   async interrupt(key) {
@@ -140,6 +162,11 @@ function fixture(overrides = {}) {
     async expirePending() { return 0 },
   }
   let now = overrides.nowMs ?? 1_000
+  for (const approved of [
+    { conversationKey: '42', telegramChatId: '42', kind: 'private' },
+    { conversationKey: '-100123', telegramChatId: '-100123', kind: 'group' },
+    { conversationKey: '-100123:7', telegramChatId: '-100123', kind: 'forum_topic' },
+  ]) state.upsertApprovedChat({ ...approved, nowMs: 1 })
   const dispatcher = new Dispatcher({
     stateStore: state,
     telegramClient: telegram,
@@ -167,7 +194,7 @@ function storeAndClaim(state, raw, nowMs = 1_000) {
   return state.claimUpdates({ workerId: 'test-worker', limit: 1, leaseMs: 10_000, nowMs })[0]
 }
 
-test('runs an owner-DM turn and records the automatic final reply once', async t => {
+test('runs an owner-DM turn and records the automatic standalone send once', async t => {
   const { state, telegram, runner, dispatcher } = fixture()
   t.after(() => state.close())
   const row = storeAndClaim(state, rawMessage(1))
@@ -178,10 +205,61 @@ test('runs an owner-DM turn and records the automatic final reply once', async t
   assert.equal(state.getUpdate('1').status, 'completed')
   assert.equal(runner.jobs[0].conversationKey, '42')
   assert.equal(runner.jobs[0].ownerDm, true)
-  assert.equal(telegram.calls.filter(call => call.method === 'reply').length, 1)
-  const outbound = state.getOutboundAction('answer:update:1:0000')
+  assert.equal(telegram.calls.filter(call => call.method === 'sendText').length, 1)
+  const outbound = state.getOutboundAction('targeted:update:1:00:0000')
   assert.equal(outbound.status, 'sent')
   assert.equal(outbound.conversationKey, '42')
+})
+
+test('rejects a root-level send before the direct dispatcher can emit it', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  setup.runner.result = {
+    ...setup.runner.result,
+    action: 'send',
+    finalText: 'root output must not leave the bridge',
+    responses: [],
+  }
+
+  const result = await setup.dispatcher.processClaimedUpdate(
+    storeAndClaim(setup.state, rawMessage(49)),
+  )
+
+  assert.equal(result.status, 'failed')
+  assert.match(result.error.message, /explicitly targeted responses/)
+  assert.equal(setup.state.getUpdate('49').status, 'pending')
+  assert.equal(
+    setup.telegram.calls.some(call => ['reply', 'sendText', 'react', 'sendDice'].includes(call.method)),
+    false,
+  )
+})
+
+test('rejects a targeted reply in the single-update direct dispatcher', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  setup.runner.result = {
+    ...setup.runner.result,
+    action: 'targeted',
+    finalText: '',
+    responses: [{
+      conversationKey: '42',
+      messageId: '500',
+      action: 'reply',
+      text: 'this should have been a standalone send',
+      isBig: false,
+    }],
+  }
+
+  const result = await setup.dispatcher.processClaimedUpdate(
+    storeAndClaim(setup.state, rawMessage(50)),
+  )
+
+  assert.equal(result.status, 'failed')
+  assert.match(result.error.message, /reply is only for an older message/)
+  assert.equal(
+    setup.telegram.calls.some(call => ['reply', 'sendText', 'react', 'sendDice'].includes(call.method)),
+    false,
+  )
 })
 
 test('sends a structured reaction without a text reply', async t => {
@@ -189,8 +267,15 @@ test('sends a structured reaction without a text reply', async t => {
   t.after(() => setup.state.close())
   setup.runner.result = {
     ...setup.runner.result,
-    action: 'react',
-    finalText: '🗿',
+    action: 'targeted',
+    finalText: '',
+    responses: [{
+      conversationKey: '42',
+      messageId: '400',
+      action: 'react',
+      text: '🗿',
+      isBig: false,
+    }],
     reason: 'reaction is enough',
   }
 
@@ -198,7 +283,7 @@ test('sends a structured reaction without a text reply', async t => {
 
   assert.equal(setup.telegram.calls.filter(call => call.method === 'react').length, 1)
   assert.equal(setup.telegram.calls.some(call => ['reply', 'sendText'].includes(call.method)), false)
-  assert.equal(setup.state.getOutboundAction('reaction:update:40').payload.reaction.emoji, '🗿')
+  assert.equal(setup.state.getOutboundAction('reaction:update:40:target:0').payload.reaction.emoji, '🗿')
 })
 
 test('does not send an automatic answer for structured SKIP or an equivalent Telegram tool action', async t => {
@@ -266,7 +351,7 @@ test('only suppresses an automatic answer for an equivalent sent text or reply a
 
       await setup.dispatcher.processClaimedUpdate(storeAndClaim(setup.state, rawMessage(30 + index)))
 
-      assert.equal(setup.telegram.calls.filter(call => call.method === 'reply').length, 1)
+      assert.equal(setup.telegram.calls.filter(call => call.method === 'sendText').length, 1)
     })
   }
 })
@@ -477,7 +562,7 @@ test('marks uncertain sends ambiguous and completes the source update without re
   await setup.dispatcher.processClaimedUpdate(storeAndClaim(setup.state, rawMessage(9)))
 
   assert.equal(setup.state.getUpdate('9').status, 'completed')
-  assert.equal(setup.state.getOutboundAction('answer:update:9:0000').status, 'ambiguous')
+  assert.equal(setup.state.getOutboundAction('targeted:update:9:00:0000').status, 'ambiguous')
   assert.equal(setup.runner.jobs.length, 1)
 })
 
@@ -492,12 +577,12 @@ test('defers a rate-limited outbound action and retries it without another Codex
 
   await setup.dispatcher.processClaimedUpdate(storeAndClaim(setup.state, rawMessage(10)))
   assert.equal(setup.state.getUpdate('10').status, 'completed')
-  assert.equal(setup.state.getOutboundAction('answer:update:10:0000').status, 'failed')
-  assert.equal(setup.state.getOutboundAction('answer:update:10:0000').nextAttemptAtMs, 4_000)
+  assert.equal(setup.state.getOutboundAction('targeted:update:10:00:0000').status, 'failed')
+  assert.equal(setup.state.getOutboundAction('targeted:update:10:00:0000').nextAttemptAtMs, 4_000)
 
   setup.setNow(4_000)
   assert.equal(await setup.dispatcher.drainOutboundOnce(), 1)
-  assert.equal(setup.state.getOutboundAction('answer:update:10:0000').status, 'sent')
+  assert.equal(setup.state.getOutboundAction('targeted:update:10:00:0000').status, 'sent')
   assert.equal(setup.runner.jobs.length, 1)
 })
 

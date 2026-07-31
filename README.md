@@ -24,19 +24,24 @@ both split-host and same-host deployments.
 - An optional shared task admission gate can grant one agent execution
   ownership for an otherwise authorized Telegram message. Other agents still
   receive the message, but their copy is downgraded to read-only permissions.
-- One queued batch can produce a standalone send, an intentional reply or
-  reaction, or multiple targeted actions. A targeted standalone send may name
+- One queued batch can produce one or more explicitly targeted actions. A
+  targeted standalone send may name
   any conversation in the durable approved-chat registry, even when that
   conversation is absent from the current batch. Targeted replies, reactions,
   and animated dice remain limited to exact messages in the current batch.
-  The model selects `send`, `reply`, `react`, `skip`, or `targeted`; the
-  connector mechanically generates the transport envelope.
+  Continuing the latest message or answering a batch as a whole uses a
+  standalone targeted send; reply is reserved for selecting an older message
+  from a multi-message batch.
+  The model selects only `skip` or `targeted`; every outbound target carries
+  its `conversationKey`, and the connector mechanically generates the
+  transport envelope.
 - Pending conversations share one bounded quiet interval and are delivered in
   one source-grouped batch. Each conversation contributes only its first
   contiguous authenticated-sender partition. Owner-DM slash commands bypass
   the wait and remain isolated from ordinary messages.
-- Commentary can produce best-effort progress messages. `send` remains
-  standalone; only an explicit `reply` decision binds progress to a message.
+- Commentary can produce best-effort progress messages only through an
+  explicit targeted send carrying `conversationKey` and `messageId=null`.
+  It uses reply only when selecting an older message from a multi-message batch.
   A final result atomically cancels any undelivered progress so stale status
   text cannot arrive after the answer.
 - Telegram attachments cross split-host relays in bounded, hashed frames.
@@ -56,11 +61,11 @@ both split-host and same-host deployments.
   local Codex client.
 - Telegram destinations are isolated by `conversation_key`: a DM or group uses
   its `chatId`, while a forum topic uses `chatId:threadId`. A batch may span
-  several conversations. Selective replies require both `conversationKey` and
-  `messageId`; an unqualified ambiguous target fails closed. A root `reply`
-  goes only to the globally latest message. A root `send` uses the latest
-  conversation without a reply target. A targeted `send` requires
-  `messageId=null` and a registered approved conversation.
+  several conversations. Every reply, reaction, dice action, and standalone
+  send requires `conversationKey`; replies, reactions, and dice also require
+  `messageId`. Root actions are rejected. A targeted `send` requires
+  `messageId=null` and a registered approved conversation. Reply to the latest
+  message is rejected because a standalone send is the unquoted continuation.
 - Replies are bound to the channel that started the turn. If a local TUI steer
   joins a Telegram-owned turn, the connector fails closed and does not send the
   mixed final answer to Telegram.
@@ -290,7 +295,7 @@ For owner DM, no group configuration is needed. Before group acceptance:
 - Approval callbacks are authorized only in the configured owner's DM and fail
   closed when expired, cancelled, or detached from the active Codex session.
 - The current structured model path is
-  `send/reply/react/skip/targeted(send|reply|react|dice)`; Telegram action tools,
+  `skip/targeted(send|reply|react|dice)`; Telegram action tools,
   attachments, `/stop`, and durable remote approvals use the same outbox and
   routing boundaries.
 

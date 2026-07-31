@@ -49,14 +49,17 @@ function isOwnerCallback(update, ownerUserId) {
     && update.chat?.id === ownerUserId
 }
 
-function hasEquivalentSentAction(state, turn, conversationKey) {
+function hasEquivalentSentResponse(state, turn, response) {
   return (turn.sentActionIds ?? []).some(actionId => {
     const action = state.getOutboundAction(actionId)
-    if (action?.status !== 'sent' || action.conversationKey !== conversationKey) return false
-    if (turn.action === 'react') {
-      return action.actionType === 'react' && action.payload?.reaction?.emoji === turn.finalText
+    if (action?.status !== 'sent' || action.conversationKey !== response.conversationKey) return false
+    if (response.action === 'react') {
+      return action.actionType === 'react' && action.payload?.reaction?.emoji === response.text
     }
-    return ['send_text', 'reply'].includes(action.actionType) && action.payload?.text === turn.finalText
+    if (response.action === 'dice') {
+      return action.actionType === 'send_dice' && action.payload?.emoji === response.text
+    }
+    return ['send_text', 'reply'].includes(action.actionType) && action.payload?.text === response.text
   })
 }
 
@@ -318,15 +321,25 @@ export class Dispatcher {
       if (turn.contextBreak) {
         await this.#sendContextBreakNotice(update, row.updateId, turn.replacedThreadId)
       }
-      const equivalentSent = hasEquivalentSentAction(this.#state, turn, update.conversationKey)
-      if (!turn.skipped && turn.action === 'react' && turn.finalText && !equivalentSent) {
-        await this.#queueReaction(update, row.updateId, turn.finalText)
-      } else if (!turn.skipped && turn.finalText && !equivalentSent) {
-        await this.#queueFinalAnswer(update, row.updateId, turn.finalText)
+      let sent = 0
+      let equivalentSent = false
+      if (!turn.skipped) {
+        if (turn.action !== 'targeted' || !Array.isArray(turn.responses) || turn.responses.length === 0) {
+          throw new Error('Telegram turn must use explicitly targeted responses')
+        }
+        const pending = turn.responses.filter(response => {
+          const equivalent = hasEquivalentSentResponse(this.#state, turn, response)
+          equivalentSent ||= equivalent
+          return !equivalent
+        })
+        sent = await this.#queueTargetedResponses(update, row.updateId, pending)
       }
 
       this.#state.completeUpdate({ updateId: row.updateId, workerId: this.#workerId, nowMs: this.#clock() })
-      return { status: 'completed', action: turn.skipped ? 'skipped' : equivalentSent ? 'tool_sent' : 'answered' }
+      return {
+        status: 'completed',
+        action: turn.skipped ? 'skipped' : sent > 0 ? 'answered' : equivalentSent ? 'tool_sent' : 'skipped',
+      }
     } catch (error) {
       const permanent = error?.turnAccepted === true
         || row.attempts >= 5
@@ -437,12 +450,105 @@ export class Dispatcher {
     await this.#sendOutboundAction(actionId)
   }
 
+  async #queueTargetedResponses(update, updateId, responses) {
+    let sent = 0
+    for (let responseIndex = 0; responseIndex < responses.length; responseIndex += 1) {
+      const response = responses[responseIndex]
+      if (typeof response.conversationKey !== 'string' || !response.conversationKey) {
+        throw new Error('targeted Telegram response requires conversationKey')
+      }
+      if (!['send', 'reply', 'react', 'dice'].includes(response.action)) {
+        throw new Error('unsupported targeted Telegram response action')
+      }
+      if (typeof response.text !== 'string' || !response.text.trim()) {
+        throw new Error('targeted Telegram response text is required')
+      }
+      if (response.action === 'reply') {
+        throw new Error('direct Telegram turns must send; reply is only for an older message in a multi-message batch')
+      }
+      if (response.action !== 'send') {
+        const expectedMessageId = messageIdForReply(update)
+        if (
+          response.conversationKey !== update.conversationKey
+          || response.messageId !== expectedMessageId
+        ) throw new Error('targeted Telegram response does not match the current update')
+      }
+
+      if (response.action === 'react') {
+        await this.#queueReaction(update, `${updateId}:target:${responseIndex}`, response.text)
+        sent += 1
+        continue
+      }
+
+      const group = `targeted:update:${updateId}:${String(responseIndex).padStart(2, '0')}`
+
+      if (response.action === 'dice') {
+        const actionId = `${group}:0000`
+        this.#state.createOutboundAction({
+          actionId,
+          conversationKey: response.conversationKey,
+          actionType: 'send_dice',
+          payload: {
+            chatId: update.chat.id,
+            threadId: topicId(update),
+            replyToMessageId: response.messageId,
+            emoji: response.text.trim(),
+          },
+          sequenceGroup: group,
+          sequenceIndex: 0,
+          nowMs: this.#clock(),
+        })
+        await this.#sendOutboundAction(actionId)
+        sent += 1
+        continue
+      }
+
+      if (response.action === 'send' && response.messageId !== null) {
+        throw new Error('targeted standalone send requires messageId=null')
+      }
+      const approved = response.action === 'send'
+        ? this.#state.getApprovedChat(response.conversationKey)
+        : null
+      if (response.action === 'send' && !approved) {
+        throw new Error('targeted Telegram response is not an approved conversation')
+      }
+      const chatId = response.action === 'send' ? approved.telegramChatId : update.chat.id
+      const threadId = response.action === 'send' && approved.kind === 'forum_topic'
+        ? response.conversationKey.slice(`${approved.telegramChatId}:`.length)
+        : topicId(update)
+      const chunks = splitTelegramText(response.text)
+      for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex += 1) {
+        const first = chunkIndex === 0
+        const actionId = `${group}:${String(chunkIndex).padStart(4, '0')}`
+        this.#state.createOutboundAction({
+          actionId,
+          conversationKey: response.conversationKey,
+          actionType: response.action === 'reply' && first ? 'reply' : 'send_text',
+          payload: {
+            chatId,
+            messageId: response.action === 'reply' && first ? response.messageId : null,
+            threadId,
+            text: chunks[chunkIndex],
+          },
+          sequenceGroup: group,
+          sequenceIndex: chunkIndex,
+          nowMs: this.#clock(),
+        })
+        const status = await this.#sendOutboundAction(actionId)
+        if (status !== 'sent') break
+        sent += 1
+      }
+    }
+    return sent
+  }
+
   async #executeOutbound(action) {
     if (action.actionType === 'reply') return this.#telegram.reply(action.payload)
     if (action.actionType === 'send_text') return this.#telegram.sendText(action.payload)
     if (action.actionType === 'edit_own_message') return this.#telegram.editOwnMessage(action.payload)
     if (action.actionType === 'delete_own_message') return this.#telegram.deleteOwnMessage(action.payload)
     if (action.actionType === 'react') return this.#telegram.react(action.payload)
+    if (action.actionType === 'send_dice') return this.#telegram.sendDice(action.payload)
     if (action.actionType === 'send_file') {
       return this.#telegram.sendFile({
         ...action.payload,
@@ -569,9 +675,14 @@ export class Dispatcher {
       if (turn.contextBreak) {
         await this.#sendContextBreakNotice(syntheticUpdate, `wake-${wake.id}`, turn.replacedThreadId)
       }
-      const equivalentSent = hasEquivalentSentAction(this.#state, turn, wake.conversationKey)
-      if (!turn.skipped && turn.finalText && !equivalentSent) {
-        await this.#queueFinalAnswer(syntheticUpdate, `wake-${wake.id}`, turn.finalText)
+      if (!turn.skipped) {
+        if (turn.action !== 'targeted' || !Array.isArray(turn.responses) || turn.responses.length === 0) {
+          throw new Error('Telegram turn must use explicitly targeted responses')
+        }
+        const pending = turn.responses.filter(
+          response => !hasEquivalentSentResponse(this.#state, turn, response),
+        )
+        await this.#queueTargetedResponses(syntheticUpdate, `wake-${wake.id}`, pending)
       }
       this.#state.completeWake({ id: wake.id, workerId: this.#workerId, nowMs: this.#clock() })
       return { status: 'completed' }

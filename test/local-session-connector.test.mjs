@@ -169,6 +169,14 @@ function batch() {
   }
 }
 
+function targeted(conversationKey, messageId, decision, text, big = false) {
+  return {
+    decision: 'targeted',
+    text: '',
+    targets: [{ conversationKey, messageId, decision, text, big }],
+  }
+}
+
 function topicBatch() {
   return {
     version: 1,
@@ -351,7 +359,7 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
   assert.equal('cwd' in started.params, false)
   assert.equal(started.params.approvalPolicy, 'never')
   assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
-  assert.equal(started.params.outputSchema.properties.decision.enum.join(','), 'send,reply,react,skip,targeted')
+  assert.equal(started.params.outputSchema.properties.decision.enum.join(','), 'skip,targeted')
   assert.deepEqual(JSON.parse(started.params.additionalContext.telegram.value), {
     source: 'telegram',
     transportStatus: 'connected',
@@ -406,8 +414,8 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
         action: 'send',
         text: '',
         responses: [
-          { messageId: '10', action: 'send', text: 'first answer' },
-          { messageId: '11', action: 'send', text: 'second answer' },
+          { conversationKey: '42', messageId: '10', action: 'send', text: 'first answer' },
+          { conversationKey: '42', messageId: '11', action: 'send', text: 'second answer' },
         ],
         reason: 'done',
       }),
@@ -425,11 +433,11 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
     batchId: 'batch:telegram:1:telegram:2',
     turnId: 'turn-tg',
     result: {
-      action: 'send',
+      action: 'targeted',
       text: '',
       responses: [
-        { messageId: '10', action: 'reply', text: 'first answer' },
-        { messageId: '11', action: 'reply', text: 'second answer' },
+        { conversationKey: '42', messageId: '10', action: 'reply', text: 'first answer' },
+        { conversationKey: '42', messageId: '11', action: 'reply', text: 'second answer' },
       ],
       reason: 'done',
     },
@@ -770,7 +778,7 @@ test('shows the stable topic name beside its conversation key', async t => {
   )
 })
 
-test('forwards plain commentary immediately without treating it as the final answer', async t => {
+test('does not forward plain commentary without an explicit conversation key', async t => {
   const setup = fixture()
   t.after(() => setup.connector.close())
   await setup.connector.start()
@@ -789,15 +797,7 @@ test('forwards plain commentary immediately without treating it as the final ans
   })
   await setup.connector.idle()
 
-  assert.deepEqual(setup.relay.frames.at(-1), {
-    version: 1,
-    type: 'job_progress',
-    batchId: 'batch:telegram:1:telegram:2',
-    turnId: 'turn-tg',
-    progressId: 'commentary-envelope',
-    action: 'send',
-    text: 'work is in progress',
-  })
+  assert.equal(setup.relay.frames.some(frame => frame.type === 'job_progress'), false)
 
   setup.app.emit('notification:turn/completed', {
     threadId: 'thread-a',
@@ -837,8 +837,8 @@ test('forwards only the first structured commentary decision as progress', async
           text: '',
           targets: [{
             conversationKey: '42',
-            messageId: '11',
-            decision: 'reply',
+            messageId: null,
+            decision: 'send',
             text,
             big: false,
           }],
@@ -856,7 +856,9 @@ test('forwards only the first structured commentary decision as progress', async
       batchId: 'batch:telegram:1:telegram:2',
       turnId: 'turn-tg',
       progressId: 'commentary-first',
-      action: 'reply',
+      action: 'send',
+      conversationKey: '42',
+      messageId: null,
       text: 'I will inspect the active connector and its tests first.',
     }],
   )
@@ -997,7 +999,7 @@ test('injects independent reply and execution capabilities with a fixed decision
     mayExecute: false,
   }])
   assert.deepEqual(started.params.outputSchema.properties.decision.enum, [
-    'send', 'reply', 'react', 'skip', 'targeted',
+    'skip', 'targeted',
   ])
   assert.equal(started.params.outputSchema.properties.action, undefined)
   assert.match(started.params.additionalContext.telegram_output_contract.value, /mayReply.*independent.*mayExecute/iu)
@@ -1018,7 +1020,7 @@ test('passes public conversational replies through without canned disclosure rep
     item: {
       type: 'agentMessage',
       phase: 'final_answer',
-      text: JSON.stringify({ decision: 'reply', text, targets: [] }),
+      text: JSON.stringify(targeted('42', '11', 'reply', text)),
     },
   })
   setup.app.emit('notification:turn/completed', {
@@ -1032,11 +1034,16 @@ test('passes public conversational replies through without canned disclosure rep
     type: 'job_result',
     batchId: 'batch:telegram:1:telegram:2',
     turnId: 'turn-tg',
-    result: { action: 'reply', text, responses: [], reason: 'model_selected_reply' },
+    result: {
+      action: 'targeted',
+      text: '',
+      responses: [{ conversationKey: '42', messageId: '11', action: 'reply', text, isBig: false }],
+      reason: 'model_selected_targeted',
+    },
   })
 })
 
-test('preserves an explicit standalone-send decision without auto-binding it as a reply', async t => {
+test('preserves an explicitly targeted standalone send', async t => {
   const setup = fixture()
   t.after(() => setup.connector.close())
   await setup.connector.start()
@@ -1049,7 +1056,7 @@ test('preserves an explicit standalone-send decision without auto-binding it as 
     item: {
       type: 'agentMessage',
       phase: 'final_answer',
-      text: JSON.stringify({ decision: 'send', text: 'standalone update', targets: [] }),
+      text: JSON.stringify(targeted('-100123', null, 'send', 'standalone update')),
     },
   })
   setup.app.emit('notification:turn/completed', {
@@ -1064,10 +1071,16 @@ test('preserves an explicit standalone-send decision without auto-binding it as 
     batchId: 'batch:telegram:private-group',
     turnId: 'turn-tg',
     result: {
-      action: 'send',
-      text: 'standalone update',
-      responses: [],
-      reason: 'model_selected_send',
+      action: 'targeted',
+      text: '',
+      responses: [{
+        conversationKey: '-100123',
+        messageId: null,
+        action: 'send',
+        text: 'standalone update',
+        isBig: false,
+      }],
+      reason: 'model_selected_targeted',
     },
   })
 })
@@ -1125,7 +1138,7 @@ test('owner-authored family-group turns receive configured execution permissions
     { conversationKey: '-100123', messageId: '14' },
   ])
   assert.deepEqual(started.params.outputSchema.properties.decision.enum, [
-    'send', 'reply', 'react', 'skip', 'targeted',
+    'skip', 'targeted',
   ])
   assert.equal(started.params.approvalPolicy, 'never')
   assert.deepEqual(started.params.sandboxPolicy, { type: 'dangerFullAccess' })
@@ -1208,7 +1221,7 @@ test('peer-bot turns share the family-group audience but remain non-authoritativ
   assert.equal(telegram.messages[0].admin, false)
   assert.equal(telegram.messages[0].executable, false)
   assert.deepEqual(started.params.outputSchema.properties.decision.enum, [
-    'send', 'reply', 'react', 'skip', 'targeted',
+    'skip', 'targeted',
   ])
   assert.deepEqual(JSON.parse(started.params.additionalContext.telegram_authorization.value).authorizedMessages, [])
   assert.equal(started.params.approvalPolicy, 'never')
@@ -1272,12 +1285,12 @@ test('preserves a concrete peer-work question instead of rewriting it to a canne
     item: {
       type: 'agentMessage',
       phase: 'final_answer',
-      text: JSON.stringify({
-        action: 'send',
-        text: '酪建议把 recall 写进 directive，现在加吗？',
-        responses: [],
-        reason: 'request_owner_authorization',
-      }),
+      text: JSON.stringify(targeted(
+        '-100123',
+        null,
+        'send',
+        '酪建议把 recall 写进 directive，现在加吗？',
+      )),
     },
   })
   setup.app.emit('notification:turn/completed', {
@@ -1292,10 +1305,16 @@ test('preserves a concrete peer-work question instead of rewriting it to a canne
     batchId: 'batch:telegram:repair-group:peer',
     turnId: 'turn-tg',
     result: {
-      action: 'send',
-      text: '酪建议把 recall 写进 directive，现在加吗？',
-      responses: [],
-      reason: 'request_owner_authorization',
+      action: 'targeted',
+      text: '',
+      responses: [{
+        conversationKey: '-100123',
+        messageId: null,
+        action: 'send',
+        text: '酪建议把 recall 写进 directive，现在加吗？',
+        isBig: false,
+      }],
+      reason: 'model_selected_targeted',
     },
   })
 })
@@ -1694,7 +1713,11 @@ test('materializes relayed photos before starting Codex and keeps base64 out of 
     turn: {
       id: 'turn-tg',
       status: 'completed',
-      items: [{ type: 'agentMessage', phase: 'final_answer', text: '{"action":"send","text":"done","responses":[]}' }],
+      items: [{
+        type: 'agentMessage',
+        phase: 'final_answer',
+        text: JSON.stringify({ decision: 'skip', text: '', targets: [] }),
+      }],
     },
   })
   await setup.connector.idle()
@@ -1881,7 +1904,7 @@ test('surfaces a transport disengage without touching the standalone Codex sessi
   assert.equal(setup.app.calls.filter(call => call.method === 'turn/start').length, 0)
 })
 
-test('returns a first-class reaction result without a text reply', async t => {
+test('returns an explicitly targeted reaction result without a text reply', async t => {
   const setup = fixture()
   t.after(() => setup.connector.close())
   await setup.connector.start()
@@ -1894,7 +1917,7 @@ test('returns a first-class reaction result without a text reply', async t => {
     item: {
       type: 'agentMessage',
       phase: 'final_answer',
-      text: JSON.stringify({ action: 'react', text: '🗿', responses: [], reason: 'reaction is enough' }),
+      text: JSON.stringify(targeted('42', '11', 'react', '🗿')),
     },
   })
   setup.app.emit('notification:turn/completed', {
@@ -1908,7 +1931,18 @@ test('returns a first-class reaction result without a text reply', async t => {
     type: 'job_result',
     batchId: 'batch:telegram:1:telegram:2',
     turnId: 'turn-tg',
-    result: { action: 'react', text: '🗿', responses: [], reason: 'reaction is enough' },
+    result: {
+      action: 'targeted',
+      text: '',
+      responses: [{
+        conversationKey: '42',
+        messageId: '11',
+        action: 'react',
+        text: '🗿',
+        isBig: false,
+      }],
+      reason: 'model_selected_targeted',
+    },
   })
 })
 

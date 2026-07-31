@@ -397,32 +397,26 @@ export class LocalSessionConnector extends EventEmitter {
 
     const parsed = params.item.text.trimStart().startsWith('{')
       ? parseTelegramStructuredOutput(params.item.text)
-      : {
-          action: 'send',
-          skipped: false,
-          finalText: params.item.text,
-          responses: [],
-          reason: 'commentary_progress',
-        }
+      : { invalid: true }
     if (parsed.invalid || parsed.skipped) return
     const output = parsed
     const targetedResponses = output.responses ?? []
-    const targetedReplies = targetedResponses.filter(response => {
-      if (response.action !== 'reply' || !response.text?.trim()) return false
+    const eligibleProgress = targetedResponses.filter(response => {
+      if (!response.text?.trim() || !['send', 'reply'].includes(response.action)) return false
       return this.#currentJob.jobs.some(job => {
         const context = job.payload?.telegramContext ?? {}
-        return String(context.conversationKey ?? context.chatId) === response.conversationKey
-          && String(context.messageId) === response.messageId
+        if (String(context.conversationKey ?? context.chatId) !== response.conversationKey) {
+          return false
+        }
+        return response.action === 'send'
+          ? response.messageId === null
+          : String(context.messageId) === response.messageId
       })
     })
-    const rootProgress = ['send', 'reply'].includes(output.action) && output.finalText?.trim()
-      ? { action: output.action, text: output.finalText }
+    const targetedProgress = targetedResponses.length === 1 && eligibleProgress.length === 1
+      ? eligibleProgress[0]
       : null
-    const targetedProgress = targetedResponses.length === 1 && targetedReplies.length === 1
-      ? { action: 'reply', text: targetedReplies[0].text }
-      : null
-    const progress = rootProgress
-      ?? targetedProgress
+    const progress = targetedProgress
     const progressText = progress?.text
     if (!progressText) {
       if (targetedResponses.length > 0) {
@@ -439,6 +433,8 @@ export class LocalSessionConnector extends EventEmitter {
       turnId: params.turnId,
       progressId,
       action: progress.action,
+      conversationKey: progress.conversationKey,
+      messageId: progress.messageId,
       text: progressText,
     }))
   }
@@ -512,19 +508,12 @@ export class LocalSessionConnector extends EventEmitter {
                 turnId: turn.id,
                 result: output.skipped
                   ? { action: 'skip', reason: output.reason }
-                  : ['send', 'reply', 'react'].includes(output.action)
-                    ? {
-                        action: output.action,
-                        text: output.finalText,
-                        responses: output.responses,
-                        reason: output.reason,
-                      }
-                    : {
-                        action: 'reply',
-                        text: output.finalText,
-                        responses: output.responses,
-                        reason: output.reason,
-                      },
+                  : {
+                      action: 'targeted',
+                      text: output.finalText,
+                      responses: output.responses,
+                      reason: output.reason,
+                    },
               }))
             }
           }

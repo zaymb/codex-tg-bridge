@@ -44,6 +44,16 @@ function enqueue(
   contextOverrides = {},
   payloadOverrides = {},
 ) {
+  const chatId = String(contextOverrides.chatId ?? conversationKey.split(':')[0])
+  const threadId = contextOverrides.threadId ?? (conversationKey.includes(':')
+    ? conversationKey.slice(conversationKey.indexOf(':') + 1)
+    : null)
+  state.upsertApprovedChat({
+    conversationKey,
+    telegramChatId: chatId,
+    kind: threadId === null ? (chatId.startsWith('-') ? 'group' : 'private') : 'forum_topic',
+    nowMs,
+  })
   state.enqueueRelayJob({
     jobId: `telegram:${updateId}`,
     sourceType: 'telegram',
@@ -63,6 +73,14 @@ function enqueue(
     expiresAtMs: nowMs + 86_400_000,
     nowMs,
   })
+}
+
+function targetedResult(responses) {
+  return { action: 'targeted', text: '', responses }
+}
+
+function targetedResponse(conversationKey, messageId, text, action = 'reply', fields = {}) {
+  return { conversationKey, messageId, action, text, ...fields }
 }
 
 test('waits for a quiet interval and resets it when a follow-up arrives', async t => {
@@ -467,7 +485,7 @@ test('fails only the poison attachment job and keeps the relay usable', async t 
   assert.deepEqual(setup.frames.at(-1).batch.jobs.map(job => job.jobId), ['telegram:92'])
 })
 
-test('records one final reply for the batch using the latest Telegram message', async t => {
+test('records one explicitly targeted standalone send for the batch', async t => {
   const setup = fixture()
   t.after(() => setup.state.close())
   enqueue(setup.state, '1', '42', 1_000)
@@ -488,21 +506,57 @@ test('records one final reply for the batch using the latest Telegram message', 
     type: 'job_result',
     batchId,
     turnId: 'turn-a',
-    result: { action: 'reply', text: 'one final answer' },
+    result: targetedResult([
+      targetedResponse('42', null, 'one final answer', 'send'),
+    ]),
   })
 
   assert.equal(setup.state.getRelayJob('telegram:1').status, 'completed')
   assert.equal(setup.state.getRelayJob('telegram:2').status, 'completed')
   const outbound = setup.state.getOutboundAction(`relay-batch:${batchId}:0000`)
-  assert.equal(outbound.actionType, 'reply')
-  assert.equal(outbound.payload.messageId, '20')
+  assert.equal(outbound.actionType, 'send_text')
+  assert.equal(outbound.payload.messageId, null)
   assert.equal(outbound.payload.text, 'one final answer')
   assert.equal(setup.frames.at(-1).type, 'job_recorded')
   assert.deepEqual(setup.frames.at(-1).jobIds, ['telegram:1', 'telegram:2'])
   assert.equal(setup.frames.at(-1).status, 'completed')
 })
 
-test('records a standalone root send without binding it to the latest message', async t => {
+test('rejects reply to the latest message while allowing reply to an older batch message', async t => {
+  const setup = fixture()
+  t.after(() => setup.state.close())
+  enqueue(setup.state, '1', '42', 1_000)
+  enqueue(setup.state, '2', '42', 1_001)
+  await hello(setup)
+  await setup.session.claimOnce()
+  const { batchId } = setup.frames.at(-1).batch
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_accepted',
+    batchId,
+    threadId: 'thread-a',
+    turnId: 'turn-a',
+  })
+
+  await setup.session.handleFrame({
+    version: 1,
+    type: 'job_result',
+    batchId,
+    turnId: 'turn-a',
+    result: targetedResult([
+      targetedResponse('42', '20', 'latest should be a send'),
+    ]),
+  })
+
+  assert.equal(setup.state.getRelayJob('telegram:1').status, 'failed')
+  assert.match(
+    setup.state.getRelayJob('telegram:1').lastError,
+    /send to continue the latest message/,
+  )
+  assert.equal(setup.state.getOutboundAction(`relay-batch:${batchId}:0000`), null)
+})
+
+test('rejects a standalone root send without an explicit conversation key', async t => {
   const setup = fixture()
   t.after(() => setup.state.close())
   enqueue(setup.state, '1', '42', 1_000)
@@ -526,11 +580,9 @@ test('records a standalone root send without binding it to the latest message', 
     result: { action: 'send', text: 'standalone answer' },
   })
 
-  const outbound = setup.state.getOutboundAction(`relay-batch:${batchId}:0000`)
-  assert.equal(outbound.actionType, 'send_text')
-  assert.equal(outbound.payload.messageId, null)
-  assert.equal(outbound.payload.chatId, '42')
-  assert.equal(outbound.payload.text, 'standalone answer')
+  assert.equal(setup.state.getOutboundAction(`relay-batch:${batchId}:0000`), null)
+  assert.equal(setup.state.getRelayJob('telegram:1').status, 'failed')
+  assert.match(setup.state.getRelayJob('telegram:1').lastError, /targeted.*empty root text/u)
 })
 
 test('reports confirmed Telegram delivery back to the connected local session', async t => {
@@ -552,7 +604,9 @@ test('reports confirmed Telegram delivery back to the connected local session', 
     type: 'job_result',
     batchId,
     turnId: 'turn-a',
-    result: { action: 'reply', text: 'delivered answer' },
+    result: targetedResult([
+      targetedResponse('42', null, 'delivered answer', 'send'),
+    ]),
   })
 
   const actionId = `relay-batch:${batchId}:0000`
@@ -601,7 +655,9 @@ test('reports terminal Telegram delivery failure instead of silently completing'
     type: 'job_result',
     batchId,
     turnId: 'turn-a',
-    result: { action: 'reply', text: 'undelivered answer' },
+    result: targetedResult([
+      targetedResponse('42', null, 'undelivered answer', 'send'),
+    ]),
   })
 
   const actionId = `relay-batch:${batchId}:0000`
@@ -626,7 +682,7 @@ test('reports terminal Telegram delivery failure instead of silently completing'
   })
 })
 
-test('queues an in-progress reply without completing the accepted batch', async t => {
+test('queues an in-progress send without completing the accepted batch', async t => {
   const setup = fixture()
   t.after(() => setup.state.close())
   enqueue(setup.state, '1', '42', 1_000)
@@ -648,6 +704,9 @@ test('queues an in-progress reply without completing the accepted batch', async 
     batchId,
     turnId: 'turn-a',
     progressId: 'commentary-1',
+    conversationKey: '42',
+    messageId: null,
+    action: 'send',
     text: 'work is in progress',
   })
 
@@ -659,8 +718,8 @@ test('queues an in-progress reply without completing the accepted batch', async 
     nowMs: 1_000,
   })
   assert.equal(outbound.length, 1)
-  assert.equal(outbound[0].actionType, 'reply')
-  assert.equal(outbound[0].payload.messageId, '20')
+  assert.equal(outbound[0].actionType, 'send_text')
+  assert.equal(outbound[0].payload.messageId, null)
   assert.equal(outbound[0].payload.text, 'work is in progress')
   assert.equal(setup.frames.some(frame => frame.type === 'job_recorded'), false)
 })
@@ -685,6 +744,9 @@ test('a final result supersedes progress that has not been delivered', async t =
     batchId,
     turnId: 'turn-a',
     progressId: 'commentary-1',
+    conversationKey: '42',
+    messageId: null,
+    action: 'send',
     text: 'work is in progress',
   })
 
@@ -700,7 +762,9 @@ test('a final result supersedes progress that has not been delivered', async t =
     type: 'job_result',
     batchId,
     turnId: 'turn-a',
-    result: { action: 'reply', text: 'final answer' },
+    result: targetedResult([
+      targetedResponse('42', null, 'final answer', 'send'),
+    ]),
   })
 
   const progress = setup.state.getOutboundAction(progressId)
@@ -710,7 +774,7 @@ test('a final result supersedes progress that has not been delivered', async t =
   assert.equal(setup.state.getOutboundAction(`relay-batch:${batchId}:0000`).status, 'pending')
 })
 
-test('records a first-class reaction against the latest Telegram message', async t => {
+test('records a first-class reaction against an explicit Telegram target', async t => {
   const setup = fixture()
   t.after(() => setup.state.close())
   enqueue(setup.state, '1', '42', 1_000)
@@ -729,7 +793,9 @@ test('records a first-class reaction against the latest Telegram message', async
     type: 'job_result',
     batchId,
     turnId: 'turn-a',
-    result: { action: 'react', text: '🗿' },
+    result: targetedResult([
+      targetedResponse('42', '10', '🗿', 'react'),
+    ]),
   })
 
   const outbound = setup.state.getOutboundAction(`relay-batch:${batchId}:0000`)
@@ -765,11 +831,11 @@ test('records selective targeted responses to messages from the same batch', asy
     batchId,
     turnId: 'turn-a',
     result: {
-      action: 'reply',
+      action: 'targeted',
       text: '',
       responses: [
-        { messageId: '10', text: 'first targeted answer' },
-        { messageId: '20', text: 'second targeted answer' },
+        targetedResponse('42', '10', 'first targeted answer'),
+        targetedResponse('42', null, 'second targeted answer', 'send'),
       ],
     },
   })
@@ -779,8 +845,8 @@ test('records selective targeted responses to messages from the same batch', asy
   assert.equal(first.actionType, 'reply')
   assert.equal(first.payload.messageId, '10')
   assert.equal(first.payload.text, 'first targeted answer')
-  assert.equal(second.actionType, 'reply')
-  assert.equal(second.payload.messageId, '20')
+  assert.equal(second.actionType, 'send_text')
+  assert.equal(second.payload.messageId, null)
   assert.equal(second.payload.text, 'second targeted answer')
 })
 
@@ -815,7 +881,7 @@ test('sends standalone messages to approved conversations outside the current ba
     batchId,
     turnId: 'turn-a',
     result: {
-      action: 'reply',
+      action: 'targeted',
       text: '',
       responses: [
         {
@@ -874,9 +940,9 @@ test('preserves the large-animation flag for a targeted reaction', async t => {
     batchId,
     turnId: 'turn-a',
     result: {
-      action: 'reply',
+      action: 'targeted',
       text: '',
-      responses: [{ messageId: '31', action: 'react', text: '🎉', isBig: true }],
+      responses: [targetedResponse('42', '31', '🎉', 'react', { isBig: true })],
     },
   })
 
@@ -905,9 +971,9 @@ test('records a targeted Telegram dice response with reply routing', async t => 
     batchId,
     turnId: 'turn-a',
     result: {
-      action: 'reply',
+      action: 'targeted',
       text: '',
-      responses: [{ messageId: '32', action: 'dice', text: '🎳' }],
+      responses: [targetedResponse('42', '32', '🎳', 'dice')],
     },
   })
 
@@ -945,12 +1011,12 @@ test('routes identical message IDs independently across one mixed-source batch',
     batchId,
     turnId: 'turn-a',
     result: {
-      action: 'reply',
+      action: 'targeted',
       text: '',
       responses: [
-        { conversationKey: '42', messageId: '7', text: 'answer-0' },
-        { conversationKey: '-1001', messageId: '7', text: 'answer-1' },
-        { conversationKey: '-1001:9', messageId: '7', text: 'answer-2' },
+        targetedResponse('42', '7', '👍', 'react'),
+        targetedResponse('-1001', '7', '👍', 'react'),
+        targetedResponse('-1001:9', '7', '👍', 'react'),
       ],
     },
   })
@@ -962,13 +1028,14 @@ test('routes identical message IDs independently across one mixed-source batch',
   ]
   for (let index = 0; index < expected.length; index += 1) {
     const outbound = setup.state.getOutboundAction(`relay-batch:${batchId}:${String(index).padStart(4, '0')}`)
+    assert.equal(outbound.actionType, 'react')
     assert.equal(outbound.payload.chatId, expected[index].chatId)
     assert.equal(outbound.payload.threadId, expected[index].threadId)
     assert.equal(outbound.payload.messageId, '7')
   }
 })
 
-test('rejects an ambiguous target in a mixed-source batch without a conversation key', async t => {
+test('rejects a target without a conversation key', async t => {
   const setup = fixture()
   t.after(() => setup.state.close())
   enqueue(setup.state, '1', '42', 1_000, { chatId: '42', messageId: '7' })
@@ -989,17 +1056,17 @@ test('rejects an ambiguous target in a mixed-source batch without a conversation
     batchId,
     turnId: 'turn-a',
     result: {
-      action: 'reply',
+      action: 'targeted',
       text: '',
-      responses: [{ messageId: '7', text: 'ambiguous' }],
+      responses: [{ messageId: '7', action: 'reply', text: 'ambiguous' }],
     },
   })
 
   assert.equal(setup.state.getRelayJob('telegram:1').status, 'failed')
-  assert.match(setup.state.getRelayJob('telegram:1').lastError, /conversationKey.*ambiguous/u)
+  assert.match(setup.state.getRelayJob('telegram:1').lastError, /requires conversationKey/u)
 })
 
-test('routes a root reply to the latest message across all sources', async t => {
+test('rejects a root reply instead of routing it to the latest source', async t => {
   const setup = fixture()
   t.after(() => setup.state.close())
   enqueue(setup.state, '1', '42', 1_000, { chatId: '42', messageId: '10' })
@@ -1022,9 +1089,9 @@ test('routes a root reply to the latest message across all sources', async t => 
     result: { action: 'reply', text: 'latest only' },
   })
 
-  const outbound = setup.state.getOutboundAction(`relay-batch:${batchId}:0000`)
-  assert.equal(outbound.conversationKey, '-1001')
-  assert.equal(outbound.payload.messageId, '20')
+  assert.equal(setup.state.getOutboundAction(`relay-batch:${batchId}:0000`), null)
+  assert.equal(setup.state.getRelayJob('telegram:1').status, 'failed')
+  assert.match(setup.state.getRelayJob('telegram:1').lastError, /targeted.*empty root text/u)
 })
 
 test('rejects reply context that disagrees with the durable conversation key', async t => {
@@ -1051,7 +1118,9 @@ test('rejects reply context that disagrees with the durable conversation key', a
     type: 'job_result',
     batchId,
     turnId: 'turn-a',
-    result: { action: 'reply', text: 'must not cross chats' },
+    result: targetedResult([
+      targetedResponse('-1001', '7', 'must not cross chats'),
+    ]),
   }), /does not match its conversation/)
 })
 
@@ -1059,14 +1128,14 @@ test('fails targeted responses outside the current batch and duplicate targets',
   const cases = [
     {
       name: 'outside batch',
-      responses: [{ messageId: '999', text: 'wrong target' }],
+      responses: [targetedResponse('42', '999', 'wrong target')],
       error: /current batch/,
     },
     {
       name: 'duplicate target',
       responses: [
-        { messageId: '10', text: 'one' },
-        { messageId: '10', text: 'two' },
+        targetedResponse('42', '10', '👍', 'react'),
+        targetedResponse('42', '10', '🔥', 'react'),
       ],
       error: /duplicate/,
     },
@@ -1092,7 +1161,7 @@ test('fails targeted responses outside the current batch and duplicate targets',
         type: 'job_result',
         batchId,
         turnId: 'turn-a',
-        result: { action: 'reply', text: '', responses: testCase.responses },
+        result: targetedResult(testCase.responses),
       })
 
       const job = setup.state.getRelayJob('telegram:1')
@@ -1126,7 +1195,7 @@ test('rejects standalone sends to conversations outside the approved registry', 
     batchId,
     turnId: 'turn-a',
     result: {
-      action: 'reply',
+      action: 'targeted',
       text: '',
       responses: [{
         conversationKey: '-100999',
@@ -1171,15 +1240,15 @@ test('fails only the accepted batch when a model result is malformed', async t =
     batchId,
     turnId: 'turn-a',
     result: {
-      action: 'reply',
+      action: 'targeted',
       text: 'duplicate answer',
-      responses: [{ messageId: '10', text: 'duplicate answer' }],
+      responses: [targetedResponse('42', '10', 'duplicate answer')],
     },
   })
 
   const job = setup.state.getRelayJob('telegram:1')
   assert.equal(job.status, 'failed')
-  assert.match(job.lastError, /cannot combine text with targeted responses/)
+  assert.match(job.lastError, /empty root text/)
   assert.equal(setup.frames.at(-1).type, 'job_recorded')
   assert.equal(setup.session.ready, true)
 })
@@ -1261,7 +1330,7 @@ test('fails closed when an older connector submits a bare SKIP reply', async t =
     result: { action: 'reply', text: 'SKIP' },
   })
 
-  assert.equal(setup.state.getRelayJob('telegram:1').status, 'completed')
+  assert.equal(setup.state.getRelayJob('telegram:1').status, 'failed')
   assert.equal(setup.state.claimDueOutboundActions({ workerId: 'probe', limit: 10, nowMs: 1_000 }).length, 0)
 })
 

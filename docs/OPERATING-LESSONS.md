@@ -13,10 +13,15 @@ it before model execution:
 - `conversationKey = chatId:threadId` for a forum topic.
 - `messageId` is meaningful only inside its original chat.
 
-Batches contain exactly one `conversationKey`. Model output never supplies an
-arbitrary destination chat. A targeted response may name only a `messageId`
-from the accepted batch; the relay resolves `chatId`, `threadId`, and
-`conversationKey` from durable inbound context and rejects disagreements.
+Batches may contain more than one `conversationKey`. Every model-selected
+outbound action must name its `conversationKey`; replies, reactions, and dice
+must also name a `messageId` from the accepted batch. Standalone sends may name
+only a conversation in the durable approved-chat registry. The relay resolves
+`chatId` and `threadId` from durable context and rejects missing or disagreeing
+routing data. The unquoted continuation of the latest message—or of the batch
+as a whole—is a targeted standalone send with `messageId=null`. Reply is only
+for selecting an older message from a multi-message batch; the relay rejects a
+reply aimed at the latest message.
 
 ## Treat Shared Turns As Mixed-Source
 
