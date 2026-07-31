@@ -6,7 +6,11 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-import { ConnectorSupervisor, createChannelStatusWriter } from './connector-supervisor.mjs'
+import {
+  ConnectorSupervisor,
+  createChannelStatusWriter,
+  createConnectorFailureWriter,
+} from './connector-supervisor.mjs'
 import { isMainModule } from './main-module.mjs'
 
 const bridgeRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -140,6 +144,10 @@ export async function main(
     bridgeRoot,
     local.statusPath ?? '.state/channel-status.json',
   ))
+  const writeConnectorFailure = createConnectorFailureWriter(resolve(
+    bridgeRoot,
+    local.failureLogPath ?? '.state/connector-failures.jsonl',
+  ))
   const writeStatus = status => writeChannelStatus({
     ...status,
     sessionLabel: local.sessionLabel,
@@ -222,6 +230,7 @@ export async function main(
           .join('; ')
         process.stderr.write(`\n[Telegram delivery ${receipt.status}] ${detail || receipt.batchId}\n`)
       },
+      failureWriter: writeConnectorFailure,
       reconnectInitialMs: local.reconnectInitialMs ?? 1_000,
       reconnectMaxMs: local.reconnectMaxMs ?? 20_000,
       heartbeatTimeoutMs: local.heartbeatTimeoutMs ?? 20_000,

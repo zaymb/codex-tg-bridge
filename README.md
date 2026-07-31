@@ -281,6 +281,9 @@ For owner DM, no group configuration is needed. Before group acceptance:
   injected into the next authenticated owner turn, so the model cannot mistake
   a rejected action for a delivered one. Successful delivery stays quiet apart
   from durable status.
+- Connector startup and relay-handshake failures are appended to the owner-only
+  `.state/connector-failures.jsonl`. The live channel status retains the latest
+  rejection reason across retry attempts until a fresh heartbeat proves recovery.
 - Final relay result and outbound actions commit in one SQLite transaction.
 - Successful bot reactions are captured in a durable, idempotent event outbox
   for side-channel consumers and never extend engagement cooldown.

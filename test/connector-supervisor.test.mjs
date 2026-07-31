@@ -6,7 +6,11 @@ import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
 
-import { ConnectorSupervisor, createChannelStatusWriter } from '../src/connector-supervisor.mjs'
+import {
+  ConnectorSupervisor,
+  createChannelStatusWriter,
+  createConnectorFailureWriter,
+} from '../src/connector-supervisor.mjs'
 
 function fakeChild(pid) {
   const child = new EventEmitter()
@@ -132,6 +136,51 @@ test('writes an owner-only atomic channel status file', async () => {
     updatedAtMs: 123,
   })
   assert.equal((await stat(path)).mode & 0o077, 0)
+})
+
+test('persists a connector rejection reason and carries it across the retry status', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'tg-connector-failure-'))
+  const failurePath = join(directory, 'nested', 'failures.jsonl')
+  const children = []
+  const statuses = []
+  const controller = new AbortController()
+  const supervisor = new ConnectorSupervisor({
+    command: '/usr/local/bin/node',
+    spawnImpl() {
+      const child = fakeChild(500 + children.length)
+      children.push(child)
+      return child
+    },
+    statusWriter: status => statuses.push(status),
+    failureWriter: createConnectorFailureWriter(failurePath),
+    waitImpl: async () => {},
+    reconnectInitialMs: 1,
+  })
+
+  const running = supervisor.run({ signal: controller.signal })
+  await waitFor(() => children.length === 1)
+  children[0].stderr.write('relay runtime fingerprint mismatch\n')
+  await new Promise(resolve => setImmediate(resolve))
+  children[0].exit(1)
+
+  await waitFor(() => statuses.some(status => status.lastFailure))
+  await waitFor(() => children.length === 2)
+  const reconnecting = statuses.find(status => status.status === 'reconnecting'
+    && status.lastFailure?.error.includes('fingerprint mismatch'))
+  const nextAttempt = statuses.find(status => status.status === 'reconnecting'
+    && status.attempt === 2
+    && status.lastFailure?.error.includes('fingerprint mismatch'))
+  assert.ok(reconnecting)
+  assert.ok(nextAttempt)
+
+  const records = (await readFile(failurePath, 'utf8')).trim().split('\n').map(JSON.parse)
+  assert.equal(records.length, 1)
+  assert.equal(records[0].exitCode, 1)
+  assert.match(records[0].error, /fingerprint mismatch/u)
+  assert.equal((await stat(failurePath)).mode & 0o077, 0)
+
+  controller.abort()
+  await running
 })
 
 test('marks a stale heartbeat disconnected and restarts the connector', async () => {

@@ -98,6 +98,19 @@ handover. Also keep the bridge in its own repository; coupling transport
 infrastructure to an unrelated product repository makes deployment boundaries
 and ownership ambiguous.
 
+## Keep The Active Runtime Checkout Clean
+
+The local connector and remote relay reject different runtime fingerprints.
+Uncommitted edits under `src/` in the active checkout therefore become a latent
+outage: the current connection can survive, but every later reconnect will fail.
+
+- Do not leave runtime WIP overnight in the checkout used by a live bridge.
+- Develop runtime changes in a separate worktree and run the full suite there.
+- Stage the tested release before switching either side of a split-host pair.
+- Every connector rejection must persist its exit details and stderr reason in
+  `.state/connector-failures.jsonl`; reconnect status must retain the latest
+  failure until a fresh heartbeat proves recovery.
+
 ## Release Checklist
 
 - Repository contains no credentials, private paths, or mutable state.

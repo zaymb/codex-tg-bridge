@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process'
-import { mkdir, rename, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, rename, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { createInterface } from 'node:readline'
 
@@ -33,6 +33,16 @@ export function createChannelStatusWriter(path) {
   }
 }
 
+export function createConnectorFailureWriter(path) {
+  return async failure => {
+    await mkdir(dirname(path), { recursive: true })
+    await appendFile(path, `${JSON.stringify(failure)}\n`, {
+      encoding: 'utf8',
+      mode: 0o600,
+    })
+  }
+}
+
 export class ConnectorSupervisor {
   #command
   #args
@@ -45,11 +55,13 @@ export class ConnectorSupervisor {
   #reconnectMaxMs
   #heartbeatTimeoutMs
   #deliveryAlert
+  #failureWriter
   #child = null
   #statusChain = Promise.resolve()
   #disengaged = false
   #engageResolve = null
   #lastDelivery = null
+  #lastFailure = null
 
   constructor({
     command,
@@ -63,6 +75,7 @@ export class ConnectorSupervisor {
     reconnectMaxMs = 20_000,
     heartbeatTimeoutMs = 20_000,
     deliveryAlert = () => {},
+    failureWriter = async () => {},
   }) {
     this.#command = command
     this.#args = args
@@ -75,6 +88,7 @@ export class ConnectorSupervisor {
     this.#reconnectMaxMs = reconnectMaxMs
     this.#heartbeatTimeoutMs = heartbeatTimeoutMs
     this.#deliveryAlert = deliveryAlert
+    this.#failureWriter = failureWriter
   }
 
   #writeStatus(status, fields = {}) {
@@ -83,6 +97,7 @@ export class ConnectorSupervisor {
       status,
       updatedAtMs: this.#clock(),
       ...(this.#lastDelivery ? { lastDelivery: this.#lastDelivery } : {}),
+      ...(this.#lastFailure ? { lastFailure: this.#lastFailure } : {}),
       ...fields,
     }
     this.#statusChain = this.#statusChain.then(() => this.#statusWriter(value))
@@ -124,6 +139,7 @@ export class ConnectorSupervisor {
         return
       }
       if (!['local_connector_ready', 'local_connector_heartbeat'].includes(event?.event)) return
+      this.#lastFailure = null
       connected = true
       lastHeartbeatAtMs = this.#clock()
       this.#writeStatus('connected', {
@@ -220,6 +236,23 @@ export class ConnectorSupervisor {
         if (signal?.aborted) break
         failedAttempts = 0
         continue
+      }
+
+      const failure = {
+        observedAtMs: this.#clock(),
+        connectorPid: child.pid ?? null,
+        exitCode: exit.code,
+        exitSignal: exit.signal,
+        error: exit.error ?? monitor.lastError() ?? 'connector exited without an error message',
+      }
+      this.#lastFailure = failure
+      try {
+        await this.#failureWriter(failure)
+      } catch (error) {
+        this.#lastFailure = {
+          ...failure,
+          failureLogError: error.message,
+        }
       }
 
       failedAttempts = monitor.connected() ? 0 : failedAttempts + 1
