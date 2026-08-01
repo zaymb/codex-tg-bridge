@@ -181,7 +181,6 @@ export class LocalSessionConnector extends EventEmitter {
   #taskContextResolver
   #pendingRelayFrames = 0
   #pendingDeliveryFailures = []
-  #pendingOutputCorrections = []
   #operationController = new AbortController()
 
   constructor({
@@ -246,29 +245,6 @@ export class LocalSessionConnector extends EventEmitter {
     if (this.#pendingDeliveryFailures.some(entry => entry.receiptId === receipt.receiptId)) return
     this.#pendingDeliveryFailures.push(receipt)
     if (this.#pendingDeliveryFailures.length > 32) this.#pendingDeliveryFailures.shift()
-  }
-
-  #rememberOutputCorrections(corrections) {
-    if (corrections === undefined) return
-    if (!Array.isArray(corrections)) throw new Error('relay output corrections are invalid')
-    for (const correction of corrections) {
-      if (
-        typeof correction?.correctionId !== 'string'
-        || !correction.correctionId
-        || correction.type !== 'reply_to_latest_normalized'
-        || typeof correction.conversationKey !== 'string'
-        || !correction.conversationKey
-        || typeof correction.messageId !== 'string'
-        || !correction.messageId
-        || correction.appliedAction !== 'send'
-        || correction.appliedMessageId !== null
-      ) throw new Error('relay output correction is invalid')
-      if (this.#pendingOutputCorrections.some(entry => (
-        entry.correctionId === correction.correctionId
-      ))) continue
-      this.#pendingOutputCorrections.push(correction)
-      if (this.#pendingOutputCorrections.length > 32) this.#pendingOutputCorrections.shift()
-    }
   }
 
   #send(frame) {
@@ -657,7 +633,6 @@ export class LocalSessionConnector extends EventEmitter {
     if (frame.type === 'error') throw new Error(`VPS relay error: ${frame.message}`)
     if (frame.type === 'job_recorded') {
       if (!this.#recordedMatches(frame)) return
-      this.#rememberOutputCorrections(frame.outputCorrections)
       if (frame.status === 'failed') {
         const error = typeof frame.error === 'string' && frame.error
           ? frame.error
@@ -805,9 +780,6 @@ export class LocalSessionConnector extends EventEmitter {
       deliveryFailures: mayObserveDeliveryFailures
         ? this.#pendingDeliveryFailures.slice()
         : [],
-      outputCorrections: mayObserveDeliveryFailures
-        ? this.#pendingOutputCorrections.slice()
-        : [],
     }
     this.#send({ type: 'heartbeat', acceptingJobs: false })
     try {
@@ -904,17 +876,6 @@ export class LocalSessionConnector extends EventEmitter {
                 },
               }
             : {}),
-          ...(this.#currentJob.outputCorrections.length > 0
-            ? {
-                telegram_output_corrections: {
-                  kind: 'application',
-                  value: JSON.stringify({
-                    rule: 'The transport already delivered these outputs after mechanically correcting reply-to-latest into send. Do not resend them. On future Telegram finals, use send with messageId=null for the latest message; reserve reply for older messages in the batch.',
-                    corrections: this.#currentJob.outputCorrections,
-                  }),
-                },
-              }
-            : {}),
           ...(taskqContext && taskqContext.status !== 'none'
             ? {
                 taskq_reference_gate: {
@@ -952,14 +913,6 @@ export class LocalSessionConnector extends EventEmitter {
         const injected = new Set(this.#currentJob.deliveryFailures.map(receipt => receipt.receiptId))
         this.#pendingDeliveryFailures = this.#pendingDeliveryFailures.filter(
           receipt => !injected.has(receipt.receiptId),
-        )
-      }
-      if (this.#currentJob.outputCorrections.length > 0) {
-        const injected = new Set(
-          this.#currentJob.outputCorrections.map(correction => correction.correctionId),
-        )
-        this.#pendingOutputCorrections = this.#pendingOutputCorrections.filter(
-          correction => !injected.has(correction.correctionId),
         )
       }
       this.#send(this.#resultFrame('job_accepted', {

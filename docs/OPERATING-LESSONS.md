@@ -20,12 +20,8 @@ only a conversation in the durable approved-chat registry. The relay resolves
 `chatId` and `threadId` from durable context and rejects missing or disagreeing
 routing data. The unquoted continuation of the latest message—or of the batch
 as a whole—is a targeted standalone send with `messageId=null`. Reply is only
-for selecting an older message from a multi-message batch. If the model marks
-the latest message as a reply, the outbound hook canonicalizes it to an
-unquoted send and reports that correction back to the local connector. The
-connector teaches the rule on the next trusted owner turn without resending the
-already-delivered text. Invalid cross-chat or unknown-message targets still
-fail closed.
+for selecting an older message from a multi-message batch; the relay rejects a
+reply aimed at the latest message.
 
 ## Treat Shared Turns As Mixed-Source
 

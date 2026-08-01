@@ -1824,69 +1824,6 @@ test('injects failed delivery receipts into the next trusted owner turn', async 
   )
 })
 
-test('reminds the agent after the relay normalizes a reply to the latest message', async t => {
-  const setup = fixture()
-  t.after(() => setup.connector.close())
-  await setup.connector.start()
-
-  setup.relay.emit('frame', ownerDmBatch())
-  await setup.connector.idle()
-  setup.app.emit('notification:item/completed', {
-    threadId: 'thread-a',
-    turnId: 'turn-tg',
-    item: {
-      type: 'agentMessage',
-      phase: 'final_answer',
-      text: JSON.stringify({ decision: 'skip', text: '', targets: [] }),
-    },
-  })
-  setup.app.emit('notification:turn/completed', {
-    threadId: 'thread-a',
-    turn: { id: 'turn-tg', status: 'completed' },
-  })
-  await setup.connector.idle()
-
-  setup.relay.emit('frame', {
-    version: 1,
-    type: 'job_recorded',
-    batchId: 'batch:telegram:owner',
-    jobIds: ['telegram:owner'],
-    status: 'completed',
-    outputCorrections: [{
-      correctionId: 'batch:telegram:owner:reply-to-latest:0',
-      type: 'reply_to_latest_normalized',
-      conversationKey: '42',
-      messageId: '12',
-      appliedAction: 'send',
-      appliedMessageId: null,
-    }],
-  })
-  await setup.connector.idle()
-
-  const nextBatch = ownerDmBatch()
-  nextBatch.batch.batchId = 'batch:telegram:owner-next'
-  nextBatch.batch.jobs[0].jobId = 'telegram:owner-next'
-  nextBatch.batch.jobs[0].payload.telegramContext.messageId = '13'
-  setup.relay.emit('frame', nextBatch)
-  await setup.connector.idle()
-
-  const started = setup.app.calls.filter(call => call.method === 'turn/start').at(-1)
-  const context = JSON.parse(
-    started.params.additionalContext.telegram_output_corrections.value,
-  )
-  assert.match(context.rule, /already delivered/u)
-  assert.match(context.rule, /Do not resend/u)
-  assert.match(context.rule, /send with messageId=null/u)
-  assert.deepEqual(context.corrections, [{
-    correctionId: 'batch:telegram:owner:reply-to-latest:0',
-    type: 'reply_to_latest_normalized',
-    conversationKey: '42',
-    messageId: '12',
-    appliedAction: 'send',
-    appliedMessageId: null,
-  }])
-})
-
 test('does not disclose pending delivery failures to an untrusted group turn', async t => {
   const setup = fixture()
   t.after(() => setup.connector.close())

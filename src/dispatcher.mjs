@@ -454,35 +454,27 @@ export class Dispatcher {
     let sent = 0
     for (let responseIndex = 0; responseIndex < responses.length; responseIndex += 1) {
       const response = responses[responseIndex]
-      let action = response.action
-      let messageId = response.messageId
       if (typeof response.conversationKey !== 'string' || !response.conversationKey) {
         throw new Error('targeted Telegram response requires conversationKey')
       }
-      if (!['send', 'reply', 'react', 'dice'].includes(action)) {
+      if (!['send', 'reply', 'react', 'dice'].includes(response.action)) {
         throw new Error('unsupported targeted Telegram response action')
       }
       if (typeof response.text !== 'string' || !response.text.trim()) {
         throw new Error('targeted Telegram response text is required')
       }
-      if (action === 'reply') {
-        const expectedMessageId = messageIdForReply(update)
-        if (
-          response.conversationKey !== update.conversationKey
-          || messageId !== expectedMessageId
-        ) throw new Error('targeted Telegram response does not match the current update')
-        action = 'send'
-        messageId = null
+      if (response.action === 'reply') {
+        throw new Error('direct Telegram turns must send; reply is only for an older message in a multi-message batch')
       }
-      if (action !== 'send') {
+      if (response.action !== 'send') {
         const expectedMessageId = messageIdForReply(update)
         if (
           response.conversationKey !== update.conversationKey
-          || messageId !== expectedMessageId
+          || response.messageId !== expectedMessageId
         ) throw new Error('targeted Telegram response does not match the current update')
       }
 
-      if (action === 'react') {
+      if (response.action === 'react') {
         await this.#queueReaction(update, `${updateId}:target:${responseIndex}`, response.text)
         sent += 1
         continue
@@ -490,7 +482,7 @@ export class Dispatcher {
 
       const group = `targeted:update:${updateId}:${String(responseIndex).padStart(2, '0')}`
 
-      if (action === 'dice') {
+      if (response.action === 'dice') {
         const actionId = `${group}:0000`
         this.#state.createOutboundAction({
           actionId,
@@ -499,7 +491,7 @@ export class Dispatcher {
           payload: {
             chatId: update.chat.id,
             threadId: topicId(update),
-            replyToMessageId: messageId,
+            replyToMessageId: response.messageId,
             emoji: response.text.trim(),
           },
           sequenceGroup: group,
@@ -511,17 +503,17 @@ export class Dispatcher {
         continue
       }
 
-      if (action === 'send' && messageId !== null) {
+      if (response.action === 'send' && response.messageId !== null) {
         throw new Error('targeted standalone send requires messageId=null')
       }
-      const approved = action === 'send'
+      const approved = response.action === 'send'
         ? this.#state.getApprovedChat(response.conversationKey)
         : null
-      if (action === 'send' && !approved) {
+      if (response.action === 'send' && !approved) {
         throw new Error('targeted Telegram response is not an approved conversation')
       }
-      const chatId = action === 'send' ? approved.telegramChatId : update.chat.id
-      const threadId = action === 'send' && approved.kind === 'forum_topic'
+      const chatId = response.action === 'send' ? approved.telegramChatId : update.chat.id
+      const threadId = response.action === 'send' && approved.kind === 'forum_topic'
         ? response.conversationKey.slice(`${approved.telegramChatId}:`.length)
         : topicId(update)
       const chunks = splitTelegramText(response.text)
@@ -531,10 +523,10 @@ export class Dispatcher {
         this.#state.createOutboundAction({
           actionId,
           conversationKey: response.conversationKey,
-          actionType: action === 'reply' && first ? 'reply' : 'send_text',
+          actionType: response.action === 'reply' && first ? 'reply' : 'send_text',
           payload: {
             chatId,
-            messageId: action === 'reply' && first ? messageId : null,
+            messageId: response.action === 'reply' && first ? response.messageId : null,
             threadId,
             text: chunks[chunkIndex],
           },
