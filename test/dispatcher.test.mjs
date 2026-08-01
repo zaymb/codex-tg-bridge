@@ -234,7 +234,7 @@ test('rejects a root-level send before the direct dispatcher can emit it', async
   )
 })
 
-test('rejects a targeted reply in the single-update direct dispatcher', async t => {
+test('normalizes a targeted reply into an unquoted send in the direct dispatcher', async t => {
   const setup = fixture()
   t.after(() => setup.state.close())
   setup.runner.result = {
@@ -254,10 +254,14 @@ test('rejects a targeted reply in the single-update direct dispatcher', async t 
     storeAndClaim(setup.state, rawMessage(50)),
   )
 
-  assert.equal(result.status, 'failed')
-  assert.match(result.error.message, /reply is only for an older message/)
+  assert.equal(result.status, 'completed')
+  const textCalls = setup.telegram.calls.filter(call => ['reply', 'sendText'].includes(call.method))
+  assert.equal(textCalls.length, 1)
+  assert.equal(textCalls[0].method, 'sendText')
+  assert.equal(textCalls[0].payload.text, 'this should have been a standalone send')
+  assert.equal(textCalls[0].payload.messageId, null)
   assert.equal(
-    setup.telegram.calls.some(call => ['reply', 'sendText', 'react', 'sendDice'].includes(call.method)),
+    setup.telegram.calls.some(call => call.method === 'reply'),
     false,
   )
 })

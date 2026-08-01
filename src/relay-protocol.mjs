@@ -68,7 +68,7 @@ function approvedStandaloneContext(stateStore, conversationKey) {
   }
 }
 
-function outboundActions(stateStore, batchId, jobs, result, nowMs) {
+function outboundActions(stateStore, batchId, jobs, result, nowMs, corrections = []) {
   if (result.action === 'skip') return []
   if (result.action !== 'targeted' || result.text !== '') {
     invalidResult('job result must be targeted with empty root text, or skip')
@@ -98,15 +98,15 @@ function outboundActions(stateStore, batchId, jobs, result, nowMs) {
   if (targeted.length === 0) invalidResult('targeted job result requires at least one response')
   const seen = new Set()
   const selected = (targeted.length > 0
-      ? targeted.map(response => {
-        const action = response.action
-        if (!['send', 'reply', 'react', 'dice'].includes(action)) {
+      ? targeted.map((response, responseIndex) => {
+        const requestedAction = response.action
+        if (!['send', 'reply', 'react', 'dice'].includes(requestedAction)) {
           invalidResult('job result targeted action must be send, reply, react, or dice')
         }
         if (typeof response.conversationKey !== 'string' || !response.conversationKey) {
           invalidResult('job result targeted response requires conversationKey')
         }
-        if (action === 'send') {
+        if (requestedAction === 'send') {
           if (
             typeof response.conversationKey !== 'string'
             || !response.conversationKey
@@ -123,7 +123,7 @@ function outboundActions(stateStore, batchId, jobs, result, nowMs) {
           return {
             context: approvedStandaloneContext(stateStore, response.conversationKey),
             text: response.text,
-            action,
+            action: requestedAction,
             isBig: response.isBig === true,
           }
         }
@@ -131,19 +131,37 @@ function outboundActions(stateStore, batchId, jobs, result, nowMs) {
         const conversationKey = response.conversationKey
         const context = byTarget.get(`${conversationKey}\0${messageId}`)
         if (!context) invalidResult('job result response target is not in the current batch')
-        if (action === 'reply' && latestMessageIdByConversation.get(conversationKey) === messageId) {
-          invalidResult('job result must send to continue the latest message; reply is only for an older batch message')
-        }
-        const targetKey = `${context.conversationKey}\0${messageId}`
+        const latestReply = requestedAction === 'reply'
+          && latestMessageIdByConversation.get(conversationKey) === messageId
+        const action = latestReply ? 'send' : requestedAction
+        const targetKey = latestReply
+          ? `${context.conversationKey}\0send`
+          : `${context.conversationKey}\0${messageId}`
         if (seen.has(targetKey)) invalidResult('job result contains a duplicate response target')
         seen.add(targetKey)
         if (typeof response.text !== 'string' || !response.text.trim()) {
           invalidResult('job result targeted response text must be non-empty')
         }
-        return { context, text: response.text, action, isBig: response.isBig === true }
+        if (latestReply) {
+          corrections.push({
+            correctionId: `${batchId}:reply-to-latest:${responseIndex}`,
+            type: 'reply_to_latest_normalized',
+            conversationKey,
+            messageId,
+            appliedAction: 'send',
+            appliedMessageId: null,
+          })
+        }
+        return {
+          context: latestReply ? { ...context, messageId: null } : context,
+          text: response.text,
+          action,
+          wasReply: requestedAction === 'reply',
+          isBig: response.isBig === true,
+        }
       })
     : [])
-    .filter(response => response.action !== 'reply' || !isInternalSkipMarker(response.text))
+    .filter(response => !response.wasReply || !isInternalSkipMarker(response.text))
   if (selected.length === 0) return []
   if (selected.some(response => !response.text.trim())) {
     invalidResult('job result must contain a non-empty reply or targeted responses')
@@ -571,8 +589,16 @@ export class RelayProtocolSession {
       throw new Error('relay result does not match the accepted turn')
     }
     let actions
+    const outputCorrections = []
     try {
-      actions = outboundActions(this.#state, batch.batchId, jobs, frame.result ?? {}, this.#clock())
+      actions = outboundActions(
+        this.#state,
+        batch.batchId,
+        jobs,
+        frame.result ?? {},
+        this.#clock(),
+        outputCorrections,
+      )
     } catch (error) {
       if (!(error instanceof InvalidJobResultError)) throw error
       if (!this.#state.failRelayJobBatch({
@@ -615,6 +641,7 @@ export class RelayProtocolSession {
       batchId: batch.batchId,
       jobIds: jobs.map(job => job.jobId),
       status: 'completed',
+      ...(outputCorrections.length > 0 ? { outputCorrections } : {}),
     })
   }
 
