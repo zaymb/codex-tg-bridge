@@ -522,7 +522,7 @@ test('records one explicitly targeted standalone send for the batch', async t =>
   assert.equal(setup.frames.at(-1).status, 'completed')
 })
 
-test('rejects reply to the latest message while allowing reply to an older batch message', async t => {
+test('normalizes a reply to the latest message into an unquoted send', async t => {
   const setup = fixture()
   t.after(() => setup.state.close())
   enqueue(setup.state, '1', '42', 1_000)
@@ -548,12 +548,20 @@ test('rejects reply to the latest message while allowing reply to an older batch
     ]),
   })
 
-  assert.equal(setup.state.getRelayJob('telegram:1').status, 'failed')
-  assert.match(
-    setup.state.getRelayJob('telegram:1').lastError,
-    /send to continue the latest message/,
-  )
-  assert.equal(setup.state.getOutboundAction(`relay-batch:${batchId}:0000`), null)
+  assert.equal(setup.state.getRelayJob('telegram:1').status, 'completed')
+  assert.equal(setup.state.getRelayJob('telegram:2').status, 'completed')
+  const outbound = setup.state.getOutboundAction(`relay-batch:${batchId}:0000`)
+  assert.equal(outbound.actionType, 'send_text')
+  assert.equal(outbound.payload.messageId, null)
+  assert.equal(outbound.payload.text, 'latest should be a send')
+  assert.deepEqual(setup.frames.at(-1).outputCorrections, [{
+    correctionId: `${batchId}:reply-to-latest:0`,
+    type: 'reply_to_latest_normalized',
+    conversationKey: '42',
+    messageId: '20',
+    appliedAction: 'send',
+    appliedMessageId: null,
+  }])
 })
 
 test('rejects a standalone root send without an explicit conversation key', async t => {
