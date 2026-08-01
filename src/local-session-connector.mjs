@@ -277,23 +277,6 @@ export class LocalSessionConnector extends EventEmitter {
     })
   }
 
-  async #restoreConfiguredPolicyForCurrentJob() {
-    if (
-      !this.#currentJob
-      || this.#currentJob.canExecute
-      || this.#currentJob.permissionsRestored
-    ) return
-    try {
-      const resumed = await this.#resumeWithConfiguredPolicy()
-      if (resumed?.thread?.id !== this.#threadId) {
-        throw new Error('Codex app-server restored permissions on a different thread')
-      }
-      this.#currentJob.permissionsRestored = true
-    } catch (error) {
-      this.emit('permissionRestoreError', error)
-    }
-  }
-
   async #reconcileAvailability() {
     if (this.#currentJob) return
     const resumed = await this.#resumeWithConfiguredPolicy()
@@ -459,10 +442,6 @@ export class LocalSessionConnector extends EventEmitter {
     this.#items.delete(turn.id)
 
     if (this.#currentJob?.turnId === turn.id) {
-      // turn/start permission overrides persist to later local turns. Restore
-      // immediately; waiting for Telegram's delivery receipt can leave the
-      // shared session read-only indefinitely when outbound recording stalls.
-      await this.#restoreConfiguredPolicyForCurrentJob()
       if (turn.status !== 'completed') {
         this.#send(this.#resultFrame('job_failed', {
           turnId: turn.id,
@@ -656,7 +635,6 @@ export class LocalSessionConnector extends EventEmitter {
         this.#rememberDeliveryFailure(receipt)
         this.emit('deliveryReceipt', receipt)
       }
-      await this.#restoreConfiguredPolicyForCurrentJob()
       const paths = this.#currentJob.jobs.flatMap(job => (job.payload?.attachments ?? [])
         .map(attachment => attachment.localPath)
         .filter(Boolean))
@@ -716,8 +694,8 @@ export class LocalSessionConnector extends EventEmitter {
       const routable = conversationKey !== null && conversationKey !== undefined
         && context?.messageId !== null && context?.messageId !== undefined
       // A stop latch revokes execution, not communication. Keeping the relay
-      // available lets the owner inspect status and send `continue` while all
-      // ordinary work remains read-only.
+      // available lets the owner inspect status and send `continue` while the
+      // per-message authority manifest keeps ordinary work non-executable.
       const baseExecutable = authority.executable
         && routable
         && !this.#interruptFanout?.isStopped()
@@ -769,7 +747,6 @@ export class LocalSessionConnector extends EventEmitter {
       messageAuthorities,
       authorizedMessages,
       canExecute,
-      permissionsRestored: canExecute,
       crossConversation,
       turnId: null,
       awaitingRecord: false,
@@ -898,12 +875,6 @@ export class LocalSessionConnector extends EventEmitter {
           telegram_output_contract: { kind: 'application', value: TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS },
         },
         outputSchema: TELEGRAM_BATCH_OUTPUT_SCHEMA,
-        ...(canExecute
-          ? (this.#approvalPolicy ? { approvalPolicy: this.#approvalPolicy } : {})
-          : { approvalPolicy: 'never' }),
-        ...(canExecute
-          ? (this.#sandboxPolicy ? { sandboxPolicy: this.#sandboxPolicy } : {})
-          : { sandboxPolicy: { type: 'readOnly', networkAccess: false } }),
       })
       const turnId = response?.turn?.id
       if (!turnId) throw new Error('Codex turn/start returned no turn ID')

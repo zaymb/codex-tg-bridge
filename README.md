@@ -22,8 +22,9 @@ both split-host and same-host deployments.
 - A Telegram job is claimed only while the target Codex thread is idle. Local
   TUI turns take priority.
 - An optional shared task admission gate can grant one agent execution
-  ownership for an otherwise authorized Telegram message. Other agents still
-  receive the message, but their copy is downgraded to read-only permissions.
+ownership for an otherwise authorized Telegram message. Other agents still
+  receive the message with `mayExecute=false`; the connector does not rewrite
+  the shared thread's approval or sandbox settings.
 - One queued batch can produce one or more explicitly targeted actions. A
   targeted standalone send may name
   any conversation in the durable approved-chat registry, even when that
@@ -333,9 +334,10 @@ For owner DM, no group configuration is needed. Before group acceptance:
   trust. Ordinary tool
   work requested by an authorized repair message still follows the manifest
   rule above.
-- Batches with no authorized message run with `readOnly`, network disabled,
-  `approvalPolicy=never`, and automatic denial of any approval request that
-  still reaches the local connector.
+- Batches with no authorized message inherit the shared thread's existing
+  approval and sandbox settings instead of applying a turn-level override.
+  Their per-message manifest carries `mayExecute=false`, and the connector
+  automatically denies any approval request associated with that turn.
 - Public Telegram output passes a deterministic disclosure guard. Concrete
   local paths, credentials, environment/config identifiers, private
   infrastructure details, code blocks, oversized responses, and file exports

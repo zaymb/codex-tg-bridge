@@ -177,6 +177,11 @@ function targeted(conversationKey, messageId, decision, text, big = false) {
   }
 }
 
+function assertPreservesThreadPermissions(started) {
+  assert.equal(Object.hasOwn(started.params, 'approvalPolicy'), false)
+  assert.equal(Object.hasOwn(started.params, 'sandboxPolicy'), false)
+}
+
 function topicBatch() {
   return {
     version: 1,
@@ -357,8 +362,7 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
   assert.match(started.params.input[0].text, /2\. \[TG\]\[message_id=11\]\[sender=laurie_bot\] \(replying to Alta\): second message/)
   assert.ok(started.params.input[0].text.indexOf('first message') < started.params.input[0].text.indexOf('second message'))
   assert.equal('cwd' in started.params, false)
-  assert.equal(started.params.approvalPolicy, 'never')
-  assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
+  assertPreservesThreadPermissions(started)
   assert.equal(started.params.outputSchema.properties.decision.enum.join(','), 'skip,targeted')
   assert.deepEqual(JSON.parse(started.params.additionalContext.telegram.value), {
     source: 'telegram',
@@ -733,8 +737,7 @@ test('a new owner turn clears a stale shared stop latch before authority is calc
     started.params.additionalContext.telegram_stop_state.value,
     /previous stop.*released.*new trusted owner message/iu,
   )
-  assert.equal(started.params.approvalPolicy, 'never')
-  assert.deepEqual(started.params.sandboxPolicy, { type: 'dangerFullAccess' })
+  assertPreservesThreadPermissions(started)
 })
 
 test('a peer turn cannot clear the shared stop latch', async t => {
@@ -759,8 +762,7 @@ test('a peer turn cannot clear the shared stop latch', async t => {
     rule: 'trusted_source_and_admin_sender',
     authorizedMessages: [],
   })
-  assert.equal(started.params.approvalPolicy, 'never')
-  assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
+  assertPreservesThreadPermissions(started)
 })
 
 test('shows the stable topic name beside its conversation key', async t => {
@@ -977,8 +979,7 @@ test('private groups receive the private-audience policy but retain no execution
   assert.match(started.params.input[0].text, /\[trust=untrusted\]/)
   assert.match(started.params.input[0].text, /\[sender=Owner\]\[admin\]/)
   assert.match(started.params.additionalContext.telegram_trust_policy.value, /trusted source.*admin sender/iu)
-  assert.equal(started.params.approvalPolicy, 'never')
-  assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
+  assertPreservesThreadPermissions(started)
 })
 
 test('injects independent reply and execution capabilities with a fixed decision schema', async t => {
@@ -1140,8 +1141,7 @@ test('owner-authored family-group turns receive configured execution permissions
   assert.deepEqual(started.params.outputSchema.properties.decision.enum, [
     'skip', 'targeted',
   ])
-  assert.equal(started.params.approvalPolicy, 'never')
-  assert.deepEqual(started.params.sandboxPolicy, { type: 'dangerFullAccess' })
+  assertPreservesThreadPermissions(started)
 })
 
 test('family-group owner messages may skip when there is genuinely nothing to add', async t => {
@@ -1198,11 +1198,10 @@ test('shared admission loser still sees the owner message but receives no execut
     rule: 'trusted_source_and_admin_sender',
     authorizedMessages: [],
   })
-  assert.equal(started.params.approvalPolicy, 'never')
-  assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
+  assertPreservesThreadPermissions(started)
 })
 
-test('peer-bot turns share the family-group audience but remain non-authoritative and read-only', async t => {
+test('peer-bot turns share the family-group audience without changing thread permissions', async t => {
   const setup = fixture({
     privateChatIds: new Set(['-100123']),
     repairChatIds: new Set(['-100123']),
@@ -1224,11 +1223,10 @@ test('peer-bot turns share the family-group audience but remain non-authoritativ
     'skip', 'targeted',
   ])
   assert.deepEqual(JSON.parse(started.params.additionalContext.telegram_authorization.value).authorizedMessages, [])
-  assert.equal(started.params.approvalPolicy, 'never')
-  assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
+  assertPreservesThreadPermissions(started)
 })
 
-test('restores configured permissions as soon as a non-authoritative turn completes', async t => {
+test('never mutates configured permissions for a non-authoritative turn', async t => {
   const setup = fixture({
     privateChatIds: new Set(['-100123']),
     repairChatIds: new Set(['-100123']),
@@ -1238,6 +1236,8 @@ test('restores configured permissions as soon as a non-authoritative turn comple
 
   setup.relay.emit('frame', repairGroupBatch({ peer: true }))
   await setup.connector.idle()
+  const started = setup.app.calls.find(call => call.method === 'turn/start')
+  assertPreservesThreadPermissions(started)
   setup.app.emit('notification:turn/completed', {
     threadId: 'thread-a',
     turn: { id: 'turn-tg', status: 'completed' },
@@ -1245,8 +1245,8 @@ test('restores configured permissions as soon as a non-authoritative turn comple
   await setup.connector.idle()
 
   const resumes = setup.app.calls.filter(call => call.method === 'thread/resume')
-  assert.equal(resumes.length, 2)
-  assert.deepEqual(resumes.at(-1).params, {
+  assert.equal(resumes.length, 1)
+  assert.deepEqual(resumes[0].params, {
     threadId: 'thread-a',
     approvalPolicy: 'never',
     sandbox: 'danger-full-access',
@@ -1368,8 +1368,7 @@ test('trusts only the authenticated owner DM and preserves its configured permis
   assert.match(started.params.input[0].text, /^\[EXTERNAL_FEED\]\[source=telegram\]\[authority=per_message\]/)
   assert.match(started.params.input[0].text, /\[TG SOURCE\]\[conversation_key=42\]\[trust=trusted\]/)
   assert.match(started.params.input[0].text, /\[sender=Owner\]\[admin\]/)
-  assert.deepEqual(started.params.sandboxPolicy, { type: 'dangerFullAccess' })
-  assert.equal(started.params.approvalPolicy, 'never')
+  assertPreservesThreadPermissions(started)
   assert.deepEqual(JSON.parse(started.params.additionalContext.telegram_authorization.value).authorizedMessages, [
     { conversationKey: '42', messageId: '12' },
   ])
@@ -1386,7 +1385,7 @@ test('fails closed when a trusted admin message lacks a routable message ID', as
   await setup.connector.idle()
 
   const started = setup.app.calls.find(call => call.method === 'turn/start')
-  assert.deepEqual(started.params.sandboxPolicy, { type: 'readOnly', networkAccess: false })
+  assertPreservesThreadPermissions(started)
   assert.deepEqual(JSON.parse(started.params.additionalContext.telegram_authorization.value), {
     rule: 'trusted_source_and_admin_sender',
     authorizedMessages: [],
@@ -1421,8 +1420,7 @@ test('groups a busy-time batch by conversation and authorizes only trusted admin
   assert.ok(prompt.indexOf('repair peer context') < prompt.indexOf('repair owner instruction'))
   assert.ok(prompt.indexOf('group conversation') < prompt.indexOf('public owner context'))
   assert.doesNotMatch(prompt, /\[(?:ts|timestamp)=/iu)
-  assert.equal(started.params.approvalPolicy, 'never')
-  assert.deepEqual(started.params.sandboxPolicy, { type: 'dangerFullAccess' })
+  assertPreservesThreadPermissions(started)
   assert.match(started.params.additionalContext.telegram_trust_policy.value, /trusted source.*admin sender/iu)
   assert.match(started.params.additionalContext.telegram_trust_policy.value, /authority does not transfer/iu)
   const context = JSON.parse(started.params.additionalContext.telegram.value)
