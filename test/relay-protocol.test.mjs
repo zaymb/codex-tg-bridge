@@ -522,7 +522,7 @@ test('records one explicitly targeted standalone send for the batch', async t =>
   assert.equal(setup.frames.at(-1).status, 'completed')
 })
 
-test('normalizes a reply to the latest message into an unquoted send', async t => {
+test('preserves a reply to the latest message when the model selects it', async t => {
   const setup = fixture()
   t.after(() => setup.state.close())
   enqueue(setup.state, '1', '42', 1_000)
@@ -544,24 +544,17 @@ test('normalizes a reply to the latest message into an unquoted send', async t =
     batchId,
     turnId: 'turn-a',
     result: targetedResult([
-      targetedResponse('42', '20', 'latest should be a send'),
+      targetedResponse('42', '20', 'direct answer to latest'),
     ]),
   })
 
   assert.equal(setup.state.getRelayJob('telegram:1').status, 'completed')
   assert.equal(setup.state.getRelayJob('telegram:2').status, 'completed')
   const outbound = setup.state.getOutboundAction(`relay-batch:${batchId}:0000`)
-  assert.equal(outbound.actionType, 'send_text')
-  assert.equal(outbound.payload.messageId, null)
-  assert.equal(outbound.payload.text, 'latest should be a send')
-  assert.deepEqual(setup.frames.at(-1).outputCorrections, [{
-    correctionId: `${batchId}:reply-to-latest:0`,
-    type: 'reply_to_latest_normalized',
-    conversationKey: '42',
-    messageId: '20',
-    appliedAction: 'send',
-    appliedMessageId: null,
-  }])
+  assert.equal(outbound.actionType, 'reply')
+  assert.equal(outbound.payload.messageId, '20')
+  assert.equal(outbound.payload.text, 'direct answer to latest')
+  assert.equal(setup.frames.at(-1).outputCorrections, undefined)
 })
 
 test('rejects a standalone root send without an explicit conversation key', async t => {

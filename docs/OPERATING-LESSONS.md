@@ -18,14 +18,14 @@ outbound action must name its `conversationKey`; replies, reactions, and dice
 must also name a `messageId` from the accepted batch. Standalone sends may name
 only a conversation in the durable approved-chat registry. The relay resolves
 `chatId` and `threadId` from durable context and rejects missing or disagreeing
-routing data. The unquoted continuation of the latest message—or of the batch
-as a whole—is a targeted standalone send with `messageId=null`. Reply is only
-for selecting an older message from a multi-message batch. If the model marks
-the latest message as a reply, the outbound hook canonicalizes it to an
-unquoted send and reports that correction back to the local connector. The
-connector teaches the rule on the next trusted owner turn without resending the
-already-delivered text. Invalid cross-chat or unknown-message targets still
-fail closed.
+routing data. During the first 30 seconds after the local connector receives a
+batch, reply quotes stay off and responses are targeted standalone sends with
+`messageId=null`. After 30 seconds, a direct answer to one specific message is
+a targeted reply, including when that message is the latest in its
+conversation. An unquoted continuation or an answer to the batch as a whole
+remains a targeted standalone send. The connector measures the window from
+batch receipt to the current system time when each output is handled. Invalid
+cross-chat or unknown-message targets still fail closed.
 
 ## Treat Shared Turns As Mixed-Source
 

@@ -52,6 +52,36 @@ function missingCommentaryTargets(commentaryResponses = [], finalResponses = [])
   ))
 }
 
+export const TELEGRAM_REPLY_UNLOCK_MS = 30_000
+
+export function applyTelegramReplyWindow(responses, elapsedMs) {
+  if (!Array.isArray(responses) || elapsedMs > TELEGRAM_REPLY_UNLOCK_MS) return responses
+  const normalized = []
+  const sendsByConversation = new Map()
+  for (const response of responses) {
+    const candidate = response.action === 'reply'
+      ? { ...response, action: 'send', messageId: null }
+      : response
+    if (candidate.action !== 'send') {
+      normalized.push(candidate)
+      continue
+    }
+    const existingIndex = sendsByConversation.get(candidate.conversationKey)
+    if (existingIndex === undefined) {
+      sendsByConversation.set(candidate.conversationKey, normalized.length)
+      normalized.push(candidate)
+      continue
+    }
+    const existing = normalized[existingIndex]
+    normalized[existingIndex] = {
+      ...existing,
+      text: `${existing.text}\n\n${candidate.text}`,
+      isBig: existing.isBig === true || candidate.isBig === true,
+    }
+  }
+  return normalized
+}
+
 function normalizeInbound(frame) {
   if (frame.type === 'job_batch') {
     const batch = frame.batch
@@ -424,7 +454,13 @@ export class LocalSessionConnector extends EventEmitter {
       : { invalid: true }
     if (parsed.invalid || parsed.skipped) return
     const output = parsed
-    const targetedResponses = output.responses ?? []
+    const rawTargetedResponses = output.responses ?? []
+    const targetedResponses = rawTargetedResponses.length === 1
+      ? applyTelegramReplyWindow(
+          rawTargetedResponses,
+          this.#clock() - this.#currentJob.receivedAtMs,
+        )
+      : rawTargetedResponses
     const eligibleProgress = targetedResponses.filter(response => {
       if (!response.text?.trim() || !['send', 'reply'].includes(response.action)) return false
       return this.#currentJob.jobs.some(job => {
@@ -528,6 +564,10 @@ export class LocalSessionConnector extends EventEmitter {
                 error: 'final Telegram decision omitted targeted responses from unforwarded commentary',
               }))
             } else {
+              const responses = applyTelegramReplyWindow(
+                output.responses,
+                this.#clock() - this.#currentJob.receivedAtMs,
+              )
               this.#send(this.#resultFrame('job_result', {
                 turnId: turn.id,
                 result: output.skipped
@@ -535,7 +575,7 @@ export class LocalSessionConnector extends EventEmitter {
                   : {
                       action: 'targeted',
                       text: output.finalText,
-                      responses: output.responses,
+                      responses,
                       reason: output.reason,
                     },
               }))
@@ -705,6 +745,7 @@ export class LocalSessionConnector extends EventEmitter {
       this.#send(deferred)
       return
     }
+    const receivedAtMs = this.#clock()
 
     const clientUserMessageId = inbound.mode === 'legacy' ? inbound.jobs[0].jobId : inbound.batchId
     const classifiedAuthorities = inbound.jobs.map(job => classifyTelegramAuthority(
@@ -808,6 +849,7 @@ export class LocalSessionConnector extends EventEmitter {
       outputCorrections: mayObserveDeliveryFailures
         ? this.#pendingOutputCorrections.slice()
         : [],
+      receivedAtMs,
     }
     this.#send({ type: 'heartbeat', acceptingJobs: false })
     try {
@@ -909,7 +951,7 @@ export class LocalSessionConnector extends EventEmitter {
                 telegram_output_corrections: {
                   kind: 'application',
                   value: JSON.stringify({
-                    rule: 'The transport already delivered these outputs after mechanically correcting reply-to-latest into send. Do not resend them. On future Telegram finals, use send with messageId=null for the latest message; reserve reply for older messages in the batch.',
+                    rule: 'A legacy relay already delivered these outputs after mechanically correcting reply-to-latest into send. Do not resend them. Current policy uses unquoted sends for the first 30 seconds after batch receipt and allows a reply to any exact batch message after that window.',
                     corrections: this.#currentJob.outputCorrections,
                   }),
                 },

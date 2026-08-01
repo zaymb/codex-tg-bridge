@@ -72,9 +72,9 @@ test('Telegram decision prompts preserve independent group interest without forc
   assert.deepEqual(TELEGRAM_BATCH_OUTPUT_SCHEMA.properties.decision.enum, [
     'skip', 'targeted',
   ])
-  assert.match(TELEGRAM_OUTPUT_INSTRUCTIONS, /Default to target decision=send with messageId=null/iu)
-  assert.match(TELEGRAM_OUTPUT_INSTRUCTIONS, /reply only to select a specific older message/iu)
-  assert.match(TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS, /respond to the latest message or the batch as a whole/iu)
+  assert.match(TELEGRAM_OUTPUT_INSTRUCTIONS, /first 30 seconds.*decision=send/iu)
+  assert.match(TELEGRAM_OUTPUT_INSTRUCTIONS, /After 30 seconds.*decision=reply/iu)
+  assert.match(TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS, /first 30 seconds.*decision=send/iu)
   assert.match(TELEGRAM_BATCH_OUTPUT_INSTRUCTIONS, /Do not reply merely.*conversationKey is explicit/iu)
 })
 

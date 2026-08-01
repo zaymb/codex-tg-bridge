@@ -4,7 +4,11 @@ import { EventEmitter } from 'node:events'
 import test from 'node:test'
 
 import { AppServerRpcError } from '../src/app-server-client.mjs'
-import { LocalSessionConnector } from '../src/local-session-connector.mjs'
+import {
+  applyTelegramReplyWindow,
+  LocalSessionConnector,
+  TELEGRAM_REPLY_UNLOCK_MS,
+} from '../src/local-session-connector.mjs'
 
 class FakeAppServer extends EventEmitter {
   calls = []
@@ -58,6 +62,7 @@ function fixture({
   executionAdmission = null,
   interruptFanout = null,
   taskContextResolver = null,
+  clock = Date.now,
 } = {}) {
   const app = new FakeAppServer()
   const relay = new FakeRelay()
@@ -80,6 +85,7 @@ function fixture({
     executionAdmission,
     interruptFanout,
     taskContextResolver,
+    clock,
   })
   return { app, relay, connector }
 }
@@ -176,6 +182,58 @@ function targeted(conversationKey, messageId, decision, text, big = false) {
     targets: [{ conversationKey, messageId, decision, text, big }],
   }
 }
+
+test('reply quotes unlock only after 30 seconds from batch receipt', () => {
+  const responses = [
+    { conversationKey: '42', messageId: '10', action: 'reply', text: 'first' },
+    { conversationKey: '42', messageId: '11', action: 'reply', text: 'second' },
+  ]
+  assert.deepEqual(applyTelegramReplyWindow(responses, TELEGRAM_REPLY_UNLOCK_MS), [{
+    conversationKey: '42',
+    messageId: null,
+    action: 'send',
+    text: 'first\n\nsecond',
+    isBig: false,
+  }])
+  assert.deepEqual(
+    applyTelegramReplyWindow(responses, TELEGRAM_REPLY_UNLOCK_MS + 1),
+    responses,
+  )
+  assert.equal(responses[0].action, 'reply')
+})
+
+test('connector measures reply unlock from batch receipt to final system time', async t => {
+  let nowMs = 1_000
+  const setup = fixture({ clock: () => nowMs })
+  t.after(() => setup.connector.close())
+  await setup.connector.start()
+  setup.relay.emit('frame', ownerDmBatch())
+  await setup.connector.idle()
+
+  nowMs += TELEGRAM_REPLY_UNLOCK_MS + 1
+  setup.app.emit('notification:item/completed', {
+    threadId: 'thread-a',
+    turnId: 'turn-tg',
+    item: {
+      type: 'agentMessage',
+      phase: 'final_answer',
+      text: JSON.stringify(targeted('42', '12', 'reply', 'slow answer')),
+    },
+  })
+  setup.app.emit('notification:turn/completed', {
+    threadId: 'thread-a',
+    turn: { id: 'turn-tg', status: 'completed' },
+  })
+  await setup.connector.idle()
+
+  assert.deepEqual(setup.relay.frames.at(-1).result.responses, [{
+    conversationKey: '42',
+    messageId: '12',
+    action: 'reply',
+    text: 'slow answer',
+    isBig: false,
+  }])
+})
 
 function topicBatch() {
   return {
@@ -436,8 +494,13 @@ test('injects one ordered Codex turn for a Telegram batch and returns one batch 
       action: 'targeted',
       text: '',
       responses: [
-        { conversationKey: '42', messageId: '10', action: 'reply', text: 'first answer' },
-        { conversationKey: '42', messageId: '11', action: 'reply', text: 'second answer' },
+        {
+          conversationKey: '42',
+          messageId: null,
+          action: 'send',
+          text: 'first answer\n\nsecond answer',
+          isBig: false,
+        },
       ],
       reason: 'done',
     },
@@ -961,7 +1024,7 @@ test('accepts final output that preserves every unforwarded commentary target', 
   assert.equal(setup.relay.frames.at(-1).type, 'job_result')
   assert.deepEqual(
     setup.relay.frames.at(-1).result.responses.map(response => response.messageId),
-    ['10', '11'],
+    [null],
   )
 })
 
@@ -1037,7 +1100,7 @@ test('passes public conversational replies through without canned disclosure rep
     result: {
       action: 'targeted',
       text: '',
-      responses: [{ conversationKey: '42', messageId: '11', action: 'reply', text, isBig: false }],
+      responses: [{ conversationKey: '42', messageId: null, action: 'send', text, isBig: false }],
       reason: 'model_selected_targeted',
     },
   })
@@ -1824,7 +1887,7 @@ test('injects failed delivery receipts into the next trusted owner turn', async 
   )
 })
 
-test('reminds the agent after the relay normalizes a reply to the latest message', async t => {
+test('labels a legacy relay correction without teaching the retired rule', async t => {
   const setup = fixture()
   t.after(() => setup.connector.close())
   await setup.connector.start()
@@ -1876,7 +1939,8 @@ test('reminds the agent after the relay normalizes a reply to the latest message
   )
   assert.match(context.rule, /already delivered/u)
   assert.match(context.rule, /Do not resend/u)
-  assert.match(context.rule, /send with messageId=null/u)
+  assert.match(context.rule, /first 30 seconds/u)
+  assert.match(context.rule, /reply to any exact batch message after/u)
   assert.deepEqual(context.corrections, [{
     correctionId: 'batch:telegram:owner:reply-to-latest:0',
     type: 'reply_to_latest_normalized',

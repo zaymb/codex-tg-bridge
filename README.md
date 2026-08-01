@@ -29,9 +29,11 @@ both split-host and same-host deployments.
   any conversation in the durable approved-chat registry, even when that
   conversation is absent from the current batch. Targeted replies, reactions,
   and animated dice remain limited to exact messages in the current batch.
-  Continuing the latest message or answering a batch as a whole uses a
-  standalone targeted send; reply is reserved for selecting an older message
-  from a multi-message batch.
+  For the first 30 seconds after the connector receives a batch, responses are
+  unquoted standalone sends. After that window, a direct answer to one
+  specific message uses a targeted reply, including when that message is the
+  latest in its conversation. An unquoted continuation or an answer to the
+  batch as a whole still uses a standalone targeted send.
   The model selects only `skip` or `targeted`; every outbound target carries
   its `conversationKey`, and the connector mechanically generates the
   transport envelope.
@@ -39,9 +41,9 @@ both split-host and same-host deployments.
   one source-grouped batch. Each conversation contributes only its first
   contiguous authenticated-sender partition. Owner-DM slash commands bypass
   the wait and remain isolated from ordinary messages.
-- Commentary can produce best-effort progress messages only through an
-  explicit targeted send carrying `conversationKey` and `messageId=null`.
-  It uses reply only when selecting an older message from a multi-message batch.
+- Commentary can produce best-effort progress messages through explicit
+  targets. The same 30-second reply window applies: before it unlocks,
+  commentary uses a send carrying `conversationKey` and `messageId=null`.
   A final result atomically cancels any undelivered progress so stale status
   text cannot arrive after the answer.
 - Telegram attachments cross split-host relays in bounded, hashed frames.
@@ -64,8 +66,8 @@ both split-host and same-host deployments.
   several conversations. Every reply, reaction, dice action, and standalone
   send requires `conversationKey`; replies, reactions, and dice also require
   `messageId`. Root actions are rejected. A targeted `send` requires
-  `messageId=null` and a registered approved conversation. Reply to the latest
-  message is rejected because a standalone send is the unquoted continuation.
+  `messageId=null` and a registered approved conversation. Reply is allowed for
+  any exact message in the accepted batch, including the latest message.
 - Replies are bound to the channel that started the turn. If a local TUI steer
   joins a Telegram-owned turn, the connector fails closed and does not send the
   mixed final answer to Telegram.
